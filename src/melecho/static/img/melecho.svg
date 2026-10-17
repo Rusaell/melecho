@@ -1,0 +1,15 @@
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="melecho-A" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="none"
+        stroke="url(#melecho-A)" stroke-width="1.5" opacity="0.55"/>
+  <rect x="8.5"  y="17" width="7" height="31" rx="2" fill="url(#melecho-A)"/>
+  <rect x="18.5" y="27" width="7" height="15" rx="2" fill="url(#melecho-A)" opacity="0.85"/>
+  <rect x="28.5" y="35" width="7" height="13" rx="2" fill="#A78BFA"/>
+  <rect x="38.5" y="27" width="7" height="15" rx="2" fill="url(#melecho-A)" opacity="0.85"/>
+  <rect x="48.5" y="17" width="7" height="31" rx="2" fill="url(#melecho-A)"/>
+</svg>

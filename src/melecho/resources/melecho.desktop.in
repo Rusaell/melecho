@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Melecho
+GenericName=SSH Control Panel
+Comment=Local-first Linux SSH control panel
+Exec={exec_path}
+Icon=melecho
+Terminal=false
+Categories=System;Monitor;Security;
+StartupNotify=false
+Keywords=ssh;admin;monitor;audit;local;

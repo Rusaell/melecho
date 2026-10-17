@@ -1,0 +1,21 @@
+id: ss_tulpn_view
+name: Сетевые интерфейсы и открытые порты
+category: network
+version: 1
+params: []
+flags:
+  dangerous: false
+  requires_confirmation: false
+  plan_preview_supported: true
+  reversible: true
+  expect_disconnect: false
+  escalatable: true
+  idempotent: true
+applicability:
+  check_command: [ip, ss]
+steps:
+  - command: "ip a"
+    expect_exit: 0
+  - command: "ss -tulpn"
+    expect_exit: 0
+    note: "Без root — неполный список процессов и сокетов."

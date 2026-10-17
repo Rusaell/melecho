@@ -1,0 +1,4091 @@
+:root {
+  --bg: #0a0c0e;
+  --bg-elevated: #12151a;
+  --bg-subtle: #1a1e24;
+  --bg-input: #0e1114;
+  --fg: #e8e6e1;
+  --fg-muted: #9aa0a6;
+  --fg-subtle: #6d737a;
+  --border: color-mix(in oklab, var(--fg) 12%, transparent);
+  --border-strong: color-mix(in oklab, var(--fg) 22%, transparent);
+  --accent: #9db4c8;
+  --accent-fg: #0a0c0e;
+  --ok: #7d9a78;
+  --warn: #c4a35a;
+  --danger: #c45c4a;
+  --info: #7f93a8;
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --motion-quick: 150ms;
+  --motion-fast: 250ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --shadow: 0 16px 40px color-mix(in oklab, #000 45%, transparent);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg); font-family: var(--font); }
+body { line-height: 1.5; }
+button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+a { color: var(--accent); }
+
+#app { min-height: 100vh; }
+
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: var(--space-5);
+}
+.panel {
+  width: min(440px, 100%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+  box-shadow: var(--shadow);
+}
+.panel-wide { width: min(920px, 100%); }
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+}
+/* Кнопка-бейдж «доступно обновление» в шапке, справа от названия
+   проекта. Ведёт в Настройки → Обновления с авто-scroll. */
+.brand-badge {
+  margin-left: 0;
+  padding: 4px 10px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--warn) 22%, var(--bg-elevated));
+  border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent);
+  color: #ead7a4;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 200ms var(--ease-out),
+              border-color 200ms var(--ease-out);
+}
+.brand-badge:hover {
+  background: color-mix(in oklab, var(--warn) 32%, var(--bg-elevated));
+  border-color: color-mix(in oklab, var(--warn) 60%, transparent);
+}
+
+/* Колонка под брендом: подзаголовок + badge «доступно обновление»
+   отдельной строкой снизу. Шапка не растёт за счёт уменьшенного
+   padding .top (space-2 вместо space-3). */
+.brand-sub {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  margin-top: 2px;
+}
+.brand-sub > p {
+  margin: 0;
+}
+
+.mark {
+  width: 36px; height: 36px;
+  display: block;
+  flex-shrink: 0;
+}
+.brand h1 { margin: 0; font-size: 1.25rem; font-weight: 600; letter-spacing: -0.03em; line-height: 1.15; }
+.brand p, .muted { margin: 0; color: var(--fg-muted); font-size: 0.875rem; line-height: 1.2; }
+.stack { display: flex; flex-direction: column; gap: var(--space-3); }
+.row { display: flex; gap: var(--space-3); flex-wrap: wrap; align-items: center; }
+.grow { flex: 1; min-width: 0; }
+
+label { font-size: 0.75rem; font-weight: 500; color: var(--fg-muted); letter-spacing: 0.04em; text-transform: uppercase; }
+input, select, textarea {
+  width: 100%;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--fg);
+  padding: 0 var(--space-3);
+  font: inherit;
+}
+textarea { height: auto; min-height: 88px; padding: var(--space-3); font-family: var(--font-mono); font-size: 0.8125rem; }
+input:focus, select:focus, textarea:focus, button:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+.btn {
+  /* inline-flex + центрирование — чтобы работало и для <a class="btn">
+     (иначе текст прилипает к верху — баг со скриншота). text-decoration
+     сбрасываем для <a>. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 44px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  padding: 0 var(--space-4);
+  font: inherit;
+  font-weight: 550;
+  text-decoration: none;
+  transition: transform var(--motion-quick) var(--ease-out), background var(--motion-quick) var(--ease-out);
+}
+.btn:hover:not(:disabled) { background: color-mix(in oklab, var(--bg-subtle) 80%, var(--fg) 8%); }
+.btn:active:not(:disabled) { transform: scale(0.98); }
+.btn-primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.btn-primary:hover:not(:disabled) { background: color-mix(in oklab, var(--accent) 88%, #fff); }
+.btn-danger { background: color-mix(in oklab, var(--danger) 18%, var(--bg-subtle)); color: #f0c4bd; border-color: color-mix(in oklab, var(--danger) 40%, transparent); }
+.btn-ghost { background: transparent; }
+.btn-sm { height: 36px; padding: 0 var(--space-3); font-size: 0.875rem; }
+
+.pw {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  overflow: hidden;
+}
+.pw > span { display: block; height: 100%; width: 0; background: var(--danger); transition: width var(--motion-fast) var(--ease-out); }
+.pw.ok > span { width: 66%; background: var(--warn); }
+.pw.strong > span { width: 100%; background: var(--ok); }
+.pw.weak > span { width: 33%; background: var(--danger); }
+
+/* Shell: фиксированная высота окна, шапка всегда сверху,
+   контент скроллится ВНУТРИ .view-host, а не на body.
+   Без height: 100vh + overflow: hidden скролл поднимался бы
+   на уровень страницы и перекрывал шапку. */
+.shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+/* Обёртка контента (всё кроме шапки и fixed-элементов).
+   min-height: 0 — ключ: без него grid-ячейка растягивается по
+   высоте контента и overflow не работает. */
+.view-host {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* На странице сервера внешний скролл выключен, скролл — во вложенном
+   .server-page-content. Так полоса идёт только под вкладками сервера,
+   не задевая глобальную шапку. */
+.view-host.view-host--server {
+  overflow: hidden;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  /* Уменьшенный вертикальный padding (space-2 вместо space-3):
+     даёт место для badge «доступно обновление» в brand-sub без
+     роста высоты шапки. */
+  padding: var(--space-2) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+.nav { display: flex; gap: var(--space-1); }
+.nav button {
+  height: 36px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-3);
+  font: inherit;
+}
+.nav button.on, .nav button:hover { color: var(--fg); background: var(--bg-subtle); }
+.banner {
+  padding: var(--space-2) var(--space-5);
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--border);
+}
+.banner.warn { background: color-mix(in oklab, var(--warn) 16%, var(--bg)); color: #ead7a4; }
+.banner.danger { background: color-mix(in oklab, var(--danger) 16%, var(--bg)); color: #f0c4bd; }
+.banner.info { background: color-mix(in oklab, var(--info) 14%, var(--bg)); color: #c5d0da; }
+.banner.ok { background: color-mix(in oklab, var(--ok) 16%, var(--bg)); color: #b9d3b1; }
+/* Плавное появление/исчезновение баннера через grid-template-rows
+   0fr → 1fr (тот же трюк, что у .llm-reveal). Обёртка — sticky, значит
+   баннер прилипает к верху скролл-контейнера. */
+.banner-reveal {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 350ms var(--ease-out);
+}
+.banner-reveal.shown {
+  grid-template-rows: 1fr;
+}
+.banner-reveal-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Внутренний .banner интернета. Плавная смена цвета при переходе
+   между warn/ok/danger — через transition. */
+.banner--internet {
+  transition: background-color 300ms var(--ease-out),
+              color 300ms var(--ease-out),
+              border-color 300ms var(--ease-out);
+}
+.banner-text {
+  transition: opacity 200ms var(--ease-out);
+}
+
+/* Кнопка внутри баннера. Фиксированная минимальная ширина — чтобы
+   баннер не «дёргался» при смене текста «Проверить сейчас» →
+   спиннер → «Успешно» → «Провал». */
+.banner-internet-btn {
+  min-width: 150px;
+  transition: background-color 250ms var(--ease-out),
+              border-color 250ms var(--ease-out),
+              color 250ms var(--ease-out);
+}
+/* Countdown до следующей авто-проверки. Моноширинный, с фиксированной
+   минимальной шириной — чтобы цифры не «прыгали», когда 10 → 9
+   (одно- и двухзначные числа). Курсор help — нативный tooltip
+   через title. */
+.banner-countdown {
+  display: inline-flex;
+  align-items: center;
+  min-width: 78px;
+  justify-content: flex-end;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8125rem;
+  color: var(--fg-muted);
+  cursor: help;
+  padding: 0 var(--space-2);
+  /* Плавное появление/уход, когда число скачет 0↔5 — без мигания. */
+  transition: opacity 220ms var(--ease-out);
+}
+/* Метка внутри кнопки. key сменяется при смене состояния → анимация
+   fade-in перезапускается, текст «проявляется». */
+.banner-btn-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  animation: fade-in 220ms var(--ease-out);
+}
+/* Спиннер. Крутится во время проверки. */
+.spin {
+  display: inline-block;
+  font-size: 1.15em;
+  line-height: 1;
+  animation: spin 1s linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.cmd {
+  display: block;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+.profile-item {
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.profile-item.active {
+  border-color: color-mix(in oklab, var(--accent) 55%, var(--border));
+  background: color-mix(in oklab, var(--accent) 8%, var(--bg));
+}
+.profile-form {
+  padding: var(--space-3);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+}
+.small { font-size: 0.75rem; }
+.llm-window {
+  position: fixed;
+  z-index: 60;
+  width: 360px;
+  min-width: 280px;
+  max-width: 90vw;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  user-select: none;
+}
+.llm-window.collapsed {
+  height: auto !important;
+}
+.llm-window-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8px 12px;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  cursor: move;
+  touch-action: none;
+}
+.llm-window.collapsed .llm-window-head {
+  border-bottom: none;
+}
+.llm-window-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.875rem;
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.llm-window-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  background: color-mix(in oklab, var(--accent) 22%, var(--bg));
+  color: var(--accent);
+  border: 0;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  max-width: 60%;
+  min-width: 0;
+  cursor: pointer;
+}
+.llm-window-pill:hover {
+  background: color-mix(in oklab, var(--accent) 32%, var(--bg));
+}
+.llm-window-pill-label {
+  letter-spacing: 0.05em;
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+.llm-window-pill-sep {
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.llm-window-pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.llm-window-pill-arrow {
+  flex-shrink: 0;
+  opacity: 0.75;
+  font-size: 0.75rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  transition: transform 160ms var(--ease-out);
+}
+.llm-window-pill.open .llm-window-pill-arrow {
+  transform: rotate(180deg);
+}
+.llm-window-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  border-radius: var(--radius-xs);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.llm-window-btn:hover { color: var(--fg); background: var(--bg); }
+.llm-window-head {
+  position: relative;
+}
+.llm-window-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 8px;
+  z-index: 70;
+  min-width: 200px;
+  max-width: min(320px, 90%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  overflow: hidden;
+}
+.llm-window-dropdown button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.llm-window-dropdown button:hover {
+  background: var(--bg-subtle);
+}
+.llm-window-dropdown button.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+.llm-window-dropdown button.active::before {
+  content: "● ";
+  font-size: 0.6rem;
+}
+.llm-window-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  background: linear-gradient(315deg, transparent 0 55%, var(--border-strong) 55% 62%, transparent 62% 70%, var(--border-strong) 70% 77%, transparent 77%);
+  touch-action: none;
+}
+.llm-window.dragging { cursor: grabbing; }
+.llm-window.dragging .llm-window-head { cursor: grabbing; }
+.llm-window-body { user-select: text; }
+.llm-window-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Чат */
+.llm-chat {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+}
+.llm-chat::-webkit-scrollbar { width: 6px; }
+.llm-chat::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+.llm-chat-empty {
+  color: var(--fg-muted);
+  font-size: 0.8125rem;
+  text-align: center;
+  margin: 24px 12px;
+  line-height: 1.5;
+}
+.llm-msg {
+  max-width: 85%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.llm-msg.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-bottom-right-radius: 4px;
+}
+.llm-msg.assistant {
+  align-self: flex-start;
+  background: var(--bg-subtle);
+  color: var(--fg);
+  border-bottom-left-radius: 4px;
+}
+.llm-msg.blocked {
+  opacity: 0.65;
+  border: 1px dashed var(--danger);
+}
+.llm-msg.assistant.streaming::after {
+  content: "▍";
+  animation: llm-blink 900ms steps(2) infinite;
+  margin-left: 2px;
+  opacity: 0.65;
+}
+@keyframes llm-blink {
+  50% { opacity: 0; }
+}
+.llm-chat-foot {
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+  flex-shrink: 0;
+  align-items: flex-end;
+}
+.llm-chat-foot textarea {
+  flex: 1;
+  min-height: 36px;
+  max-height: 88px;
+  resize: none;
+  padding: 8px 10px;
+  font-size: 0.875rem;
+  line-height: 1.35;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.llm-chat-foot textarea::-webkit-scrollbar { display: none; }
+.llm-chat-expand {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--fg-muted);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.llm-chat-expand:hover { color: var(--fg); }
+.llm-chat-expand:disabled { opacity: 0.4; cursor: not-allowed; }
+.llm-expand-body {
+  min-height: 220px;
+  max-height: 60vh;
+  resize: vertical;
+  padding: 12px;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  font-family: inherit;
+}
+.llm-window-fab {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 60;
+  height: 40px;
+  padding: 0 16px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 0;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.llm-window-fab:hover { background: color-mix(in oklab, var(--accent) 88%, #fff); }
+.alerts-toolbar {
+  display: grid;
+  /* Две равные половины: слева фильтры, справа счётчики.
+     Внутренний вертикальный разделитель — border-right левой колонки. */
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  align-items: stretch;
+  padding: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+@media (max-width: 720px) {
+  .alerts-toolbar { grid-template-columns: 1fr; }
+}
+
+/* Фильтры слева: вертикальные поля «label сверху / select снизу» */
+.alerts-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: var(--space-4) var(--space-5);
+  /* Вертикальный разделитель — пунктир, не бросается в глаза. */
+  border-right: 1px dashed var(--border);
+}
+@media (max-width: 720px) {
+  .alerts-filters {
+    border-right: none;
+    border-bottom: 1px dashed var(--border);
+  }
+}
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.filter-field label {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  /* Отключаем капс из базового стиля label — здесь имена обычным
+     регистром («Severity», «Сервер», «Статус»). */
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+.filter-field select {
+  width: 100%;
+  height: 34px;
+  font-size: 0.8125rem;
+  min-width: 0;
+  /* Своя стрелка вместо нативной: полный контроль над отступом
+     правого края. Левый padding текста и правый отступ стрелки —
+     одинаковые (12px), получается визуальная симметрия. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%239aa0a6' d='M0 0h10L5 6z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding: 0 30px 0 12px;
+}
+
+/* Счётчики справа: центр правой половины, две строки, разделители-точки */
+.alerts-counters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--space-4) var(--space-5);
+}
+.alerts-counter-active,
+.alerts-counter-other {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.alerts-counter-sep {
+  width: 100%;
+  max-width: 420px;
+  height: 1px;
+  background: var(--border);
+  margin: 2px 0;
+}
+.alerts-counter-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-muted);
+}
+/* Разделитель-точка между соседними счётчиками в строке — как в meta
+   карточки алерта. Ставится перед КАЖДЫМ счётчиком кроме первого. */
+.alerts-counter-active > .alerts-counter-item + .alerts-counter-item::before,
+.alerts-counter-other  > .alerts-counter-item + .alerts-counter-item::before {
+  content: "·";
+  margin-right: 8px;
+  color: var(--fg-subtle);
+  font-weight: 400;
+}
+.alerts-counter-item b {
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: var(--fg);
+  line-height: 1;
+}
+.alerts-counter-item small {
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  letter-spacing: 0.02em;
+}
+.alerts-counter-item.critical b { color: var(--danger); }
+.alerts-counter-item.warning b { color: var(--warn); }
+.alerts-counter-item.info b { color: var(--info); }
+.alerts-counter-item.total b { color: var(--fg); }
+
+.alert-list-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.alert-card {
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.alert-card.critical { border-left: 3px solid var(--danger); }
+.alert-card.warning  { border-left: 3px solid var(--warn); }
+.alert-card.info     { border-left: 3px solid var(--info); }
+.alert-card.resolved { opacity: 0.55; }
+.alert-card.dismissed { opacity: 0.4; }
+
+.alert-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.alert-card-title {
+  font-weight: 600;
+  font-size: 0.9375rem;
+  flex: 1;
+  min-width: 0;
+}
+.alert-card-desc {
+  font-size: 0.875rem;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+}
+.alert-card-meta {
+  display: flex;
+  gap: var(--space-3);
+  font-size: 0.8125rem;
+  color: var(--fg-muted);
+  flex-wrap: wrap;
+}
+.alert-card-meta .mono { font-size: 0.8125rem; }
+.alert-card-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+.alert-repeat {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+.alert-history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: var(--space-3);
+  background: var(--bg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  scrollbar-width: thin;
+}
+.alert-history-item {
+  display: grid;
+  grid-template-columns: max-content 1fr auto;
+  gap: 8px;
+  font-size: 0.8125rem;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+  align-items: center;
+}
+.alert-history-item:last-child { border-bottom: none; }
+.alert-history-kind {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+.alert-history-kind.created { color: var(--info); }
+.alert-history-kind.repeated { color: var(--fg-muted); }
+.alert-history-kind.acknowledged { color: var(--accent); }
+.alert-history-kind.resolved,
+.alert-history-kind.auto_resolved { color: var(--ok); }
+.alert-history-kind.dismissed { color: var(--fg-subtle); }
+.alert-history-kind.muted { color: var(--warn); }
+.alert-history-time {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+.alert-history-actor {
+  color: var(--fg-subtle);
+  font-size: 0.75rem;
+}
+.alert-detail-meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 0.8125rem;
+  padding: var(--space-3);
+  background: var(--bg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+}
+.alert-detail-meta dt { color: var(--fg-muted); }
+.alert-detail-meta dd { margin: 0; font-family: var(--font-mono); word-break: break-word; }
+.sub-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-4);
+}
+.sub-tabs button {
+  height: 36px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 0 var(--space-4);
+  font: inherit;
+  border-bottom: 2px solid transparent;
+}
+.sub-tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
+
+.check-card {
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.check-card.disabled { opacity: 0.5; }
+.check-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.check-title { font-weight: 600; font-size: 0.9375rem; flex: 1; min-width: 0; }
+.check-meta {
+  display: flex;
+  /* gap:0 — промежутки даёт ::before у разделителя. Так расстояние
+     между соседними элементами симметрично относительно "·", как
+     в .alert-card-meta (единый паттерн разделителя в проекте). */
+  gap: 0;
+  font-size: 0.8125rem;
+  color: var(--fg-muted);
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+}
+.check-meta > span + span::before {
+  content: "·";
+  margin: 0 8px;
+  color: var(--fg-subtle);
+}
+/* Когда метаданные разбиты на несколько строк по 3 элемента
+   (см. AlertRulesFromLLMModal), они оборачиваются в .check-meta-group.
+   Внутри группы — плотный gap 2px, снаружи группа ведёт себя как
+   один элемент flex-контейнера .check-card (gap 8px применяется
+   один раз до группы и один раз после). */
+.check-meta-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* Severity в мета-строке — цветным текстом, без badge-фона. */
+.check-meta .sev-critical { color: var(--danger); font-weight: 600; }
+.check-meta .sev-warning  { color: var(--warn);   font-weight: 600; }
+.check-meta .sev-info     { color: var(--info);   font-weight: 600; }
+
+/* Кликабельный badge (для кнопки «показать детали дубликата»). */
+.badge--clickable {
+  cursor: pointer;
+  transition: background var(--motion-quick) var(--ease-out),
+              border-color var(--motion-quick) var(--ease-out);
+}
+.badge--clickable:hover {
+  background: color-mix(in oklab, var(--bg-subtle) 70%, var(--fg) 12%);
+  border-color: var(--border-strong);
+}
+.check-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+  align-items: center;
+}
+.badge.ok    { color: var(--ok); border-color: color-mix(in oklab, var(--ok) 50%, transparent); }
+.badge.fail  { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 50%, transparent); }
+.badge.off   { color: var(--fg-subtle); }
+.match-group {
+  padding: var(--space-3);
+  background: var(--bg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.match-group-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.match-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.match-checks .check { margin: 0; }
+.rk-stats {
+  display: flex;
+  gap: var(--space-3);
+  font-size: 0.8125rem;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+.rk-stats span b { color: var(--fg); }
+.rk-policy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.rk-policy.auto { color: var(--ok); }
+.rk-policy.confirm { color: var(--warn); }
+.form-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.form-section-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.form-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* InfoHint */
+.info-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-muted);
+  font-size: 0.65rem;
+  font-weight: 700;
+  font-style: normal;
+  cursor: help;
+  margin-left: 6px;
+  vertical-align: middle;
+  position: relative;
+  line-height: 1;
+}
+.info-hint:hover { color: var(--fg); border-color: var(--fg-muted); }
+.info-hint:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  font-weight: 400;
+  font-style: normal;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.4;
+  white-space: normal;
+  width: max-content;
+  max-width: 260px;
+  text-align: left;
+  box-shadow: var(--shadow);
+  z-index: 100;
+}
+
+/* Multi-select с чипами */
+.ms-wrap {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 8px;
+  min-height: 38px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  align-items: center;
+}
+.ms-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--bg-subtle);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  max-width: 100%;
+}
+.ms-chip-label { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ms-chip-x {
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  cursor: pointer;
+  padding: 0 0 0 2px;
+  font: inherit;
+  line-height: 1;
+}
+.ms-chip-x:hover { color: var(--danger); }
+.ms-open {
+  flex: 1;
+  min-width: 60px;
+  height: 22px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8125rem;
+  text-align: left;
+  padding: 0 4px;
+}
+.ms-open:hover { color: var(--fg); }
+.ms-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  max-height: 240px;
+  overflow-y: auto;
+  z-index: 80;
+  padding: 4px 0;
+}
+.ms-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  padding: 6px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+.ms-item:hover { background: var(--bg-subtle); }
+.ms-item.on { color: var(--accent); font-weight: 600; }
+.ms-empty { padding: 8px 12px; color: var(--fg-muted); font-size: 0.8125rem; }
+
+/* Операторы сравнения в select (≥ > ≤ <): в обычном шрифте символы
+   < > рисуются ниже ростом, чем ≥ ≤. Единый mono-шрифт выравнивает
+   их визуально. Применяется через span.op-sym внутри <option>. */
+.op-sym {
+  font-family: var(--font-mono);
+  font-size: 1.05em;
+  line-height: 1;
+}
+
+/* ============================================================
+   Кастомные form-controls: radio / checkbox / number
+   ============================================================
+   Нативные элементы в тёмной теме выглядят чужеродно: серые
+   квадратные стрелки у number, системный accent-color у radio/
+   checkbox, а focus-outline рисует квадратную обводку. Заменяем
+   через appearance: none и собираем свой вид в стиле проекта.
+
+   Разметка не меняется — работает с <input type="radio|checkbox|
+   number"> как есть. */
+
+input[type="radio"],
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  max-width: 16px;
+  min-height: 16px;
+  max-height: 16px;
+  padding: 0;
+  box-sizing: border-box;
+  margin: 0;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg-input);
+  cursor: pointer;
+  flex-shrink: 0;
+  flex-grow: 0;
+  position: relative;
+  transition: border-color var(--motion-quick) var(--ease-out),
+              background var(--motion-quick) var(--ease-out),
+              box-shadow var(--motion-quick) var(--ease-out);
+}
+input[type="radio"]:hover:not(:disabled),
+input[type="checkbox"]:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+input[type="radio"]:disabled,
+input[type="checkbox"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* Focus — скруглённое свечение вместо квадратного outline. */
+input[type="radio"]:focus,
+input[type="checkbox"]:focus {
+  outline: none;
+}
+input[type="radio"]:focus-visible,
+input[type="checkbox"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 35%, transparent);
+}
+
+/* Radio — круглый, точка accent внутри. */
+input[type="radio"] {
+  border-radius: 50%;
+}
+input[type="radio"]:checked {
+  border-color: var(--accent);
+}
+input[type="radio"]:checked::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* Checkbox — квадрат со скруглением, галочка accent-fg. */
+input[type="checkbox"] {
+  border-radius: var(--radius-xs);
+}
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--accent-fg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+/* Промежуточное состояние (для «выбрано частично» — пока не
+   используется, но чтобы не терять нативный вид). */
+input[type="checkbox"]:indeterminate {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  top: 50%;
+  height: 2px;
+  background: var(--accent-fg);
+  transform: translateY(-50%);
+}
+
+/* ============================================================
+   Toggle switch для .check input[type="checkbox"]
+   ============================================================
+   Заменяем квадратную галочку на анимированный переключатель
+   (iOS-style). Внутри — вертикальный thumb, при выборе он едет
+   слева направо, фон плавно перекрашивается в accent. Надпись
+   «no» / «ok» центрируется в свободной половине.
+
+   Работает только для .check (там всегда одиночный bool-чекбокс).
+   .server-picker-item input[type=checkbox] и другие места
+   остаются квадратными 14×14 со галочкой — там toggle был бы
+   не по размеру. */
+.check input[type="checkbox"] {
+  width: 44px;
+  height: 24px;
+  min-width: 44px;
+  max-width: 44px;
+  min-height: 24px;
+  max-height: 24px;
+  aspect-ratio: auto;
+  box-sizing: border-box;
+  border-radius: 3px;
+  background-color: var(--bg-input);
+  background-clip: padding-box;
+  /* Контур NO — приглушённый красный (#a05447, как в SVG).
+     В checked меняется на accent (см. ниже). Значение хардкодом,
+     потому что это точная копия цвета из toggle-no.svg. */
+  border: 1px solid #a05447;
+  transition: background-color 200ms var(--ease-out),
+              border-color 200ms var(--ease-out);
+}
+.check input[type="checkbox"]::before {
+  /* thumb — тонкая полоса 3×18. top/left отсчитываются от
+     padding-box (внутренней границы border). Border = 1px,
+     поэтому 2px внутри дают 3px от внешнего края трека. */
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: 3px;
+  border-radius: 1px;
+  /* NO: приглушённый красный (#a05447, как SVG и border трека).
+     OK: accent. */
+  background-color: #a05447;
+  /* Единый transition для hover и click: overshoot, мягкая
+     остановка. */
+  transition: left 280ms cubic-bezier(0.34, 1.56, 0.64, 1),
+              background-color 200ms var(--ease-out);
+}
+.check input[type="checkbox"]::after {
+  /* Векторная иконка «NO» — через background-image.
+     Цвета зафиксированы в SVG-файле, CSS просто показывает картинку.
+     ВАЖНО: border: none + transform: none — сбрасываем свойства,
+     которые иначе наследуются из общего правила
+     `input[type=checkbox]:checked::after` (там галочка для
+     server-picker-item через border-left+bottom + rotate 45deg).
+     Без сброса эти свойства накладываются поверх нашей SVG
+     и получается двойная фигура. */
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 16px;
+  width: 16px;
+  height: 10px;
+  margin-top: -5px;
+  /* border: none + transform: none — обязательный сброс. Без
+     него наследуются border-width и rotate(45deg) из общего
+     правила `input[type=checkbox]:checked::after` (там галочка
+     для server-picker-item), и наши SVG разворачиваются. */
+  border: none;
+  transform: none;
+  background-color: transparent;
+  background-image: url("/static/img/toggle-no.svg?v=9");
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+  pointer-events: none;
+  transition: background-size 200ms var(--ease-out);
+}
+/* hover: иконка чуть увеличивается. */
+.check input[type="checkbox"]:hover:not(:disabled)::after {
+  background-size: 118% 118%;
+}
+/* hover-намёк: только thumb чуть продвигается, border и фон
+   трека не трогаем. Явный :hover::before с transition — чтобы
+   анимация была идентична клику (и для checked-состояния тоже). */
+.check input[type="checkbox"]:hover:not(:disabled)::before {
+  transition: left 280ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.check input[type="checkbox"]:hover:not(:disabled):not(:checked)::before {
+  left: 5px;
+}
+/* hover не перекрашивает контур трека — остаётся danger. */
+.check input[type="checkbox"]:hover:not(:disabled):not(:checked) {
+  border-color: #a05447;
+}
+.check input[type="checkbox"]:hover:not(:disabled):checked {
+  border-color: var(--accent);
+}
+/* выбранное состояние. Обводка — тот же inset-контур, но тёмный
+   (цвет --accent-fg — почти чёрный). На светлом accent-фоне
+   граница трека становится отчётливо видна, и отступы thumb
+   от стенок читаются одинаково в обоих состояниях. */
+.check input[type="checkbox"]:checked {
+  /* Контур OK-состояния — accent (тот же голубой, что у полоски
+     и иконки). Фон трека остаётся тёмным. */
+  border-color: var(--accent);
+}
+.check input[type="checkbox"]:checked::before {
+  /* Компенсация border 1px: 44 − 1(border right) − 3(thumb) −
+     3(желаемый gap) = 37. Цвет полоски = --accent. */
+  left: 37px;
+  background-color: var(--accent);
+}
+.check input[type="checkbox"]:checked::after {
+  /* Векторная иконка «OK» — через background-image.
+     border: none + transform: none — сбрасываем свойства,
+     унаследованные из общего правила (иначе поверх SVG
+     рисуется border-галочка и получается две фигуры). */
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 10px;
+  width: 16px;
+  height: 10px;
+  margin-top: -5px;
+  /* Сброс наследования от общего :checked::after (см. выше). */
+  border: none;
+  transform: none;
+  background-color: transparent;
+  background-image: url("/static/img/toggle-ok.svg?v=7");
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+  pointer-events: none;
+  transition: background-size 200ms var(--ease-out);
+}
+.check input[type="checkbox"]:checked:hover:not(:disabled)::before {
+  /* Дельта -3 (симметрично unchecked: 2 → 5, дельта +3).
+     Раньше было 37 → 36 (дельта -1) — overshoot на 0.56px
+     через цель выглядел как дёрганье. */
+  left: 34px;
+  transition: left 280ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.check input[type="checkbox"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------
+   toggle--onoff: вариант switch с иконками ON/OFF.
+   ------------------------------------------------------------
+   Отличие от базового (OK/NO) — только иконки внутри трека.
+   Трек/thumb/анимации/hover — те же (наследуются из базовых
+   правил `.check input[type=checkbox]`). Здесь переопределяются
+   только размер и позиция иконки + сама картинка.
+   Иконки шире (22px против 16px), потому что OFF = 3 буквы.
+   Селектор `.check.check--onoff` специфичнее `.check` — override
+   гарантирован. */
+
+/* Toggle ON/OFF — вариант switch с иконками ON/OFF.
+   Размер трека = базовый (44×24). Отличие от OK/NO — только
+   иконки внутри (шире, потому что OFF = 3 буквы).
+   Селектор `.check.check--onoff` специфичнее `.check` —
+   override гарантирован. */
+/* Явные размеры трека для .check--onoff. Дублируем базовое
+   правило `.check input[type="checkbox"]`, чтобы гарантированно
+   перебить возможные конфликты специфичности. */
+.check.check--onoff input[type="checkbox"] {
+  width: 44px;
+  height: 24px;
+  min-width: 44px;
+  max-width: 44px;
+  min-height: 24px;
+  max-height: 24px;
+  aspect-ratio: auto;
+  display: inline-block;
+  box-sizing: border-box;
+  border-radius: 3px;
+  background-color: var(--bg-input);
+  background-clip: padding-box;
+  border: 1px solid #a05447;
+  position: relative;
+  cursor: pointer;
+}
+.check.check--onoff input[type="checkbox"]:checked {
+  border-color: var(--accent);
+}
+.check.check--onoff input[type="checkbox"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: 3px;
+  border-radius: 1px;
+  background-color: #a05447;
+  transition: left 280ms cubic-bezier(0.34, 1.56, 0.64, 1),
+              background-color 200ms var(--ease-out);
+}
+.check.check--onoff input[type="checkbox"]:checked::before {
+  left: 37px;
+  background-color: var(--accent);
+}
+.check.check--onoff input[type="checkbox"]:hover:not(:disabled):not(:checked)::before {
+  left: 5px;
+}
+.check.check--onoff input[type="checkbox"]:hover:not(:disabled):checked::before {
+  left: 34px;
+}
+
+.check.check--onoff input[type="checkbox"]::after {
+  /* Контейнер больше картинки на 2px с каждой стороны.
+     Запас нужен, т.к. background-image при hover-увеличении
+     (background-size > 100%) обрезается границами контейнера;
+     у ON/OFF буквы стоят по краям картинки. */
+  width: 26px;
+  height: 14px;
+  margin-top: -7px;
+  left: 10px;
+  overflow: visible;
+  background-image: url("/static/img/toggle-off.svg");
+  background-size: 22px 12px;
+  background-position: center;
+  background-repeat: no-repeat;
+  /* Тот же easing, что у thumb — синхронное движение. */
+  transition: background-size 280ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.check.check--onoff input[type="checkbox"]:checked::after {
+  left: 6px;
+  background-image: url("/static/img/toggle-on.svg");
+  background-size: 22px 12px;
+}
+.check.check--onoff input[type="checkbox"]:hover:not(:disabled)::after {
+  background-size: 24px 13px;
+}
+/* flex-обёртка: meta-группа слева, toggle справа.
+   При сжатии окна meta сжимается, между ней и toggle
+   всегда сохраняется gap 16px (двойной обычный отступ карточки). */
+.check-meta-with-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.check-meta-with-toggle > .check-meta-group {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.check-meta-with-toggle > .check--onoff {
+  flex-shrink: 0;
+}
+/* Специальный отступ: у .check с toggle текст в label идёт сразу за
+   прямоугольником 44px — стандартный gap 8px уже даёт воздух. */
+.check > input[type="checkbox"] {
+  margin-right: 2px;
+}
+
+/* Number — кастомные стрелки в правой части. Две SVG-иконки:
+   вверх и вниз, цвет --fg-muted, при фокусе — --fg. */
+input[type="number"] {
+  /* appearance: none НЕ ставим — иначе Chromium удаляет нативные
+     кнопки-стрелки, и клики по ним перестают работать. Firefox
+     гасим отдельным правилом -moz-appearance. */
+  -moz-appearance: textfield;   /* Firefox: убрать нативные стрелки */
+  padding-right: 30px;
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%239aa0a6' d='M5 0l5 6H0z'/></svg>"),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%239aa0a6' d='M5 6L0 0h10z'/></svg>");
+  background-repeat: no-repeat;
+  background-position:
+    right 10px top calc(50% - 9px),
+    right 10px bottom calc(50% - 9px);
+  background-size: 10px 6px;
+}
+input[type="number"]:hover:not(:disabled) {
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%23e8e6e1' d='M5 0l5 6H0z'/></svg>"),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%23e8e6e1' d='M5 6L0 0h10z'/></svg>");
+}
+input[type="number"]:focus {
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%23e8e6e1' d='M5 0l5 6H0z'/></svg>"),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%23e8e6e1' d='M5 6L0 0h10z'/></svg>");
+}
+input[type="number"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* Прозрачный оверлей поверх фоновых SVG, чтобы клики по областям
+   «вверх» / «вниз» продолжали работать в Chromium. */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  /* Прозрачная, но «живая» кнопка: клик по верхней половине правой
+     зоны увеличивает значение, по нижней — уменьшает. */
+  opacity: 0;
+  height: 100%;
+  width: 28px;
+  cursor: pointer;
+  margin: 0;
+}
+
+/* Строка формы добавления сервера: «Имя» слева, toggle «локальный»
+   справа. Toggle выравнивается по низу — на одном уровне с полем
+   ввода имени (а не с его label). */
+.server-form-row-name {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-end;
+}
+.server-form-row-name-left {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.server-form-row-name > .check {
+  flex: 0 0 auto;
+  margin: 0;
+  /* Чуть выше нижней границы поля — компенсация line-height у label.
+     Без этого текст «локальный» визуально «висит» ниже. */
+  padding-bottom: 12px;
+}
+/* Строка «Host | Порт»: Host растягивается, Порт — по контенту. */
+.server-form-row-two {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-end;
+}
+.server-form-row-two > .grow-host {
+  flex: 1 1 auto;
+  min-width: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.server-form-row-two > .grow-port {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.server-form-row-two > .grow-port input {
+  /* Порт — 5 цифр максимум (65535). Ширина фиксированная, чтобы
+     не растягивалось на всю доступную область. */
+  width: 96px;
+  text-align: center;
+  padding-right: 30px;
+}
+
+/* Тонкий горизонтальный разделитель между двумя секциями внутри
+   одной .card. Используется, когда два смысловых блока должны
+   жить на одном фоне, но с визуальным разделением (например,
+   «Имя сервера» + «Тип сервера»). */
+.card-divider {
+  border: 0;
+  height: 1px;
+  background: var(--border);
+  margin: var(--space-2) 0;
+  width: 100%;
+}
+
+/* Строка «label слева — toggle справа»: применяется в формах
+   правил и реакций (Название + включена/выключена). */
+.form-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.form-label-row > label:first-child {
+  margin: 0;
+}
+.form-label-row .check--onoff {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+/* Radio group */
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.radio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.875rem;
+  color: var(--fg);
+  cursor: pointer;
+}
+.radio-row input[type="radio"] {
+  cursor: pointer;
+}
+.radio-hint { font-size: 0.75rem; color: var(--fg-muted); margin-left: 4px; }
+
+/* Textarea без resize внутри форм */
+.modal textarea { resize: none; }
+.rk-status {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+}
+.rk-status.ok       { color: var(--ok); border-color: color-mix(in oklab, var(--ok) 50%, transparent); }
+.rk-status.fail     { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 50%, transparent); }
+.rk-status.warn     { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 50%, transparent); }
+.rk-status.running  { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 50%, transparent); }
+/* В grid-контексте .rk-status растягивался по ширине ячейки:
+   inline-flex + grid → justify-self по умолчанию stretch. Возвращаем
+   поведение «по контенту». */
+.alert-history-item > .rk-status,
+.pending-head > .rk-status {
+  justify-self: start;
+  width: max-content;
+}
+.rk-status.off      { color: var(--fg-subtle); }
+
+.pending-card {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.pending-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.pending-title { font-weight: 600; font-size: 0.9375rem; flex: 1; min-width: 0; }
+.pending-meta {
+  display: flex;
+  gap: var(--space-3);
+  font-size: 0.8125rem;
+  color: var(--fg-muted);
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+}
+.pending-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+.fp-box {
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+  margin: 4px 0;
+  font-size: 0.8125rem;
+}
+.nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #f0c4bd;
+  font-size: 0.65rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.nav-badge.warn { background: var(--warn); color: #ead7a4; }
+.toast {
+  position: fixed;
+  top: 8vh;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 14px 24px;
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, var(--ok) 22%, var(--bg-elevated));
+  color: #d4e3cc;
+  border: 1px solid color-mix(in oklab, var(--ok) 48%, transparent);
+  box-shadow: var(--shadow);
+  font-size: 0.9375rem;
+  font-weight: 500;
+  pointer-events: none;
+  animation: toast-in 320ms var(--ease-out);
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, -14px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+.page { padding: var(--space-5); max-width: 1280px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; gap: var(--space-5); }
+.h2 { margin: 0 0 var(--space-4); font-size: 1.35rem; letter-spacing: -0.03em; font-weight: 600; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--space-4);
+}
+
+/* Сетка карточек серверов на дашборде. Использует общий .grid
+   (auto-fill / minmax(280px, 1fr)); модификатор .dashboard-grid
+   добавляет поведение режима редактирования. */
+/* gap не трогаем: при auto-fill / minmax(280px, 1fr) любое
+   изменение gap пересчитывает ширину колонок и карточки
+   «дёргаются» при входе в режим редактирования. */
+.dashboard-grid.editing .card {
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  /* Transition и на opacity (fade in/out захваченной), и на
+     transform (target-карточка едет от progress'а). Второй нужен
+     именно здесь, не только в .drag-target: когда swapTarget
+     становится null и класс .drag-target снимается, inline
+     transform сбрасывается — а transition должен остаться,
+     чтобы сброс был плавным (иначе — резкая остановка). */
+  transition:
+    opacity 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+.dashboard-grid.editing .card:active {
+  cursor: grabbing;
+}
+/* В режиме редактирования кнопки и ссылки внутри карточек
+   не работают — вся площадь карточки становится «ручкой» drag.
+   pointer-events: none пропускает события сквозь кнопку к карточке,
+   так что клик не срабатывает, а drag начинается. */
+.dashboard-grid.editing .card button,
+.dashboard-grid.editing .card a {
+  pointer-events: none;
+  opacity: 0.45;
+  cursor: default;
+}
+/* Заморозка карточки: внешний сервер, у панели нет интернета.
+   Фон чуть приглушается — визуальный сигнал «не сейчас».
+   Динамика (KPI + sparkline) обёрнута в .card-dynamic и блюрится;
+   статика (имя, ip, ОС, время) и кнопка «Открыть» остаются чёткими. */
+.card.frozen {
+  background: color-mix(in oklab, var(--bg-elevated) 70%, var(--bg));
+}
+.card-dynamic {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  transition: filter 320ms var(--ease-out),
+              opacity 320ms var(--ease-out);
+}
+.card-dynamic.blurred {
+  filter: blur(4px);
+  opacity: 0.55;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Drag-handle — виден только в режиме редактирования. */
+.card-drag {
+  display: none;
+  color: var(--fg-subtle);
+  font-size: 1rem;
+  line-height: 1;
+  user-select: none;
+  flex-shrink: 0;
+  cursor: grab;
+}
+.dashboard-grid.editing .card-drag {
+  display: inline-block;
+}
+/* Захваченная карточка: невидима (её место — «дырка»), но
+   продолжает занимать свою позицию в сетке. Ghost едет за
+   курсором отдельным элементом. */
+.dashboard-grid.editing .card.dragging {
+  opacity: 0;
+}
+/* Карточка-цель swap-превью: к ней применяется inline transform
+   (B едет к месту A). Transition на transform — чтобы движение
+   было плавным при быстром курсоре и для отката. */
+.dashboard-grid.editing .card.drag-target {
+  /* Только z-index: карточка визуально «выше» соседей, пока
+     едет к месту dragging. Transition на transform уже в базовом
+     .card — не дублируем, чтобы не перебивать будет нечем. */
+  z-index: 1;
+}
+/* Ghost под курсором: размеры копируются из getBoundingClientRect. */
+.card-ghost {
+  position: fixed;
+  z-index: 250;
+  border-radius: var(--radius-lg);
+  /* Полупрозрачный фон + backdrop-filter: blur — эффект «стекла»
+     как у плашки вложения в LLM-чате. Сквозь ghost видно фон
+     страницы, размытый. */
+  background: color-mix(in oklab, var(--bg-elevated) 60%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+          backdrop-filter: blur(8px);
+  border: 1px solid var(--accent);
+  box-shadow: var(--shadow);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  pointer-events: none;
+  opacity: 0.95;
+  box-sizing: border-box;
+  /* Плавное появление ghost'а: 150ms от невидимого к полному.
+     Без этого «подъём» карточки при захвате выглядит резко. */
+  animation: card-ghost-in 150ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes card-ghost-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 0.95; transform: scale(1); }
+}
+/* Глобальный grabbing во время drag — перебивает локальные cursor. */
+body.dragging-server,
+body.dragging-server * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+.card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.card h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.02em; }
+.kpi { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 1.25rem; }
+.kpi small { color: var(--fg-muted); font-size: 0.75rem; margin-left: var(--space-1); }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+}
+.badge.ok { color: var(--ok); }
+.badge.warn { color: var(--warn); }
+.badge.danger { color: var(--danger); }
+
+.tabs { display: flex; gap: 2px; overflow: auto; border-bottom: 1px solid var(--border); margin-bottom: var(--space-4); }
+.tabs button {
+  height: 40px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 0 var(--space-4);
+  font: inherit;
+  border-bottom: 2px solid transparent;
+}
+.tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
+
+.chart-box {
+  width: 100%;
+  height: 220px;
+  background: var(--bg);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.chart-box { position: relative; }
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+  font-size: 0.875rem;
+  background: var(--bg);
+}
+.spark-box { width: 100%; height: 48px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--fg-muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.mono { font-family: var(--font-mono); font-size: 0.8125rem; word-break: break-all; }
+.pre {
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  max-height: 360px;
+  overflow: auto;
+}
+
+.modal-back {
+  position: fixed; inset: 0;
+  background: color-mix(in oklab, #000 55%, transparent);
+  display: grid; place-items: center;
+  padding: var(--space-4);
+  z-index: 20;
+}
+.modal {
+  width: min(640px, 100%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-head {
+  padding: var(--space-5) var(--space-5) var(--space-3);
+  flex-shrink: 0;
+}
+.modal-body {
+  /* padding-bottom: небольшой запас под outline последнего input'а.
+     outline рисуется СНАРУЖИ border-box, и при overflow-y: auto и
+     отсутствии padding снизу он бы клипался границей скролл-контейнера.
+     8px — с запасом на 2px outline + 1px offset. */
+  padding: 0 var(--space-5) 8px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  scrollbar-width: thin;
+}
+.modal-foot {
+  padding: var(--space-3) var(--space-5) var(--space-5);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.err { color: #f0c4bd; font-size: 0.875rem; }
+.okt { color: var(--ok); }
+.hidden { display: none; }
+.srv-head { display: flex; justify-content: space-between; gap: var(--space-4); align-items: flex-start; flex-wrap: wrap; }
+/* Строка «Имя · статус» на странице сервера. Точка-разделитель —
+   по проектному паттерну (.check-meta, .alert-card-meta,
+   .alerts-counter-item): через ::before у элемента после первого,
+   gap: 0, margin вокруг точки симметричный. */
+.srv-name-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+}
+.srv-name-row > .h2 {
+  /* Перебиваем стандартный margin-bottom у .h2, чтобы badge встал
+     ровно на одной линии с именем. */
+  margin: 0;
+}
+.srv-name-row > * + *::before {
+  content: "·";
+  margin: 0 8px;
+  color: var(--fg-subtle);
+}
+
+.check { display: flex; gap: var(--space-2); align-items: center; text-transform: none; letter-spacing: 0; font-size: 0.875rem; color: var(--fg); }
+
+.empty { padding: var(--space-6); gap: var(--space-4); }
+.empty h3 { font-size: 1.15rem; }
+.alert-list { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: var(--space-2); }
+.alert-list li { color: var(--fg); font-size: 0.875rem; }
+.table-wrap { overflow: auto; max-width: 100%; }
+
+.modal-back {
+  animation: fade-in var(--motion-fast) var(--ease-out);
+}
+.modal {
+  animation: modal-in var(--motion-fast) var(--ease-out);
+}
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-in {
+  from { opacity: 0; transform: scale(0.96) translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 720px) {
+  .top { flex-direction: column; align-items: stretch; }
+  .page { padding: var(--space-4); }
+  .chart-box { height: 180px; }
+  .nav { overflow: auto; }
+  .btn, .tabs button { min-height: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* User-op editor */
+.user-op-yaml {
+  min-height: 360px;
+  max-height: 60vh;
+  resize: vertical;
+  padding: 12px;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  tab-size: 2;
+}
+.user-op-status {
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 20px;
+}
+
+/* Whitelist editor */
+.wl-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-size: 0.8125rem;
+}
+.wl-chip.base {
+  opacity: 0.6;
+}
+.wl-chip-x {
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  cursor: pointer;
+  padding: 0 0 0 2px;
+  font: inherit;
+  line-height: 1;
+}
+.wl-chip-x:hover:not(:disabled) { color: var(--danger); }
+
+/* User-op links status row */
+.op-links-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Segmented control */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  align-self: flex-start;
+}
+.seg-btn {
+  padding: 6px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 0.8125rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.seg-btn:hover:not(.on) { color: var(--fg); }
+.seg-btn.on {
+  background: var(--bg-subtle);
+  color: var(--fg);
+}
+
+/* ServerPicker (inline-вариант MultiSelect для привязки к серверам) */
+.server-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.server-picker-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  min-height: 28px;
+}
+input.server-picker-input {
+  flex: 1;
+  min-width: 120px;
+  width: auto;
+  height: 24px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8125rem;
+  outline: none;
+}
+.server-picker-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+  display: flex;
+  flex-direction: column;
+  scrollbar-width: thin;
+}
+.server-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  font-size: 0.8125rem;
+}
+.server-picker-item:hover { background: var(--bg-subtle); }
+.server-picker-item input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+.server-picker-empty {
+  padding: 6px 4px;
+}
+
+/* Symbol button with delayed tooltip */
+.sym-btn {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.sym-btn:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border-strong);
+  background: var(--bg-subtle);
+}
+.sym-btn[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 9px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 100;
+  /* Исчезновение мгновенное: transition из базового (не-hover) состояния. */
+  transition: opacity 120ms ease-out 0ms, transform 120ms ease-out 0ms;
+}
+.sym-btn[data-tip]:hover:not(:disabled)::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  /* Появление с задержкой 1 сек: transition из hover-состояния. */
+  transition: opacity 120ms ease-out 1000ms, transform 120ms ease-out 1000ms;
+}
+
+/* Symbol button: overlay в углу textarea */
+.user-op-yaml-wrap {
+  position: relative;
+}
+.user-op-yaml-wrap .sym-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: color-mix(in oklab, var(--bg-input) 88%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+/* Tooltip через портал в body (position: fixed уже не заперт .modal) */
+.tooltip-float {
+  position: fixed;
+  z-index: 300;
+  background: var(--bg-subtle);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 9px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+  box-shadow: var(--shadow);
+}
+
+/* LLM chat: блок сообщения — пузырь + кнопки действий под ним.
+   Раньше suggested-кнопки жили внутри .llm-msg и рендерились инлайн
+   с текстом ответа. Теперь они вынесены в отдельный flex-ряд с
+   flex-wrap: кнопки переносятся по ширине пузыря, а сам ряд визуально
+   «приклеен» к пузырю снизу. */
+.llm-msg-block {
+  display: flex;
+  flex-direction: column;
+  max-width: 85%;
+  min-width: 0;
+}
+.llm-msg-block.user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+.llm-msg-block.assistant {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+/* Внутри блока пузырь занимает всю ширину блока — max-width на самом
+   .llm-msg больше не нужен (иначе получили бы 85% от 85% = 72%). */
+.llm-msg-block > .llm-msg {
+  max-width: 100%;
+  align-self: stretch;
+}
+.llm-msg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+  max-width: 100%;
+  min-width: 0;
+}
+/* Внутри action-ряда кнопки не имеют собственного верхнего отступа —
+   его даёт .llm-msg-actions. Иначе при переносе на новую строку
+   между кнопками появлялись бы «дырки». */
+.llm-msg-actions .llm-open-editor-btn {
+  margin-top: 0;
+}
+
+/* LLM chat: вложение */
+.llm-attach-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.llm-attach-x {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+}
+.llm-attach-x:hover { color: var(--danger); background: var(--bg); }
+
+
+/* Вложение в сообщении user: свернутое, с раскрытием */
+
+/* Плашка вложения в LLM-чате: сжимается по контенту, обрезка имени, отступ снизу */
+.llm-attach-name {
+  max-width: 320px;
+}
+
+/* Модалка-чат LLM */
+
+
+
+/* Восстановить padding у чата в модалке (я его ошибочно обнулил). */
+
+/* Обёртка поля ввода: relative, кнопки поверх в правом верхнем углу. */
+
+/* Пилюля профиля в шапке модалки — позиционирование dropdown. */
+
+/* --- Вложение: фиолетовый оттенок кода --- */
+
+/* ============================================================
+   LLM-chat modal (переписан целиком)
+   ============================================================ */
+
+
+/* Шапка — как в маленьком окне: pill профиля + [×], без лишнего. */
+
+/* Пилюля профиля: обёртка позиционирует dropdown */
+
+/* Body — колонка: chat (скролл) + input (фикс), либо input на всю высоту. */
+
+/* Чат: единственный скроллящийся регион. */
+
+/* Всплывающее уведомление (замена вложения) — поверх, по центру сверху. */
+
+/* Обёртка поля ввода: relative для кнопок-оверлея. */
+
+/* Плашка вложения в модалке — над textarea, без фона-подложки. */
+
+/* textarea: без рамки, без скругления, прижата к стенкам модалки. */
+
+/* Expanded: textarea растягивается на всё тело body. */
+
+/* Кнопки поверх textarea в правом верхнем углу. */
+
+/* ============================================================
+   Вложение в пузырях (рестайлинг: фон = accent-mix, текст — фиолет)
+   ============================================================ */
+
+.llm-attach-inline {
+  margin-bottom: 6px;
+  background: color-mix(in oklab, var(--accent) 26%, var(--bg-elevated));
+  border: 1px solid color-mix(in oklab, var(--accent) 38%, transparent);
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+}
+.llm-attach-inline > summary {
+  padding: 5px 8px;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  color: #ded5f5;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.llm-attach-inline > summary::-webkit-details-marker { display: none; }
+.llm-attach-inline > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  transition: transform 120ms var(--ease-out);
+}
+.llm-attach-inline[open] > summary::before {
+  transform: rotate(90deg);
+}
+.llm-attach-inline[open] > summary {
+  border-bottom: 1px solid color-mix(in oklab, var(--accent) 32%, transparent);
+}
+.llm-attach-pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1.45;
+  color: #c4b5fd;
+  background: color-mix(in oklab, var(--accent) 18%, var(--bg-elevated));
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+/* Плашка-пилюля в маленьком окне LLM (снизу, над foot). */
+.llm-attach-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 10px 12px;
+  padding: 5px 8px;
+  align-self: flex-start;
+  max-width: calc(100% - 20px);
+  background: color-mix(in oklab, var(--accent) 18%, var(--bg-elevated));
+  border: 1px solid color-mix(in oklab, var(--accent) 34%, transparent);
+  border-radius: var(--radius-xs);
+  font-size: 0.75rem;
+  color: var(--fg);
+}
+.llm-attach-pill .llm-attach-name {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.llm-attach-x {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+}
+.llm-attach-x:hover { color: var(--danger); background: var(--bg); }
+
+/* Уведомление (замена вложения) в маленьком окне. */
+.llm-attach-notice {
+  margin: 8px 10px 0;
+  padding: 6px 10px;
+  background: color-mix(in oklab, var(--warn) 18%, var(--bg-elevated));
+  border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent);
+  border-radius: var(--radius-xs);
+  font-size: 0.75rem;
+  color: #ead7a4;
+  animation: toast-in 200ms var(--ease-out);
+}
+
+/* ============================================================
+   LLM-chat modal (v3)
+   ============================================================ */
+
+.llm-chat-modal {
+  width: min(880px, 96vw);
+  height: min(740px, calc(100vh - 32px));
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  border-radius: 0;
+  overflow: visible;
+}
+
+/* Шапка: pill профиля — слева, [×] — справа. Без заголовка. */
+.llm-chat-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 5;
+}
+.llm-chat-modal-head .llm-window-btn {
+  margin-left: auto;   /* [×] прижат вправо */
+}
+
+/* Пилюля профиля: обёртка позиционирует dropdown */
+.llm-modal-pill-wrap {
+  position: relative;
+  min-width: 0;
+  flex-shrink: 0;
+  max-width: 60%;
+}
+.llm-modal-pill-wrap .llm-window-pill {
+  max-width: 100%;
+}
+.llm-modal-pill-wrap .llm-window-dropdown {
+  left: 0;
+  right: auto;
+}
+.llm-modal-profile-fallback {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Body: колонка chat + input. overflow: hidden — фиксирует скругление. */
+.llm-chat-modal-body {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-xl) var(--radius-xl);
+  /* visible, чтобы плашка вложения вылетала поверх чата (absolute в input) */
+  overflow: visible;
+  position: relative;
+}
+
+/* Чат — единственный скроллящийся регион. */
+.llm-chat-modal-body .llm-chat {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  scrollbar-width: thin;
+}
+.llm-chat-modal-body .llm-chat::-webkit-scrollbar { width: 6px; }
+.llm-chat-modal-body .llm-chat::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+
+/* Уведомление (замена вложения) — поверх, по центру сверху. */
+.llm-chat-modal-notice {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  margin: 0;
+  max-width: 80%;
+}
+
+/* Обёртка «плашка вложения + textarea + кнопки». */
+.llm-chat-modal-input {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--bg-input);
+  min-height: 0;
+  position: relative;
+  /* Скругление снизу совпадает с body, чтобы input закрывал углы
+     при overflow: visible на родителе. -1px — внутренняя граница body. */
+  border-radius: 0 0 calc(var(--radius-xl) - 1px) calc(var(--radius-xl) - 1px);
+}
+.llm-chat-modal.expanded .llm-chat-modal-input {
+  flex: 1 1 0;
+  min-height: 0;
+  border-top: 0;
+}
+
+/* Плашка вложения — как в маленьком окне. */
+.llm-chat-modal-input .llm-attach-pill {
+  /* Плашка висит над полем ввода и перекрывает контент чата.
+     bottom: calc(100% + 10px) — низ плашки на 10px выше верхнего
+     края input. Позиционирование относительно input (relative). */
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 14px;
+  margin: 0;
+  align-self: auto;
+  max-width: calc(100% - 28px);
+  z-index: 3;
+  box-shadow: var(--shadow);
+}
+
+/* Обёртка над textarea — relative для кнопок-оверлея. */
+.llm-chat-modal-input-area {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* textarea: без рамки, без скругления, прижата к стенкам. */
+.llm-chat-modal-input-area textarea {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 64px;
+  max-height: 40vh;
+  padding: 16px 100px 16px 20px;   /* справа — место под кнопки, боковые воздух */
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  outline: none;
+  resize: none;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.llm-chat-modal.expanded .llm-chat-modal-input-area textarea {
+  min-height: 0;
+  max-height: none;
+  /* Снизу большой запас — кнопки [⤡][➤] лежат поверх нижней части поля */
+  padding: 28px 32px 84px 32px;
+}
+
+/* Кнопки [⤢][➤] — абсолютно по центру правого края textarea. */
+.llm-chat-modal-actions {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  display: flex;
+  gap: 6px;
+  z-index: 2;
+  align-items: center;
+}
+.llm-chat-modal-actions .sym-btn {
+  width: 36px;
+  height: 36px;
+  font-size: 15px;
+  background: color-mix(in oklab, var(--bg-input) 85%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(2px);
+}
+.llm-chat-modal-actions .sym-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+/* Кнопка отправки в модалке — accent, одинаковый размер с маленьким окном.
+   Селектор из 3 классов (bg-input от .llm-chat-modal-actions .sym-btn
+   перебивался бы по порядку в файле — сейчас побеждает наша специфичность). */
+.llm-chat-modal-actions .sym-btn.sym-btn-send {
+  width: 52px;
+  height: 36px;
+  font-size: 18px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: transparent;
+}
+.llm-chat-modal-actions .sym-btn.sym-btn-send:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent) 88%, #fff);
+  color: var(--accent-fg);
+  border-color: transparent;
+}
+
+/* Expanded: кнопки — внизу, статичные, справа. */
+.llm-chat-modal.expanded .llm-chat-modal-actions {
+  /* Кнопки остаются поверх textarea. Группу выравниваем так, чтобы
+     ЦЕНТР последней кнопки (отправить) совпал с горизонтальным
+     центром модалки. left: calc(50% + 15px) + translateX(-100%):
+     правый край группы = 50% + полширины кнопки (15px), значит
+     центр последней кнопки ровно на 50%. */
+  position: absolute;
+  top: auto;
+  bottom: 18px;
+  right: auto;
+  left: calc(50% + 15px);
+  transform: translateX(-100%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+/* ============================================================
+   Fixes: attachment overlay + blur, expanded buttons
+   ============================================================ */
+
+/* --- Маленькое окно: плашка вложения поверх поля ввода --- */
+.llm-chat-foot { position: relative; }
+.llm-chat-foot > .llm-attach-pill {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  z-index: 5;
+  margin: 0;
+  align-self: auto;
+}
+
+/* Плашка-стекло: блюр + полупрозрачный фон (и в окне, и в модалке) */
+.llm-attach-pill {
+  background: color-mix(in oklab, var(--bg-elevated) 60%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent) 34%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* --- Модалка: плашка вложения поверх поля ввода --- */
+.llm-chat-modal-input { position: relative; }
+.llm-chat-modal-input .llm-attach-pill {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  top: auto;
+  margin: 0;
+  max-width: calc(100% - 20px);
+  z-index: 5;
+}
+/* expanded: сверху нет чата → плашка внутри, поверх textarea */
+.llm-chat-modal.expanded .llm-chat-modal-input .llm-attach-pill {
+  top: 10px;
+  bottom: auto;
+  left: 12px;
+}
+
+/* --- Textarea: чуть больше внутренних отступов --- */
+.llm-chat-modal-input-area textarea {
+  padding: 14px 100px 14px 16px;
+}
+.llm-chat-modal.expanded .llm-chat-modal-input-area textarea {
+  padding: 24px 24px 90px 24px;   /* большой нижний padding под кнопки */
+}
+
+/* --- Не-expanded: шире кнопка отправки (символ внутри) --- */
+.llm-chat-modal-actions .sym-btn-send {
+  width: 52px;
+  font-size: 18px;
+}
+
+/* --- Expanded: кнопки поверх textarea внизу по центру --- */
+.llm-chat-modal.expanded .llm-chat-modal-actions {
+  position: absolute;
+  top: auto;
+  right: auto;
+  left: 50%;
+  bottom: 16px;
+  /* Сдвигаем контейнер влево на (width_первой_кнопки + gap)/2, чтобы
+     центр ВТОРОЙ кнопки ("отправить") совпал с центром модалки.
+     Первая — sym-btn 40px, gap 8px → 24px. */
+  transform: translateX(calc(-50% - 24px));
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
+  z-index: 3;
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn {
+  width: 40px;
+  height: 40px;
+  font-size: 16px;
+  background: color-mix(in oklab, var(--bg-input) 85%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+
+/* Кнопка "отправить" в expanded — крупнее */
+.llm-chat-modal-send-btn-expanded {
+  height: 40px;
+  padding: 0 24px;
+  font-size: 0.9375rem;
+}
+
+/* ============================================================
+   Fixes: attachment overlay + blur, expanded buttons
+   ============================================================ */
+
+/* --- Маленькое окно: плашка вложения поверх поля ввода --- */
+.llm-chat-foot { position: relative; }
+.llm-chat-foot > .llm-attach-pill {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  z-index: 5;
+  margin: 0;
+  align-self: auto;
+}
+
+/* --- Плашка-стекло: блюр + полупрозрачный фон --- */
+.llm-attach-pill {
+  background: color-mix(in oklab, var(--bg-elevated) 60%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent) 34%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* --- Модалка: плашка вложения поверх поля ввода --- */
+.llm-chat-modal-input { position: relative; }
+.llm-chat-modal-input .llm-attach-pill {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  top: auto;
+  margin: 0;
+  max-width: calc(100% - 20px);
+  z-index: 5;
+}
+/* expanded: сверху нет чата → плашка внутри, поверх textarea */
+.llm-chat-modal.expanded .llm-chat-modal-input .llm-attach-pill {
+  top: 10px;
+  bottom: auto;
+  left: 12px;
+}
+
+/* --- Textarea: больше отступов, текст не касается границ --- */
+.llm-chat-modal-input-area textarea {
+  padding: 14px 100px 14px 16px;
+}
+.llm-chat-modal.expanded .llm-chat-modal-input-area textarea {
+  padding: 24px 24px 90px 24px;   /* большой нижний padding под кнопки */
+}
+
+/* --- Не-expanded: кнопка отправки шире (внутри символ ➤) --- */
+.llm-chat-modal-actions .sym-btn-send {
+  width: 52px;
+  font-size: 18px;
+}
+
+/* --- Expanded: кнопки поверх textarea внизу по центру --- */
+.llm-chat-modal.expanded .llm-chat-modal-actions {
+  position: absolute;
+  top: auto;
+  right: auto;
+  left: 50%;
+  bottom: 16px;
+  /* Сдвиг влево на (width_sym_btn + gap)/2 = 24px, чтобы центр
+     ВТОРОЙ кнопки (отправить) совпал с центром модалки. */
+  transform: translateX(calc(-50% - 24px));
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
+  z-index: 3;
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn {
+  width: 40px;
+  height: 40px;
+  font-size: 16px;
+  background: color-mix(in oklab, var(--bg-input) 85%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+
+/* Кнопка "отправить" в expanded — крупнее, без привязки к JS-классу.
+   Внутри .llm-chat-modal-actions это единственный .btn (остальные .sym-btn). */
+.llm-chat-modal.expanded .llm-chat-modal-actions .btn {
+  height: 40px;
+  min-width: 140px;
+  padding: 0 24px;
+  font-size: 0.9375rem;
+}
+
+/* ============================================================
+   LLM chat: attachment overlay + blur, expanded buttons
+   ============================================================ */
+
+/* --- Маленькое окно: плашка вложения поверх поля ввода --- */
+.llm-chat-foot { position: relative; }
+.llm-chat-foot > .llm-attach-pill {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  z-index: 5;
+  margin: 0;
+  align-self: auto;
+}
+
+/* --- Плашка-стекло: блюр + полупрозрачный фон --- */
+.llm-attach-pill {
+  background: color-mix(in oklab, var(--bg-elevated) 60%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent) 34%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* --- Модалка: плашка вложения поверх поля ввода --- */
+.llm-chat-modal-input { position: relative; }
+.llm-chat-modal-input .llm-attach-pill {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  top: auto;
+  margin: 0;
+  max-width: calc(100% - 20px);
+  z-index: 5;
+}
+/* expanded: чата сверху нет → плашка внутри textarea, вверху --- */
+.llm-chat-modal.expanded .llm-chat-modal-input .llm-attach-pill {
+  top: 10px;
+  bottom: auto;
+  left: 12px;
+}
+
+/* --- Textarea: увеличенные внутренние отступы --- */
+.llm-chat-modal-input-area textarea {
+  padding: 14px 100px 14px 16px;
+}
+.llm-chat-modal.expanded .llm-chat-modal-input-area textarea {
+  padding: 24px 24px 90px 24px;   /* большой нижний padding под кнопки */
+}
+
+/* --- Не-expanded: кнопка-символ отправки чуть шире --- */
+.llm-chat-modal-actions .sym-btn-send {
+  width: 52px;
+  font-size: 18px;
+}
+
+/* --- Expanded: кнопки поверх textarea внизу по центру --- */
+.llm-chat-modal.expanded .llm-chat-modal-actions {
+  position: absolute;
+  top: auto;
+  right: auto;
+  left: 50%;
+  bottom: 16px;
+  /* Кнопки: [↺ 36] [⤢ 36] [➤ 52], gap 8.
+     Центр ➤ от левого края контейнера: 36+8+36+8+26 = 114
+     Центр контейнера: 140/2 = 70
+     Сдвиг контейнера влево: 70 - 114 = -44 → translateX(calc(-50% - 44px))
+     Если reset скрыт: [⤢ 36] [➤ 52], gap 8
+     Центр ➤: 36+8+26 = 70; центр контейнера: 96/2 = 48; сдвиг -22. */
+  transform: translateX(calc(-50% - 22px));
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
+  z-index: 3;
+}
+.llm-chat-modal.expanded.has-reset .llm-chat-modal-actions {
+  transform: translateX(calc(-50% - 44px));
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn {
+  width: 36px;
+  height: 36px;
+  font-size: 15px;
+  background: color-mix(in oklab, var(--bg-input) 85%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn.sym-btn-send {
+  width: 52px;
+  height: 36px;
+  font-size: 18px;
+}
+
+/* Текстовая кнопка отправить/стоп в expanded — как было. */
+.llm-chat-modal.expanded .llm-chat-modal-actions .llm-send-text {
+  height: 36px;
+  padding: 0 24px;
+  font-size: 0.9375rem;
+  min-width: 140px;
+}
+.llm-chat-modal.expanded .llm-chat-modal-actions .sym-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+
+/* Кнопка «В редактор» под сообщением ассистента с suggested_op */
+.llm-open-editor-btn {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 8px;
+  padding: 5px 12px;
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  color: var(--accent);
+  border: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.llm-open-editor-btn:hover {
+  background: color-mix(in oklab, var(--accent) 32%, transparent);
+}
+
+/* User-op editor: две кнопки в углу textarea */
+
+/* Mode-pill: индикатор и переключатель режима чата */
+.llm-mode-pill-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.llm-mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px 0 10px;
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  max-width: 160px;
+  min-width: 0;
+  transition: color var(--motion-quick) var(--ease-out),
+              background var(--motion-quick) var(--ease-out);
+}
+.llm-mode-pill:hover {
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+.llm-mode-pill.active {
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 20%, var(--bg));
+  border-color: color-mix(in oklab, var(--accent) 42%, transparent);
+}
+.llm-mode-pill.active:hover {
+  background: color-mix(in oklab, var(--accent) 30%, var(--bg));
+}
+.llm-mode-pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  letter-spacing: 0.02em;
+}
+.llm-mode-pill-arrow {
+  flex-shrink: 0;
+  opacity: 0.7;
+  font-size: 0.7rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  transition: transform 160ms var(--ease-out);
+}
+.llm-mode-pill.open .llm-mode-pill-arrow {
+  transform: rotate(180deg);
+}
+/* Dropdown режима выравниваем по ЛЕВОМУ краю pill — как у profile-pill. */
+.llm-mode-pill-wrap .llm-window-dropdown {
+  left: 0;
+  right: auto;
+}
+
+/* Расширенные параметры профиля LLM */
+.llm-extra-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.llm-extra-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+input.llm-extra-key {
+  flex: 0 0 180px;
+  height: 32px;
+  padding: 0 8px;
+  font-size: 0.8125rem;
+}
+input.llm-extra-value {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  font-size: 0.8125rem;
+}
+.llm-extra-kind {
+  flex-shrink: 0;
+  min-width: 36px;
+  text-align: center;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+}
+.llm-extra-kind.kind-bool { color: var(--ok); border-color: color-mix(in oklab, var(--ok) 40%, transparent); }
+.llm-extra-kind.kind-num  { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 40%, transparent); }
+.llm-extra-kind.kind-obj,
+.llm-extra-kind.kind-arr  { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); }
+.llm-extra-del {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+}
+.llm-extra-del:hover { color: var(--danger); background: var(--bg-subtle); }
+.llm-extra-actions {
+  gap: 6px;
+}
+.llm-extra-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.llm-extra-preset {
+  padding: 4px 10px;
+  background: var(--bg-input);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.llm-extra-preset:hover {
+  color: var(--fg);
+  border-color: var(--border-strong);
+  background: var(--bg-subtle);
+}
+
+/* Inline-редактор правил из LLM */
+input.llm-rule-name {
+  height: 30px;
+  font-size: 0.8125rem;
+  min-width: 0;
+}
+select.llm-rule-name + select,
+.check-head select {
+  height: 30px;
+  font-size: 0.8125rem;
+  flex-shrink: 0;
+}
+textarea.llm-rule-cond {
+  min-height: 60px;
+  max-height: 200px;
+  font-size: 0.75rem;
+}
+.llm-rule-row {
+  gap: 8px;
+}
+.llm-rule-row select,
+.llm-rule-row input[type="number"] {
+  height: 30px;
+  font-size: 0.8125rem;
+}
+input.llm-rule-num {
+  width: 100px;
+  flex: 0 0 auto;
+}
+
+/* Глобальный тост — поверх всего, включая модалки */
+.toast {
+  position: fixed;
+  top: 8vh;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 400;   /* выше .modal-back (200), tooltip-float (300) */
+}
+.toast.warn {
+  background: color-mix(in oklab, var(--warn) 22%, var(--bg-elevated));
+  color: #ead7a4;
+  border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent);
+}
+.toast.error {
+  background: color-mix(in oklab, var(--danger) 22%, var(--bg-elevated));
+  color: #f0c4bd;
+  border: 1px solid color-mix(in oklab, var(--danger) 48%, transparent);
+}
+.toast { cursor: pointer; }
+
+/* Пометка id#N в meta алерта — по моноширинному */
+.alert-card-meta > .mono[title="ID алерта — используется в /explain"] {
+  color: var(--fg-subtle);
+}
+
+/* Навигация: всегда что-то одно — либо текст (широко), либо иконки (узко). */
+.nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* По умолчанию (широко): только текст, иконки скрыты. */
+.nav-icon { display: none; }
+.nav-text { white-space: nowrap; }
+/* Узко: скрываем текст, показываем иконки. Кнопки компактные. */
+@media (max-width: 900px) {
+  .nav-text { display: none; }
+  .nav-icon {
+    display: inline-flex;
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    color: currentColor;
+    opacity: 0.85;
+  }
+  .nav button.on .nav-icon,
+  .nav button:hover .nav-icon {
+    opacity: 1;
+  }
+  .nav button {
+    padding: 0 8px;
+    gap: 0;
+    position: relative;
+  }
+  .nav-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    font-size: 0.55rem;
+    margin: 0;
+  }
+}
+
+/* Разделитель в meta карточки алерта */
+.alert-card-meta > span + span::before {
+  content: "·";
+  margin: 0 8px 0 0;
+  color: var(--fg-subtle);
+}
+
+/* Модалки: textarea без resize по умолчанию.
+   UserOpEditor разрешает vertical-resize на своём поле YAML. */
+.modal textarea { resize: none; }
+.user-op-yaml { resize: vertical; }
+
+/* Текст в чате LLM должен выделяться (и в маленьком окне, и в модалке).
+   Кнопки/инпуты — нет. */
+.llm-chat-modal, .llm-chat-modal * { user-select: text; }
+.llm-chat-modal button,
+.llm-chat-modal select,
+.llm-chat-modal input { user-select: none; }
+.llm-window-body, .llm-window-body * { user-select: text; }
+.llm-window-body button,
+.llm-window-body textarea,
+.llm-window-body input { user-select: none; }
+/* Окно само по себе (за пределами body) остаётся невыделяемым — drag
+   за шапку не должен случайно триггерить selection. */
+.llm-window-head, .llm-window-head * { user-select: none; }
+
+/* Кнопка отправки (символ) — accent-фон, одинаковый в обоих местах. */
+.sym-btn.sym-btn-send {
+  width: 52px;
+  height: 36px;
+  font-size: 18px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: transparent;
+}
+.sym-btn.sym-btn-send:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent) 88%, #fff);
+  color: var(--accent-fg);
+  border-color: transparent;
+}
+.sym-btn.sym-btn-send:disabled {
+  opacity: 0.55;
+}
+
+
+/* ============================================================
+   Retention (Хранение данных) в SettingsView
+   ============================================================ */
+
+.retention-table {
+  /* fixed: ширины колонок задаются явно, контент не «распирает» */
+  table-layout: fixed;
+  width: 100%;
+}
+.retention-table td,
+.retention-table th {
+  padding: 10px 8px;
+  /* База задаёт vertical-align: top — здесь переопределяем на middle,
+     чтобы текстовые ячейки центрировались относительно input в «Срок».
+     Так отступ сверху и снизу равны. */
+  vertical-align: middle;
+}
+.retention-table .mono {
+  font-variant-numeric: tabular-nums;
+}
+/* Выравнивание: 1 — по левому краю, 4 — по правому,
+   средние две (Сейчас, Срок) — по центру, ширины равны. */
+.retention-table th:nth-child(1),
+.retention-table td:nth-child(1) { width: 40%; text-align: left; }
+.retention-table th:nth-child(2),
+.retention-table td:nth-child(2) { width: 20%; text-align: center; }
+.retention-table th:nth-child(3),
+.retention-table td:nth-child(3) { width: 20%; text-align: center; }
+.retention-table th:nth-child(4),
+.retention-table td:nth-child(4) { width: 20%; text-align: right; }
+
+/* У последней строки таблицы нижняя полоса не нужна — это визуальный
+   хвост, за ним ничего нет. База th,td даёт border-bottom у всех ячеек. */
+.retention-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.retention-days {
+  /* Grid: input всегда в центральной колонке (по центру ячейки),
+     подпись «дней» — в правой колонке сразу за input.
+     Раньше inline-flex центрировал всю группу целиком, из-за чего
+     input уходил левее центра ячейки. */
+  display: grid;
+  grid-template-columns: 1fr 88px 1fr;
+  align-items: center;
+  gap: 0;
+}
+.retention-days input[type="number"] {
+  grid-column: 2;
+  width: 88px;
+  height: 30px;
+  font-size: 0.8125rem;
+  text-align: center;
+  padding: 0 8px;
+  /* Нативные стрелки +/- убраны (Chrome/Safari — ::-webkit-*,
+     Firefox — appearance: textfield). Фоновые SVG-стрелки из
+     общего правила input[type="number"] здесь тоже отключаем —
+     ячейка узкая (88px), стрелки мешали бы. */
+  -moz-appearance: textfield;
+  appearance: textfield;
+  background-image: none;
+}
+.retention-days input[type="number"]::-webkit-outer-spin-button,
+.retention-days input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.retention-days > span {
+  grid-column: 3;
+  justify-self: start;
+  padding-left: 6px;
+}
+.retention-would {
+  color: var(--warn);
+  font-weight: 600;
+}
+.retention-foot {
+  padding-top: 4px;
+  align-items: center;
+}
+.retention-foot-info {
+  text-align: right;
+}
+
+
+/* Общее правило: у последней строки таблицы нижняя полоса не нужна.
+   Табличный глобальный th,td { border-bottom } оставляет визуальный
+   хвост под последней строкой, за которым ничего нет. */
+table.no-last-border tbody tr:last-child td {
+  border-bottom: none;
+}
+
+
+/* ============================================================
+   MetricsView — панель метрик сервера
+   ============================================================ */
+
+.metrics-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.metrics-windows {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+/* Кнопка «Сбросить все»: текст danger-оттенком, фон как у ghost.
+   Показывается только в режиме редактирования. */
+.metrics-reset {
+  color: color-mix(in oklab, var(--danger) 85%, var(--fg));
+}
+.metrics-reset:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in oklab, var(--danger) 40%, transparent);
+}
+
+.metrics-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.metrics-grid.editing {
+  gap: var(--space-2);
+}
+
+/* FLIP-хук ставит transform/transition на карточку только когда
+   порядок изменился. Не задаём transition в CSS — иначе любые
+   перерисовки карточек будут анимироваться. */
+.metric-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  /* flex-элемент иначе может «распирать» родителя по min-content. */
+  min-width: 0;
+}
+.metrics-grid.editing .metric-card {
+  cursor: grab;
+  padding: var(--space-3) var(--space-4);
+  user-select: none;
+  touch-action: none;   /* отключаем скролл при drag через touch */
+}
+.metrics-grid.editing .metric-card:active {
+  cursor: grabbing;
+}
+/* Перетаскиваемый оригинал — невидим, на его месте «дырка»;
+   surface, который «едет» за курсором — это .metric-card-ghost. */
+.metric-card.dragging {
+  opacity: 0;
+}
+
+.metric-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 28px;
+}
+.metric-title {
+  margin: 0;
+  font-size: 1.05rem;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.metric-drag {
+  display: none;
+  color: var(--fg-subtle);
+  font-size: 1rem;
+  line-height: 1;
+  user-select: none;
+  flex-shrink: 0;
+}
+.metrics-grid.editing .metric-drag {
+  display: inline-block;
+}
+.metric-window-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+.metric-menu-btn {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+  flex-shrink: 0;
+}
+.metric-menu-btn:hover {
+  color: var(--fg);
+  background: var(--bg-subtle);
+}
+/* Высота фиксированная (не min-height) и overflow: hidden — по
+   аналогии со старым .chart-box. Без этого canvas с bitmap-размером
+   (его задаёт Chart.js) может распирать контейнер, что приводило к
+   лагам при пересоздании графиков. */
+.metric-chart {
+  position: relative;
+  width: 100%;
+  height: 220px;
+  overflow: hidden;
+}
+/* canvas рисуется Chart.js в bitmap-размере, который может быть
+   больше контейнера после ресайза. Без max-width он растягивает
+   .metric-card и создаёт горизонтальный скролл у .view-host. */
+.metric-chart canvas {
+  max-width: 100%;
+  display: block;
+}
+.metric-edit-info {
+  padding: 4px 0;
+}
+
+/* Ghost при drag: тот же border-radius, что и у карточки. Никакой
+   браузерной тени-прямоугольника — своя, скруглённая. */
+.metric-card-ghost {
+  position: fixed;
+  z-index: 250;
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent);
+  box-shadow: var(--shadow);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  pointer-events: none;
+  opacity: 0.95;
+  box-sizing: border-box;
+}
+.metric-card-ghost .metric-drag {
+  display: inline-block;
+}
+.metric-card-ghost .metric-title {
+  margin: 0;
+}
+
+/* Контекстное меню счётчика (CounterMenu). Позиция — через inline
+   style left/top в пикселях (единственное исключение, кроме
+   .llm-window: меню следует за курсором). Всё остальное в CSS. */
+.counter-menu {
+  position: fixed;
+  z-index: 300;
+  min-width: 200px;
+  max-width: 260px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  animation: fade-in 100ms var(--ease-out);
+}
+.counter-menu-group {
+  padding: 2px 0;
+}
+.counter-menu-title {
+  padding: 4px 12px 6px;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.counter-menu-sep {
+  height: 1px;
+  margin: 2px 0;
+  background: var(--border);
+}
+.counter-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.counter-menu-item:hover {
+  background: var(--bg-subtle);
+}
+.counter-menu-item.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+.counter-menu-item.active::before {
+  content: "● ";
+  font-size: 0.6rem;
+}
+.counter-menu-item.danger {
+  color: var(--danger);
+}
+.counter-menu-item.danger:hover {
+  background: color-mix(in oklab, var(--danger) 14%, var(--bg-subtle));
+}
+
+
+/* Бейдж «⟲» рядом с названием метрики, если у неё установлен cutoff
+   (значения сброшены — график строится заново с момента клика). */
+.metric-cutoff-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--warn) 22%, var(--bg-subtle));
+  color: color-mix(in oklab, var(--warn) 85%, var(--fg));
+  font-size: 0.75rem;
+  font-weight: 600;
+  flex-shrink: 0;
+  cursor: help;
+}
+
+
+/* Пока идёт перетаскивание метрики — глобально grabbing на всём body.
+   Перебивает локальный .metric-card { cursor: grab }, из-за которого
+   при наведении ghost'а на соседнюю карточку курсор «слетал» с
+   захвата. */
+body.dragging-metric,
+body.dragging-metric * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+
+/* Placeholder «Загрузка…» внутри карточки метрики. Показывается,
+   пока данные за нужное окно ещё не пришли с бэкенда. Убирает
+   «мигание»: пользователь видит плашку, а не чужую кривую. */
+.metric-chart-placeholder {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+  font-size: 0.875rem;
+}
+
+
+/* Верхняя полоса страницы сервера: заголовок + вкладки.
+   При скролле контента вкладки полоса "прилипает" к верхней границе
+   скролл-контейнера (.view-host) и остаётся видимой. Остальной
+   контент вкладки прокручивается под ней.
+
+   Отрицательные margin компенсируют padding .page, чтобы полоса
+   шла от края до края страницы. background — непрозрачный, чтобы
+   контент не просвечивал под полосой. */
+.server-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  margin: calc(-1 * var(--space-5)) calc(-1 * var(--space-5)) 0;
+  padding: var(--space-4) var(--space-5) 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+/* Внутри .server-topbar у .tabs не нужен нижний отступ: он бы
+   увеличивал высоту sticky-блока, не добавляя пользы. */
+.server-topbar .tabs {
+  margin-bottom: 0;
+}
+
+
+/* ── ServerView: двухуровневая структура ─────────────────────
+   .server-page         — flex-колонка, занимает всю высоту .view-host;
+   .server-page-top     — фиксированный верх: заголовок, вкладки, баннеры;
+   .server-page-content — скролл-контейнер под вкладками.
+   Скролл-полоса идёт только в .server-page-content, не задевая ни
+   глобальную шапку, ни заголовок сервера, ни вкладки. */
+.server-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+  width: 100%;
+}
+.server-page-top {
+  flex-shrink: 0;
+  padding: var(--space-5) var(--space-5) 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.server-page-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--space-5);
+}
+
+
+/* ============================================================
+   Кастомный скроллбар (глобально)
+   ============================================================ */
+
+/* Единый тонкий скроллбар для всего приложения: тонкий, круглый,
+   на цвет --border-strong в покое и чуть светлее при hover.
+   Трек — прозрачный, чтобы фон под ним был виден.
+
+   Firefox: scrollbar-width + scrollbar-color.
+   Chrome/Safari/Edge: ::-webkit-scrollbar-*.
+   Оба правила работают независимо; браузер игнорирует чужой
+   синтаксис. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--fg) 32%, transparent);
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ============================================================
+   Suggest-стрим: плавное появление вложения и кнопок
+   ============================================================
+   Пока идёт стрим explanation — вложение (block) и кнопки
+   (suggested_*) не показываются. Когда событие final прилетает,
+   они появляются в один кадр — резко. Лечим это лёгкой
+   анимацией: opacity 0→1 + небольшой сдвиг вниз.
+
+   Анимация не срабатывает при первичном рендере истории из LS:
+   там элементы появляются в первом кадре — браузер прокручивает
+   анимацию, но пользователь этого не видит (страница
+   перерисовывается целиком).
+*/
+
+@keyframes llm-attach-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.llm-attach-inline {
+  animation: llm-attach-in 180ms var(--ease-out) both;
+}
+
+@keyframes llm-msg-actions-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.llm-msg-actions {
+  animation: llm-msg-actions-in 220ms var(--ease-out) both;
+}
+
+/* ============================================================
+   Patch 3d: плавное раздвигание пузыря при появлении
+   вложения и кнопок.
+
+   Идея: обёртка .llm-reveal — display: grid с одной строкой.
+   Скрытая = grid-template-rows: 0fr, показанная = 1fr.
+   Переход grid-template-rows — единственный способ плавно
+   анимировать «auto»-высоту без JS-замеров.
+
+   Внутренний .llm-reveal-inner { min-height: 0; overflow: hidden; } —
+   обязательные условия: без min-height: 0 grid-элемент не может
+   сжаться меньше контента, без overflow: hidden содержимое
+   «вылезает» за нулевую строку.
+
+   Предыдущая fade-анимация (из patch 3b) отключается:
+   её полностью перекрывал layout-shift, и появление всё равно
+   выглядело резким. Плавность даёт движение геометрии.
+
+   Класс общий для маленького окна и большой модалки LLM. */
+
+.llm-attach-inline,
+.llm-msg-actions {
+  animation: none;
+}
+.llm-reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.llm-reveal.shown {
+  grid-template-rows: 1fr;
+}
+.llm-reveal-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ============================================================
+   ModelCombobox — редактируемое поле модели + кнопка со стрелкой
+   ============================================================
+   Единый контейнер с рамкой: input без border, справа — кнопка
+   с залитым треугольником (та же иконка, что у .filter-field select).
+   Клик по кнопке открывает dropdown со списком моделей и полем-
+   фильтром. Значение из списка подставляется в input. */
+
+.model-combo {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  align-items: stretch;
+  box-sizing: border-box;
+}
+.model-combo:focus-within {
+  outline: 2px solid color-mix(in oklab, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+.model-combo-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  outline: none;
+}
+.model-combo-arrow {
+  width: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+.model-combo-arrow:hover:not(:disabled) {
+  color: var(--fg);
+  background: color-mix(in oklab, var(--bg-subtle) 80%, var(--fg) 6%);
+}
+.model-combo-arrow:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.model-combo-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 80;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  scrollbar-width: thin;
+}
+.model-combo-filter {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 4px 8px 6px;
+  height: 30px;
+  padding: 0 8px;
+  font-size: 0.8125rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--fg);
+}
+.model-combo-filter:focus {
+  outline: none;
+  border-color: var(--border-strong);
+}
+.model-combo-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-combo-item:hover {
+  background: var(--bg-subtle);
+}
+.model-combo-item.on {
+  color: var(--accent);
+  font-weight: 600;
+}
+.model-combo-empty {
+  padding: 8px 12px;
+  color: var(--fg-muted);
+  font-size: 0.8125rem;
+}
+
+/* ============================================================
+   Единая стрелка для всех <select> в проекте
+   ============================================================
+   Chrome рисует свою «шеврон»-иконку — она визуально отличается от
+   залитого треугольника, который уже используется в .filter-field select
+   и в ModelCombobox. Унифицируем: все select получают тот же SVG.
+   padding-right увеличиваем, чтобы текст не наезжал на стрелку. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%239aa0a6' d='M0 0h10L5 6z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 30px;
+}
+/* .filter-field select переопределяет padding/размеры под себя —
+   правило оставляем, чтобы не поломать фильтры (у них своя плотность). */
+
+/* ============================================================
+   Fix: убрать базовый outline у input внутри ModelCombobox
+   ============================================================
+   Проблема: базовое правило проекта `input:focus { outline: 2px solid; }`
+   имеет специфичность (0, 1, 1) — тип + псевдокласс. Селектор
+   `.model-combo-input` = (0, 1, 0) — только класс. Класс проигрывает,
+   поэтому при фокусе input получал outline с квадратными углами
+   (у input border-radius: 0) поверх нашего скруглённого контура
+   `.model-combo:focus-within`. Визуально — «два контура, один
+   перекрывает другой, квадратные углы».
+
+   Фикс: селектор `.model-combo-input:focus` = (0, 2, 0) — класс +
+   псевдокласс. Это больше (0, 1, 1), базовое правило побеждено.
+   Правильный контур остаётся только один — на `.model-combo:focus-within`. */
+
+.model-combo-input:focus,
+.model-combo-input:focus-visible {
+  outline: none;
+}
+
+/* ============================================================
+   Fix: обрезание outline у input в .modal-body
+   ============================================================
+   Базовое правило input:focus рисует outline-offset: 1px — outline
+   выходит на 3px за границу input. В модалках modal-body имеет
+   padding: 0 ... (без bottom), а следующий элемент или padding
+   модалки не оставляют места снизу — outline обрезается.
+   Внутри modal-body убираем offset: outline рисуется вплотную к
+   границе input, не выходит за контейнер. */
+.modal-body input:focus,
+.modal-body select:focus,
+.modal-body textarea:focus {
+  outline-offset: 0;
+}
+
+
+/* ============================================================
+   ProfileSection — строка «Имя профиля | slug»
+   ============================================================
+   Слева — колонка с label и строкой input+кнопка, справа — колонка
+   с label и read-only значением slug. Обе колонки одной высоты
+   (label + gap 4px + 44px), поэтому label-строки выравниваются
+   автоматически. Если места мало — перенос (flex-wrap). */
+.profile-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  /* flex-start: label обеих колонок + input/slug-box встают по верху.
+     Кнопка «Сохранить» уходит на вторую строку ВНУТРИ name-колонки
+     и не сдвигает slug вниз. */
+  align-items: flex-start;
+}
+.profile-row-name {
+  flex: 1 1 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.profile-row-input {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+/* input растягивается по ширине колонки, отменяя .grow (flex:1),
+   который в column-flex дал бы вертикальное растяжение. */
+.profile-row-input > input {
+  width: 100%;
+  flex: 0 0 auto;
+}
+/* Кнопка под input, по левому краю; ширина — по контенту. */
+.profile-row-input > .btn {
+  flex: 0 0 auto;
+}
+.profile-row-slug {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Read-only значение slug. Визуально — как input, но не кликабельный
+   и приглушённый. Высота 44px совпадает с обычным input, поэтому
+   label-строки слева и справа выравниваются по baseline. */
+.profile-slug-box {
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: 0.8125rem;
+  cursor: default;
+  user-select: all;
+  white-space: nowrap;
+}

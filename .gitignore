@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.venv-*/
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Melecho runtime (dev) — данные пользователя, не для репозитория
+profiles/
+data/
+*.db
+*.db-shm
+*.db-wal
+audit.key
+
+# Личные заметки / бэкапы
+*.bak
+*.orig
+*.swp
+*~
+
+# Dev docs, tests, scripts — не для публичного репозитория
+/dev-docs/
+/tests/
+/scripts/

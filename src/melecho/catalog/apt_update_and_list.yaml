@@ -1,0 +1,22 @@
+id: apt_update_and_list
+name: Обновление индексов APT и список обновлений
+category: packages
+version: 1
+params: []
+flags:
+  dangerous: false
+  state_changing: true
+  requires_confirmation: true
+  idempotent: false
+  plan_preview_supported: true
+  reversible: false
+  expect_disconnect: false
+  escalatable: false
+applicability:
+  check_command: [apt-get, apt]
+steps:
+  - command: "sudo -n apt-get update"
+    expect_exit: 0
+  - command: "apt list --upgradable"
+    expect_exit: 0
+    ignore_stderr: true

@@ -1,0 +1,27 @@
+id: journalctl_view
+name: Просмотр журнала systemd
+category: logs
+version: 1
+params:
+  - name: lines
+    type: int
+    default: 100
+    min: 1
+    max: 1000
+flags:
+  dangerous: false
+  requires_confirmation: false
+  plan_preview_supported: true
+  reversible: true
+  expect_disconnect: false
+  escalatable: true
+  idempotent: true
+applicability:
+  check_command: [journalctl]
+preconditions:
+  - command: "journalctl --no-pager -n 1"
+    expect_exit: 0
+    on_success_note: "Вывод без sudo может быть неполным"
+steps:
+  - command: "journalctl --no-pager -n {lines} -o short-iso"
+    expect_exit: 0

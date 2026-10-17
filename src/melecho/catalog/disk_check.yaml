@@ -1,0 +1,18 @@
+id: disk_check
+name: Проверка дискового пространства
+category: storage
+version: 1
+params: []
+flags:
+  dangerous: false
+  requires_confirmation: false
+  idempotent: true
+  plan_preview_supported: true
+  reversible: true
+  expect_disconnect: false
+  escalatable: false
+applicability:
+  check_command: [findmnt]
+steps:
+  - command: "findmnt -J -b -o TARGET,FSTYPE,SIZE,USED,AVAIL"
+    expect_exit: 0

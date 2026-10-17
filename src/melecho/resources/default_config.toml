@@ -1,0 +1,111 @@
+# Встроенный дефолтный конфиг Melecho.
+# Используется, если пользователь не создал ~/.config/melecho/config.toml.
+# Для переопределения — создай свой конфиг по этому образцу.
+#
+# Пути db_path / audit_key_path / catalog.d при первом запуске wizard'а
+# резолвятся в ~/.local/share/melecho/ (XDG_DATA_HOME).
+
+http_port = 8765
+bind = "127.0.0.1"
+log_level = "INFO"
+env_path = "/usr/bin/env"
+resolver_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Порт занят — что делать: "ephemeral" (взять любой свободный)
+# или "fail" (попросить пользователя поменять конфиг).
+port_fallback = "ephemeral"
+
+[crypto]
+kdf_params_version = 1
+
+[limits]
+max_servers = 20
+max_parallel_ssh = 10
+max_parallel_ops = 3
+connect_timeout_sec = 15
+idle_timeout_sec = 60
+op_timeout_sec = 300
+step_timeout_sec = 60
+step_output_bytes = 1048576
+max_steps = 20
+
+[sudo]
+ttl_sec = 900
+
+[unlock]
+max_attempts = 5
+lock_minutes = 15
+
+[metrics]
+interval_sec = 30
+downsample_sec = 300
+raw_retention_days = 7
+agg_retention_days = 30
+retention_interval_sec = 3600
+
+[detector]
+ewma_alpha = 0.3
+min_warmup_residuals = 30
+z_window = 60
+z_threshold = 3.0
+abs_cpu = 90
+abs_ram = 90
+abs_disk = 90
+abs_load_1m_per_cpu = 1.5
+
+[llm]
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"
+master_enabled = false
+timeout_sec = 30
+cache_ttl_days = 30
+
+[network]
+# Различение «нет интернета» / «сервер недоступен».
+# При провале SSH к серверу панель делает TCP-handshake к этому
+# адресу. Если и он не отвечает — глобальный флаг internet_offline:
+# все операции приостанавливаются, серверы НЕ считаются упавшими.
+#
+# 1.1.1.1:53 (Cloudflare DNS) — anycast, стабильно. Можно заменить
+# на 8.8.8.8:53 или свой резолвер.
+internet_check_host = "1.1.1.1"
+internet_check_port = 53
+# Таймаут одного handshake. 2 секунды — компромисс: быстрый ответ
+# при живом интернете, но не залипаем при полной недоступности.
+internet_check_timeout_sec = 2
+# Backoff активного polling при offline: от 5 до 30 секунд.
+internet_check_poll_sec_min = 5
+internet_check_poll_sec_max = 30
+# Кэш успешного результата: при массовых провалах SSH (20 серверов
+# разом) не долбим 1.1.1.1 каждым сервером.
+internet_check_cache_sec = 60
+
+[updates]
+# Проверка обновлений для git-клона. Работает только если в корне
+# проекта есть .git/ (dev-сценарий). pipx-установка проверку не делает —
+# пользователь обновляется через `pipx upgrade melecho`.
+#
+# opt-out: по умолчанию включено. При включении раз в сутки (по кэшу)
+# делается HTTPS GET к GitHub Releases API (timeout 2 сек, провал —
+# молча продолжаем). Если версия новее — в шапке UI появляется метка
+# «доступно обновление», в Настройках → Обновления — кнопка.
+# Отключается тут или в UI (Настройки → Обновления).
+check_on_start = true
+check_interval_hours = 24
+github_repo = "Rusaell/melecho"
+
+[disk_roles]
+"/" = "system"
+"/var" = "system"
+"/home" = "data"
+"/srv" = "data"
+
+[catalog]
+allowed_commands = ["findmnt", "systemctl", "journalctl", "apt-get", "apt", "ip", "ss"]
+
+[tabs]
+leader_wait_ms = 300
+claim_wait_ms = 100
+heartbeat_sec = 2
+heartbeat_timeout_sec = 5

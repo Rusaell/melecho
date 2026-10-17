@@ -1,0 +1,30 @@
+id: systemd_restart
+name: Перезапуск systemd-сервиса
+category: services
+version: 1
+params:
+  - name: unit
+    type: enum
+    source: server.allowed_units
+    required: true
+    sensitive: false
+flags:
+  dangerous: false
+  requires_confirmation: true
+  idempotent: false
+  plan_preview_supported: true
+  reversible: false
+  expect_disconnect: false
+  escalatable: false
+  state_changing: true
+applicability:
+  check_command: [systemctl]
+preconditions:
+  - command: "systemctl cat {unit}"
+    expect_exit: 0
+steps:
+  - command: "sudo -n systemctl restart {unit}"
+    expect_exit: 0
+postconditions:
+  - command: "systemctl is-active {unit}"
+    expect_stdout: "active"
