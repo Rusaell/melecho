@@ -92,15 +92,24 @@ a { color: var(--accent); }
 /* Колонка под брендом: подзаголовок + badge «доступно обновление»
    отдельной строкой снизу. Шапка не растёт за счёт уменьшенного
    padding .top (space-2 вместо space-3). */
-.brand-sub {
+.brand-text {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
-  margin-top: 2px;
 }
-.brand-sub > p {
+.brand-text > h1 {
   margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+.brand-text > p {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 0.875rem;
+  line-height: 1.2;
 }
 
 .mark {
@@ -108,6 +117,13 @@ a { color: var(--accent); }
   display: block;
   flex-shrink: 0;
 }
+/* В шапке иконка крупнее и центрируется по вертикали */
+.top .mark {
+  width: 48px;
+  height: 48px;
+}
+/* Бейдж обновления — отдельно от текста, с отступом */
+
 .brand h1 { margin: 0; font-size: 1.25rem; font-weight: 600; letter-spacing: -0.03em; line-height: 1.15; }
 .brand p, .muted { margin: 0; color: var(--fg-muted); font-size: 0.875rem; line-height: 1.2; }
 .stack { display: flex; flex-direction: column; gap: var(--space-3); }
@@ -4088,4 +4104,33 @@ select {
   cursor: default;
   user-select: all;
   white-space: nowrap;
+}
+
+/* Drop-zone для импорта профиля */
+.file-drop {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-5);
+  text-align: center;
+  background: var(--bg-input);
+  cursor: pointer;
+  transition: border-color 200ms;
+}
+.file-drop:hover, .file-drop.dragover {
+  border-color: var(--accent);
+}
+.file-drop input[type="file"] {
+  display: none;
+}
+
+/* Сброс margin-bottom у .brand внутри шапки, чтобы шапка не была раздутой */
+.top .brand {
+  margin-bottom: 0;
+}
+/* Компактная плашка обновления внутри бренда */
+.brand-text .brand-badge {
+  margin-top: 2px;
+  height: 20px;
+  padding: 2px 8px;
+  font-size: 0.65rem;
 }

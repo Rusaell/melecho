@@ -145,7 +145,7 @@ def fetch_latest_version(repo: str, timeout_sec: float = 2.0) -> str | None:
 def detect_install_kind() -> str:
     """Определяет способ установки.
 
-    git      — .git/ в CWD (полное автообновление: git pull + pip install -e .)
+    git      — .git/ в корне пакета (полное автообновление: git pull + pip install -e .)
     dev      — локальная копия репо без .git/ (pyproject.toml + src/melecho).
                Обновление вручную: скачать свежую версию.
     pipx     — sys.prefix содержит .../pipx/venvs/...
@@ -160,15 +160,50 @@ def detect_install_kind() -> str:
         return "flatpak"
     if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
         return "docker"
-    if "pipx/venvs/" in sys.prefix.replace("\\", "/"):
+
+    is_pipx = "pipx/venvs/" in sys.prefix.replace("\\", "/")
+
+    # 1. Смотрим на метаданные установки (direct_url.json).
+    # pip >= 20.1 пишет сюда реальный путь, откуда ставили пакет.
+    try:
+        import json
+        from importlib.metadata import distribution, PackageNotFoundError
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+
+        try:
+            dist = distribution("melecho")
+            direct_url_text = dist.read_text("direct_url.json")
+        except PackageNotFoundError:
+            direct_url_text = None
+
+        if direct_url_text:
+            data = json.loads(direct_url_text)
+            url = data.get("url", "")
+            if url.startswith("file://"):
+                parsed = urlparse(url)
+                local_path = url2pathname(parsed.path)
+                p = Path(local_path)
+                if p.exists():
+                    if (p / ".git").is_dir():
+                        return "git"
+                    if (p / "pyproject.toml").is_file() and (p / "src" / "melecho").is_dir():
+                        return "dev"
+                return "pip"  # битая editable-установка
+    except Exception:
+        # Если importlib.metadata недоступен или файл повреждён — fallback.
+        pass
+
+    # 2. Fallback: если direct_url.json нет или он не помог.
+    if is_pipx:
         return "pipx"
+
+    # 3. Для случая, когда пакет не установлен, а запущен из репо напрямую.
     if Path(".git").is_dir():
         return "git"
-    # Локальная копия репозитория без .git/ (git clone отсутствует).
-    # Признак: pyproject.toml и src/melecho в CWD. Пользователь
-    # запускает ./run.sh — venv с editable-установкой.
     if Path("pyproject.toml").is_file() and Path("src/melecho").is_dir():
         return "dev"
+
     return "pip"
 
 

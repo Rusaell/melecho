@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "melecho"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local-first Linux SSH control panel with HMAC audit and LLM-assisted anomaly interpretation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,7 @@ dependencies = [
   "httpx>=0.28,<1.0",
   "asyncssh>=2.24,<3.0",
   "bcrypt>=5.0,<6",
+  "python-multipart>=0.0.9,<1.0",
 ]
 
 [project.urls]

@@ -78,6 +78,7 @@ def aad_passphrase(server_id: int, version: int) -> bytes:
 
 
 AAD_LLM = b"melecho-llm-key-v1"  # legacy: один ключ в settings
+AAD_PROFILE_EXPORT = b"melecho-profile-export-v1"
 
 
 def aad_llm_profile(profile_id: int, version: int) -> bytes:

@@ -384,6 +384,56 @@ def create_app(rt: Runtime) -> FastAPI:
         confirm = _require_str(body, "new_password_confirm", strip=False)
         return await rt.change_master_password(old_password, new_password, confirm)
 
+    @app.post("/api/v1/profiles/export")
+    async def profiles_export(request: Request):
+        """Экспорт текущего профиля в зашифрованный файл."""
+        rt.require_dek()
+        rt.rate.check("profile_export", 3)
+        body = await _read_json(request)
+        password = _require_str(body, "password", strip=False)
+        data = await rt.export_profile_bytes(password)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        fname = f"{rt.cfg.profile_slug}-{ts}.melecho"
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
+    @app.post("/api/v1/profiles/import")
+    async def profiles_import(request: Request):
+        """Импорт профиля из зашифрованного архива."""
+        rt.rate.check("profile_import", 3)
+        try:
+            form = await request.form()
+        except Exception as e:
+            raise AppError("E_PARAM", f"не удалось прочитать multipart: {e}", status=400) from e
+        archive = form.get("archive")
+        if archive is None or not hasattr(archive, "read"):
+            raise AppError("E_PARAM", "поле 'archive' с файлом обязательно", status=400)
+        password = form.get("password")
+        if not isinstance(password, str):
+            raise AppError("E_PARAM", "поле 'password' обязательно", status=400)
+        profile_name = form.get("profile_name")
+        if profile_name is not None and not isinstance(profile_name, str):
+            raise AppError("E_PARAM", "поле 'profile_name' должно быть строкой", status=400)
+
+        from melecho.profiles import MAX_IMPORT_BYTES
+        buf = bytearray()
+        while True:
+            chunk = await archive.read(1024 * 1024)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > MAX_IMPORT_BYTES:
+                raise AppError(
+                    "E_PARAM",
+                    f"файл больше {MAX_IMPORT_BYTES // (1024 * 1024)} MB",
+                    status=413,
+                )
+        res = await rt.import_profile_bytes(bytes(buf), password, profile_name)
+        return res
+
     @app.post("/api/v1/profiles/switch")
     async def profiles_switch(request: Request):
         """Переключиться на другой профиль «на лету».
@@ -587,6 +637,30 @@ def create_app(rt: Runtime) -> FastAPI:
         rt.require_dek()
         rt.rate.check("update_check", 10)
         return await rt.check_updates_now()
+
+    @app.get("/api/v1/system/desktop-status")
+    async def system_desktop_status():
+        rt.require_dek()
+        from melecho import desktop
+        return {"installed": desktop.is_installed()}
+
+    @app.post("/api/v1/system/install-desktop")
+    async def system_install_desktop():
+        rt.require_dek()
+        from melecho import desktop
+        rc = desktop.install_desktop()
+        if rc != 0:
+            raise AppError("E_INTERNAL", "Не удалось установить ярлык", status=500)
+        return {"ok": True}
+
+    @app.post("/api/v1/system/uninstall-desktop")
+    async def system_uninstall_desktop():
+        rt.require_dek()
+        from melecho import desktop
+        rc = desktop.uninstall_desktop()
+        if rc != 0:
+            raise AppError("E_INTERNAL", "Не удалось удалить ярлык", status=500)
+        return {"ok": True}
 
     @app.post("/api/v1/system/apply-update")
     async def apply_update():

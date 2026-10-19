@@ -4,6 +4,23 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/).
 Проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [1.1.0] — 2026-10-19
+
+### Добавлено
+- Экспорт/импорт профиля: `.tar.gz.enc` с `app.db` (VACUUM INTO),
+  `audit.key`, `manifest.json`, `dek.bin`; всегда шифруется
+  Argon2id + AES-256-GCM. Кнопки в Настройках («Экспорт») и на
+  стартовом экране («Импорт»).
+
+### Изменено
+- Определение канала установки теперь читает `direct_url.json`
+  установленного пакета, а не CWD. `./run.sh` и `.desktop`-ярлык
+  определяются как один и тот же `git`-канал.
+- Автоматическая установка ярлыка при первом запуске убрана — теперь
+  только toggle в Настройках и явные флаги `--install-desktop` /
+  `--uninstall-desktop`.
+
+
 ## [1.0.0] — 2026-10-16
 
 Первый публичный релиз.
@@ -81,6 +98,3 @@
 - S6: Host / Origin / CSP / session-токен.
 - S7: mismatch host key → отказ без «продолжить».
 - S8: ключ аудита не в БД и не в `VACUUM INTO`.
-
-
-[1.0.0]: https://github.com/Rusaell/melecho/releases/tag/v1.0.0

@@ -144,26 +144,7 @@ def _cmd_stop() -> int:
 # Launcher (default): запустить child или приаттачиться.
 # ---------------------------------------------------------------------------
 
-def _maybe_prompt_install_desktop(args: argparse.Namespace) -> None:
-    """После первого успешного запуска — предложить установить ярлык.
 
-    Условия: TTY, ярлык ещё не установлен, не передан --no-install-desktop.
-    Не-TTY (скрипт, CI) — молча пропускаем.
-    """
-    if getattr(args, "no_install_desktop", False):
-        return
-    from melecho import desktop
-    if desktop.is_installed():
-        return
-    if not sys.stdin.isatty():
-        return
-    try:
-        answer = input("Установить ярлык Melecho в меню приложений? [Y/n] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
-    if answer in ("", "y", "yes", "д", "да"):
-        desktop.install_desktop()
 
 
 def _launch_detached(args: argparse.Namespace) -> int:
@@ -187,7 +168,6 @@ def _launch_detached(args: argparse.Namespace) -> int:
             return 1
         if not args.no_browser:
             webbrowser.open(new_url)
-        _maybe_prompt_install_desktop(args)
         return 0
 
     # Старые / битые файлы — чистим перед spawn.
@@ -225,7 +205,6 @@ def _launch_detached(args: argparse.Namespace) -> int:
     if not args.no_browser:
         webbrowser.open(new_url)
     print(f"Melecho запущен (PID {proc.pid}). Логи: {log_path}")
-    _maybe_prompt_install_desktop(args)
     return 0
 
 

@@ -673,6 +673,40 @@ class Runtime:
         await self.start_background()
         log.info("unload_for_logout: готово (профиль тот же)")
 
+    async def export_profile_bytes(self, password: str) -> bytes:
+        """Создаёт зашифрованный архив текущего профиля."""
+        from melecho.profiles import export_profile_bytes as _export
+        self.require_dek()
+        if not isinstance(password, str) or len(password) < 12:
+            raise AppError("E_PASSWORD", "пароль архива не короче 12 символов", status=400)
+        try:
+            return await asyncio.to_thread(
+                _export, self.cfg.data_dir, self.dek, password,
+            )
+        except ValueError as e:
+            raise AppError("E_PARAM", str(e), status=400) from e
+
+    async def import_profile_bytes(
+        self, data: bytes, password: str, profile_name: str | None,
+    ) -> dict:
+        """Импортирует профиль из архива и переключается на него."""
+        from melecho.profiles import import_profile_bytes as _import
+        if not isinstance(password, str) or len(password) < 12:
+            raise AppError("E_PASSWORD", "пароль архива не короче 12 символов", status=400)
+        existing = {p["slug"] for p in list_profiles()}
+        try:
+            res = await asyncio.to_thread(
+                _import, data, password, existing, profile_name,
+            )
+        except ValueError as e:
+            raise AppError("E_PARAM", str(e), status=400) from e
+        await self.reload_for_profile(res["slug"])
+        return {
+            "slug": res["slug"],
+            "name": res["name"],
+            "bootstrap": self.bootstrap,
+        }
+
     def rename_current_profile(self, name: str) -> dict:
         """Переименовать активный профиль. Меняет manifest.json + кэш
         имени в self.cfg (чтобы UI и логи видели новое имя без

@@ -869,6 +869,7 @@ function Gate({ title, subtitle, children, header_extra }) {
 // же запрос получит 401 E_SESSION и фронт уйдёт в need-boot.
 function ProfileSwitcher({ profiles, activeSlug, onSwitch, onCreate, switchBusy }) {
   const [newOpen, setNewOpen] = useState(false);
+  const [impOpen, setImpOpen] = useState(false);
   if (!profiles || profiles.length === 0) return null;
   return html`<div class="stack">
     <div class="row" style="align-items:flex-end; gap:8px">
@@ -887,6 +888,11 @@ function ProfileSwitcher({ profiles, activeSlug, onSwitch, onCreate, switchBusy 
               disabled=${!!switchBusy}
               title="Создать новый профиль"
               onClick=${() => setNewOpen(true)}>+</button>
+      <button type="button" class="btn"
+              style="padding:0 12px"
+              disabled=${!!switchBusy}
+              title="Импортировать профиль"
+              onClick=${() => setImpOpen(true)}>↓</button>
     </div>
     ${switchBusy
       ? html`<div class="muted small">Переключение…</div>`
@@ -898,6 +904,9 @@ function ProfileSwitcher({ profiles, activeSlug, onSwitch, onCreate, switchBusy 
               setNewOpen(false);
               await onCreate(name);
             }} />`
+      : null}
+    ${impOpen
+      ? html`<${ImportProfileModal} onClose=${() => setImpOpen(false)} />`
       : null}
   </div>`;
 }
@@ -5244,6 +5253,156 @@ function ExtraParamsEditor({ rows, onChange }) {
 }
 
 
+// Модалка экспорта профиля
+function ExportProfileModal({ onClose }) {
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function submit(e) {
+    e.preventDefault();
+    if (password.length < 12) { setErr("Пароль не короче 12 символов"); return; }
+    setBusy(true); setErr("");
+    try {
+      const res = await fetch("/api/v1/profiles/export", {
+        method: "POST",
+        headers: {
+          "X-Session-Token": sessionToken,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ password })
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(()=>({}));
+        throw new Error((data.error && data.error.message) || "Ошибка экспорта");
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `profile-export-${new Date().toISOString().slice(0,10)}.melecho`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast("Экспорт готов", "ok");
+      onClose();
+    } catch (ex) {
+      setErr(ex.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return html`<${Modal} title="Экспорт профиля" onClose=${onClose}
+    footer=${html`<div class="row">
+      <button type="button" class="btn btn-ghost btn-sm" onClick=${onClose} disabled=${busy}>Отмена</button>
+      <div class="grow"></div>
+      <button type="button" class="btn btn-primary btn-sm" disabled=${busy || password.length < 12} onClick=${submit}>
+        ${busy ? "Экспорт…" : "Скачать архив"}
+      </button>
+    </div>`}>
+    <p class="muted small">
+      Архив содержит всю базу данных профиля (включая зашифрованные ключи SSH и LLM)
+      и ключ аудита. Он будет зашифрован указанным ниже паролем.
+    </p>
+    <label>Пароль архива (≥ 12 символов)</label>
+    <input type="password" autocomplete="new-password" value=${password} onInput=${(e) => setPassword(e.target.value)} />
+    ${err ? html`<div class="err">${err}</div>` : null}
+  </${Modal}>`;
+}
+
+// Модалка импорта профиля
+function ImportProfileModal({ onClose }) {
+  const [file, setFile] = useState(null);
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState(() => "Импорт " + new Date().toISOString().slice(0, 10));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef(null);
+
+  function onFileChange(e) {
+    if (e.target.files && e.target.files.length > 0) {
+      setFile(e.target.files[0]);
+    }
+  }
+
+  function onDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      setFile(e.dataTransfer.files[0]);
+    }
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!file) { setErr("Выберите файл"); return; }
+    if (password.length < 12) { setErr("Пароль не короче 12 символов"); return; }
+    if (!name.trim()) { setErr("Укажите имя для нового профиля"); return; }
+    setBusy(true); setErr("");
+
+    const form = new FormData();
+    form.append("archive", file);
+    form.append("password", password);
+    form.append("profile_name", name.trim());
+
+    try {
+      const res = await fetch("/api/v1/profiles/import", {
+        method: "POST",
+        headers: { "X-Session-Token": sessionToken },
+        body: form
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error((data.error && data.error.message) || "Ошибка импорта");
+      }
+      showToast("Профиль импортирован", "ok");
+      sessionToken = "";
+      try { sessionStorage.removeItem("melecho.session"); } catch {}
+      const newUrl = "/?pi=" + Date.now() + "#bootstrap=" + encodeURIComponent(data.bootstrap);
+      location.replace(newUrl);
+    } catch (ex) {
+      setErr(ex.message);
+      setBusy(false);
+    }
+  }
+
+  return html`<${Modal} title="Импорт профиля" onClose=${onClose}
+    footer=${html`<div class="row">
+      <button type="button" class="btn btn-ghost btn-sm" onClick=${onClose} disabled=${busy}>Отмена</button>
+      <div class="grow"></div>
+      <button type="button" class="btn btn-primary btn-sm" disabled=${busy || !file || !name.trim() || password.length < 12} onClick=${submit}>
+        ${busy ? "Импорт…" : "Импортировать"}
+      </button>
+    </div>`}>
+    <p class="muted small">
+      Выберите файл архива (.melecho) и введите пароль, который использовался при экспорте.
+      Будет создан новый профиль. Пароль архива станет мастер-паролем нового профиля.
+    </p>
+    
+    <div class=${"file-drop" + (dragOver ? " dragover" : "")}
+         onClick=${() => fileRef.current && fileRef.current.click()}
+         onDragOver=${(e) => { e.preventDefault(); setDragOver(true); }}
+         onDragLeave=${() => setDragOver(false)}
+         onDrop=${onDrop}>
+      <input type="file" ref=${fileRef} accept=".melecho" onChange=${onFileChange} />
+      ${file 
+        ? html`<div class="mono">${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)</div>`
+        : html`<div>Перетащите файл сюда или нажмите для выбора</div>`}
+    </div>
+
+    <label>Имя нового профиля</label>
+    <input value=${name} onInput=${(e) => setName(e.target.value)} placeholder="например, Импорт 2026" />
+
+    <label>Пароль архива</label>
+    <input type="password" autocomplete="off" value=${password} onInput=${(e) => setPassword(e.target.value)} />
+    
+    ${err ? html`<div class="err">${err}</div>` : null}
+  </${Modal}>`;
+}
+
 // ProfileSection: блок «Профиль» в Настройках. Управляет ТОЛЬКО
 // текущим (активным) профилем: переименование, смена мастер-пароля,
 // удаление. Переключение между профилями — на стартовом экране
@@ -5273,6 +5432,7 @@ function ProfileSection() {
   // для inline-интерфейса и оба требуют фокуса и явного подтверждения.
   const [pwOpen, setPwOpen] = useState(false);
   const [delOpen, setDelOpen] = useState(false);
+  const [expOpen, setExpOpen] = useState(false);
 
   async function load() {
     try {
@@ -5355,6 +5515,9 @@ function ProfileSection() {
       <button type="button" class="btn btn-sm"
               disabled=${busy}
               onClick=${() => setPwOpen(true)}>Сменить мастер-пароль</button>
+      <button type="button" class="btn btn-sm"
+              disabled=${busy}
+              onClick=${() => setExpOpen(true)}>Экспорт</button>
       <div class="grow"></div>
       <button type="button" class="btn btn-sm btn-danger"
               disabled=${busy}
@@ -5391,6 +5554,9 @@ function ProfileSection() {
                 location.reload();
               }
             }} />`
+      : null}
+    ${expOpen
+      ? html`<${ExportProfileModal} onClose=${() => setExpOpen(false)} />`
       : null}
   </div>`;
 }
@@ -8372,6 +8538,8 @@ function SettingsView() {
   const [netErr, setNetErr] = useState("");
   const [updateStatus, setUpdateStatus] = useState(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [desktopInstalled, setDesktopInstalled] = useState(false);
+  const [desktopBusy, setDesktopBusy] = useState(false);
   const [updateErr, setUpdateErr] = useState("");
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
   useEffect(() => {
@@ -8379,6 +8547,7 @@ function SettingsView() {
     api("/api/v1/llm/anomalies").then((r) => setAnoms(r.items || []));
     api("/api/v1/llm/audit").then((r) => setLlmRows(r.items || []));
     api("/api/v1/system/update-status").then(setUpdateStatus).catch(() => {});
+    api("/api/v1/system/desktop-status").then(r => setDesktopInstalled(r.installed)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -8493,6 +8662,27 @@ function SettingsView() {
     }
   }
 
+  async function toggleDesktop(next) {
+    if (desktopBusy) return;
+    const prev = desktopInstalled;
+    // Оптимистичное обновление: toggle визуально переключается сразу.
+    // Если backend ответит ошибкой — откатим.
+    setDesktopInstalled(next);
+    setDesktopBusy(true);
+    try {
+      const endpoint = next
+        ? "/api/v1/system/install-desktop"
+        : "/api/v1/system/uninstall-desktop";
+      await api(endpoint, { method: "POST", body: "{}" });
+      showToast(next ? "Ярлык создан" : "Ярлык удалён", "ok");
+    } catch (ex) {
+      setDesktopInstalled(prev);
+      showToast("Ошибка: " + ex.message, "error");
+    } finally {
+      setDesktopBusy(false);
+    }
+  }
+
   async function saveNet() {
     setNetBusy(true);
     setNetErr("");
@@ -8517,10 +8707,21 @@ function SettingsView() {
   return html`<div class="page stack">
     <h2 class="h2">Настройки</h2>
     <div class="card stack">
-      <div>Провайдер LLM: <span class="mono">${s.llm_provider}</span> / ${s.llm_model}</div>
+      <h3>Общие</h3>
       <label class="check"><input type="checkbox" checked=${s.llm_master_enabled} onChange=${(e) => toggleLlm(e.target.checked)} /> Мастер переключатель LLM (отключение/включение AI функций)</label>
       <label class="check"><input type="checkbox" checked=${!!s.llm_opt_in_logs} onChange=${(e) => toggleOptIn(e.target.checked)} /> Opt-in: сырые логи в LLM (ответ не кэшируется)</label>
-      <label class="check"><input type="checkbox" checked=${smoothStream} onChange=${(e) => toggleSmooth(e.target.checked)} /> Уплавнение стрим ответов LLM (включить если текст появляется слишком резко)</label>
+      <label class="check"><input type="checkbox" checked=${smoothStream} onChange=${(e) => toggleSmooth(e.target.checked)} /> Плавный стрим ответов LLM</label>
+      <label class="check check--onoff"
+             title=${desktopBusy
+               ? "Обработка…"
+               : (desktopInstalled
+                   ? "Удалить ярлык из меню приложений"
+                   : "Создать ярлык в меню приложений для быстрого запуска")}>
+        <input type="checkbox" checked=${desktopInstalled}
+               disabled=${desktopBusy}
+               onChange=${(e) => toggleDesktop(e.target.checked)} />
+        <span>${desktopInstalled ? "ярлык установлен" : "ярлык не установлен"}</span>
+      </label>
       <div class="muted">
         ${s.llm_ready
           ? "LLM готов · активный профиль: " + (s.llm_active_profile_name || "—")
@@ -8531,8 +8732,6 @@ function SettingsView() {
         <input name="ttl" type="number" min="0" value=${s.sudo_ttl_sec} />
         <button class="btn btn-sm">Сохранить</button>
       </form>
-      <div class="muted">опрос метрик: ${s.metrics_interval_sec} с · KDF v${s.kdf_params_version}</div>
-      <p class="muted">Сырые логи в LLM по умолчанию выключены (S5). Канарейки проверяются до запроса (S4).</p>
     </div>
     <${ProfileSection} />
 
@@ -11102,24 +11301,22 @@ function AppShell() {
     <header class="top">
       <div class="brand">
         <${IconShield} />
-        <div>
+        <div class="brand-text">
           <h1>Melecho</h1>
-          <div class="brand-sub">
-            <p>local-first · без агента на серверах</p>
-            ${updateAvailable
-              ? html`<button class="brand-badge"
-                      title=${"Доступна версия " + updateAvailable.version}
-                      onClick=${() => {
-                        setView("set");
-                        setSid(null);
-                        setTimeout(() => {
-                          window.dispatchEvent(new Event("melecho:scroll-to-updates"));
-                        }, 50);
-                      }}>
-                  доступно обновление
-                </button>`
-              : null}
-          </div>
+          <p>local-first · без агента на серверах</p>
+          ${updateAvailable
+            ? html`<button class="brand-badge"
+                    title=${"Доступна версия " + updateAvailable.version}
+                    onClick=${() => {
+                      setView("set");
+                      setSid(null);
+                      setTimeout(() => {
+                        window.dispatchEvent(new Event("melecho:scroll-to-updates"));
+                      }, 50);
+                    }}>
+                доступно обновление
+              </button>`
+            : null}
         </div>
       </div>
       <nav class="nav">
