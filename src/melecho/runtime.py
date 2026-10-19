@@ -737,6 +737,23 @@ class Runtime:
                 self.audit_key = path.read_bytes()
             return
         if not path.exists():
+            # S8: различаем «первый запуск» и «потерянный ключ у
+            # существующего профиля».
+            #
+            #   fresh profile (encrypted_dek отсутствует) — wizard
+            #   создаёт ключ вместе с мастер-паролем. Это нормально.
+            #
+            #   непустой профиль (encrypted_dek есть) — ключ потерян,
+            #   HMAC-chain невалиден. Молчаливое создание нового ключа
+            #   ломает аудит без предупреждения. Отказ (SystemExit),
+            #   чтобы пользователь восстановил ключ из бэкапа.
+            if self.db.get_setting("encrypted_dek") is not None:
+                raise SystemExit(
+                    f"ключ аудита отсутствует: {path}. "
+                    "Профиль уже инициализирован — HMAC-chain без ключа "
+                    "невалиден. Восстановите audit.key из резервной копии "
+                    "или создайте профиль заново."
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
             key = generate_audit_key()
             path.write_bytes(key)
