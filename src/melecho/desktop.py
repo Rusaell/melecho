@@ -29,27 +29,42 @@ def _icon_path() -> Path:
     return _data_home() / "icons" / "hicolor" / "scalable" / "apps" / "melecho.svg"
 
 
+def _q_desktop_exec(s: str) -> str:
+    """Quote path for .desktop Exec line if it contains space/tab/quote.
+
+    Exec spec: каждый аргумент с пробелом/табом/кавычкой оборачивается в "…".
+    """
+    if not s or not any(c in s for c in ' \t"\''):
+        return s
+    return '"' + s.replace('"', '\\"') + '"'
+
+
 def _resolve_exec() -> str:
-    """Абсолютный путь к исполняемому melecho.
+    """Возвращает Exec-значение для .desktop-файла.
 
     Приоритет:
-      1. shutil.which('melecho') — основной случай (pipx / pip в ~/.local/bin).
-      2. sys.argv[0], если это файл (dev-режим через .venv/bin/melecho).
-      3. fallback: '<python> -m melecho' — сработает, если путь не найден.
+      1. shutil.which('melecho') — pipx / pip --user. Возвращает
+         ~/.local/bin/melecho — стабильный симлинк, переживает reinstall.
+      2. <venv>/bin/melecho от sys.executable — dev через ./run.sh
+         (sys.executable = .venv/bin/python, значит .venv/bin/melecho).
+      3. fallback: '<python> -m melecho' — сработает из любого места.
+
+    ВАЖНО: НЕ используем sys.argv[0]. В child-процессе (`python -m melecho
+    --foreground` из _launch_detached) sys.argv[0] = __main__.py, а он
+    не executable — .desktop-ярлык получался с Exec на .py-файл и падал
+    с «Отсутствуют права доступа выполнение программы».
     """
     which = shutil.which("melecho")
     if which:
-        # НЕ resolve(): сохраняем симлинк как он есть.
-        # pipx создаёт ~/.local/bin/melecho -> ~/.local/share/pipx/venvs/melecho/bin/melecho.
-        # .resolve() разыменует в venv-путь, и при переустановке pipx (или
-        # обновлении melecho) старый venv удаляется — ярлык ломается.
-        # Симлинк ~/.local/bin/melecho переживает reinstall, потому что pipx
-        # пересоздаёт его в том же месте.
-        return str(Path(which).absolute())
-    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
-    if argv0 and argv0.exists() and argv0.is_file():
-        return str(argv0.resolve())
-    return f"{sys.executable} -m melecho"
+        # НЕ resolve(): сохраняем симлинк как он есть (см. комментарий выше).
+        return _q_desktop_exec(str(Path(which).absolute()))
+
+    venv_bin = Path(sys.executable).parent
+    candidate = venv_bin / "melecho"
+    if candidate.is_file():
+        return _q_desktop_exec(str(candidate.resolve()))
+
+    return f"{_q_desktop_exec(sys.executable)} -m melecho"
 
 
 def is_installed() -> bool:
@@ -57,10 +72,18 @@ def is_installed() -> bool:
 
 
 def _refresh_caches() -> None:
-    """Best-effort. Отсутствие утилит — не ошибка."""
+    """Best-effort. Отсутствие утилит — не ошибка.
+
+    update-desktop-database / gtk-update-icon-cache — стандарт freedesktop
+    (GNOME, Xfce, Cinnamon, MATE, LXQt и др.).
+    kbuildsycoca6 / kbuildsycoca5 — KDE Plasma 6/5. У него собственный
+    кэш sycoca; update-desktop-database меню KDE не обновляет.
+    """
     for cmd in (
         ["update-desktop-database", str(_data_home() / "applications")],
         ["gtk-update-icon-cache", "-f", "-t", str(_data_home() / "icons" / "hicolor")],
+        ["kbuildsycoca6"],
+        ["kbuildsycoca5"],
     ):
         try:
             subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL,

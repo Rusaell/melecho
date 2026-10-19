@@ -8656,6 +8656,13 @@ function SettingsView() {
         setUpdateBusy(false);
         return;
       }
+      // Успех. Бэкенд запланировал graceful shutdown (1–2 секунды):
+      // следующий polling уже получит connection refused. Переключаем
+      // Root в phase=stopped сразу, не дожидаясь тишины в сети и не
+      // оставляя вкладку с вечным «Обновляю…».
+      sessionToken = "";
+      try { sessionStorage.removeItem("melecho.session"); } catch {}
+      window.dispatchEvent(new CustomEvent("melecho:backend-stopped"));
     } catch (ex) {
       setUpdateErr(ex.message);
       setUpdateBusy(false);
@@ -8743,9 +8750,11 @@ function SettingsView() {
       ? html`<div class="card stack" id="settings-updates-section">
           <h3>Обновления</h3>
           <p class="muted">
-            Канал установки: <span class="mono">${updateStatus.install_kind}</span>
+            Текущая версия: <span class="mono">${updateStatus.current_version || "неизвестна"}</span>${
+              " · "
+            }канал установки: <span class="mono">${updateStatus.install_kind}</span>
             ${updateStatus.install_hint
-              ? html` · ручное обновление: <span class="mono">${updateStatus.install_hint}</span>`
+              ? html`<br />ручное обновление: <span class="mono">${updateStatus.install_hint}</span>`
               : null}
           </p>
           <label class="check check--onoff">
@@ -8875,7 +8884,7 @@ function SettingsView() {
 pip install -e . --upgrade</pre>
           <p class="muted">
             После установки backend завершит работу. Запустите
-            <span class="mono">melecho</span> снова, чтобы открыть новую версию.
+            <span class="mono"> melecho</span> снова, чтобы открыть новую версию.
           </p>
           <p class="muted small">
             Если в репозитории есть незакоммиченные изменения — git pull

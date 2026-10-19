@@ -882,8 +882,10 @@ class Runtime:
 
     def update_status(self) -> dict:
         from melecho import update as _upd
+        from melecho import __version__ as _ver
         kind = _upd.detect_install_kind()
         return {
+            "current_version": _ver,
             "check_on_start": self._effective_updates_check_on_start(),
             "install_kind": kind,
             "install_hint": _upd.install_hint(kind),
@@ -948,6 +950,17 @@ class Runtime:
             return {"ok": False, "state": "failed", "message": msg}
 
         self._update_apply_state = "done"
+        # Сброс «доступно обновление». Без этого badge в шапке висит
+        # до следующей ручной проверки, а кэш update_available.json
+        # продолжает отдавать старую версию. Плюс — помечаем время,
+        # чтобы при следующем старте _update_poll_loop не дёргал
+        # GitHub сразу (до истечения check_interval_hours).
+        self._update_available = None
+        self._update_last_check_at = now_z()
+        try:
+            self._update_write_cache()
+        except Exception:
+            log.exception("update: сброс кэша после apply failed")
         self.events.publish("update.apply", {
             "state": "done", "message": "обновление установлено, перезапуск…",
         })
