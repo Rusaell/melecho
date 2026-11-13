@@ -1,6 +1,12 @@
 # Melecho
 
-Локальная ИС управления Linux-серверами через SSH.
+Локальная ИС управления Linux-серверами через SSH: метрики,
+алерты, реакции, HMAC-аудит, LLM-объяснитель. Local-first,
+без агента на серверах.
+
+<p align="center">
+  <img src="images/dashboard.png" alt="Дашборд Melecho" width="880" />
+</p>
 
 ## Установка
 
