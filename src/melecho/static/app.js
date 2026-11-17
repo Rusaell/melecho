@@ -207,27 +207,6 @@ const crosshairPlugin = {
   },
 };
 
-function parseFindmnt(stdout) {
-  try {
-    const data = JSON.parse(stdout);
-    const out = [];
-    const walk = (rows) => {
-      for (const r of rows || []) {
-        if (!r) continue;
-        if (r.target && r.fstype && r.size != null && r.used != null) {
-          const pct = r.size > 0 ? (r.used / r.size) * 100 : 0;
-          out.push({ target: r.target, fstype: r.fstype, size: r.size, used: r.used, avail: r.avail, pct });
-        }
-        if (Array.isArray(r.children)) walk(r.children);
-      }
-    };
-    walk(data.filesystems);
-    return out;
-  } catch {
-    return null;
-  }
-}
-
 function fmtBytes(n) {
   if (n == null || Number.isNaN(n)) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -241,45 +220,436 @@ function fmtBytes(n) {
   return v.toFixed(digits) + " " + units[i];
 }
 
-const REAL_FS = new Set(["ext4", "xfs", "btrfs"]);
-
-function DiskCheckResult({ step }) {
-  if (!step) return html`<div class="muted">run-шаг не найден</div>`;
-  const mounts = parseFindmnt(step.stdout);
-  if (!mounts) {
-    return html`<div class="err">Не удалось разобрать вывод findmnt как JSON</div>
-      <details><summary class="muted">сырой вывод</summary><pre class="pre">${step.stdout}</pre></details>`;
+// Преобразование Python-именованных групп (?P<name>...) в JS (?<name>...)
+// и безопасная компиляция multiline RegExp.
+function compileDisplayRegex(pat) {
+  if (typeof pat !== "string" || !pat) return null;
+  const jsPat = pat.replace(/\(\?P<([A-Za-z_][A-Za-z0-9_]*)>/g, "(?<$1>");
+  try {
+    return new RegExp(jsPat, "m");
+  } catch {
+    return null;
   }
-  const interesting = mounts.filter((m) => REAL_FS.has(m.fstype));
-  const other = mounts.filter((m) => !REAL_FS.has(m.fstype));
+}
+
+function getJsonPath(obj, path) {
+  if (obj == null) return undefined;
+  if (!path) return obj;
+  let cur = obj;
+  for (const part of String(path).split(".")) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+// Безопасный вычислитель арифметических выражений (без eval/Function для CSP).
+// Поддерживает идентификаторы из row, числа, +, -, *, /, скобки.
+function evalDisplayExpr(expr, row) {
+  if (typeof expr !== "string" || !expr.trim()) return null;
+  const tokens = [];
+  const rx = /\s*([A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[+\-*/()])/g;
+  let pos = 0;
+  while (pos < expr.length) {
+    rx.lastIndex = pos;
+    const m = rx.exec(expr);
+    if (!m || m.index !== pos) {
+      if (expr.slice(pos).trim() === "") break;
+      return null;
+    }
+    tokens.push(m[1]);
+    pos = rx.lastIndex;
+  }
+  if (!tokens.length) return null;
+  let i = 0;
+  function parseExpr() {
+    let left = parseTerm();
+    if (left == null) return null;
+    while (i < tokens.length && (tokens[i] === "+" || tokens[i] === "-")) {
+      const op = tokens[i++];
+      const right = parseTerm();
+      if (right == null) return null;
+      left = op === "+" ? left + right : left - right;
+    }
+    return left;
+  }
+  function parseTerm() {
+    let left = parseFactor();
+    if (left == null) return null;
+    while (i < tokens.length && (tokens[i] === "*" || tokens[i] === "/")) {
+      const op = tokens[i++];
+      const right = parseFactor();
+      if (right == null) return null;
+      if (op === "/") {
+        if (right === 0) return 0;
+        left = left / right;
+      } else {
+        left = left * right;
+      }
+    }
+    return left;
+  }
+  function parseFactor() {
+    if (i >= tokens.length) return null;
+    const tok = tokens[i++];
+    if (tok === "(") {
+      const v = parseExpr();
+      if (tokens[i] !== ")") return null;
+      i++;
+      return v;
+    }
+    if (tok === "-") {
+      const v = parseFactor();
+      return v == null ? null : -v;
+    }
+    if (/^\d/.test(tok)) return Number(tok);
+    const raw = row && row[tok];
+    const num = Number(raw);
+    return raw == null || Number.isNaN(num) ? null : num;
+  }
+  const res = parseExpr();
+  return i === tokens.length && Number.isFinite(res) ? res : null;
+}
+
+function formatDisplayCell(val, format) {
+  if (val == null || val === "") return "—";
+  if (format === "bytes") return fmtBytes(val);
+  if (format === "percent") {
+    const n = Number(val);
+    return Number.isNaN(n) ? "—" : n.toFixed(1) + "%";
+  }
+  if (format === "number") {
+    const n = Number(val);
+    return Number.isNaN(n) ? String(val) : String(n);
+  }
+  return String(val);
+}
+
+function kvSeverityClass(valStr, field) {
+  const s = String(valStr ?? "");
+  for (const [key, cls] of [["danger_if", "err"], ["warn_if", "cell-warn"], ["ok_if", "okt"]]) {
+    if (field[key]) {
+      const rx = compileDisplayRegex(field[key]);
+      if (rx && rx.test(s)) return cls;
+    }
+  }
+  return "";
+}
+
+function DisplaySingleBlock({ spec, stdout }) {
+  if (!spec || typeof spec !== "object") return null;
+  const text = String(stdout ?? "");
+
+  if (spec.type === "lines") {
+    const lines = text.split(/\r?\n/);
+    const incRx = (spec.include || []).map(compileDisplayRegex).filter(Boolean);
+    const excRx = (spec.exclude || []).map(compileDisplayRegex).filter(Boolean);
+    const matched = lines.filter((ln) => {
+      if (!ln.trim() && incRx.length) return false;
+      if (incRx.length && !incRx.some((rx) => rx.test(ln))) return false;
+      if (excRx.length && excRx.some((rx) => rx.test(ln))) return false;
+      return true;
+    });
+    return html`<div class="stack" style="gap:6px">
+      ${spec.title ? html`<div class="form-section-title">${spec.title}</div>` : null}
+      ${matched.length === 0
+        ? html`<div class="muted small">${spec.empty_text || "Совпадений по фильтру не найдено."}</div>`
+        : html`<pre class="pre" style="margin:0">${matched.join("\n")}</pre>`}
+    </div>`;
+  }
+
+  if (spec.type === "kv") {
+    const fmt = spec.format || "regex";
+    const rows = [];
+    if (fmt === "json") {
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch { parsed = null; }
+      if (!parsed || typeof parsed !== "object") {
+        return html`<div class="stack" style="gap:6px">
+          ${spec.title ? html`<div class="form-section-title">${spec.title}</div>` : null}
+          <div class="muted small">Не удалось разобрать вывод как JSON.</div>
+        </div>`;
+      }
+      for (const f of (spec.fields || [])) {
+        const val = getJsonPath(parsed, f.key);
+        const formatted = formatDisplayCell(val, f.format);
+        rows.push({ label: f.label, val: formatted, cls: kvSeverityClass(formatted, f), mono: f.format === "mono" });
+      }
+    } else {
+      for (const f of (spec.fields || [])) {
+        const rx = compileDisplayRegex(f.regex);
+        let extracted = null;
+        if (rx) {
+          const m = rx.exec(text);
+          if (m) {
+            const grp = f.group != null ? Number(f.group) : (m.length > 1 ? 1 : 0);
+            extracted = m[grp] != null ? String(m[grp]).trim() : null;
+          }
+        }
+        if (extracted != null) {
+          const formatted = formatDisplayCell(extracted, f.format);
+          rows.push({ label: f.label, val: formatted, cls: kvSeverityClass(formatted, f), mono: f.format === "mono" || !f.format });
+        }
+      }
+    }
+    return html`<div class="stack" style="gap:6px">
+      ${spec.title ? html`<div class="form-section-title">${spec.title}</div>` : null}
+      ${rows.length === 0
+        ? html`<div class="muted small">${spec.empty_text || "Данные по шаблону не найдены."}</div>`
+        : html`<dl class="alert-detail-meta">
+            ${rows.map((r, idx) => html`<dt key=${"dt" + idx}>${r.label}</dt>
+              <dd key=${"dd" + idx} class=${(r.mono ? "mono " : "") + r.cls}>${r.val}</dd>`)}
+          </dl>`}
+    </div>`;
+  }
+
+  if (spec.type === "table") {
+    const fmt = spec.format || "json";
+    const cols = spec.columns || [];
+    let allRows = [];
+    let parseErr = "";
+
+    if (fmt === "json") {
+      let data = null;
+      try { data = JSON.parse(text); } catch { parseErr = "Не удалось разобрать вывод как JSON."; }
+      if (data != null) {
+        const rootArr = spec.items_path ? getJsonPath(data, spec.items_path) : data;
+        if (!Array.isArray(rootArr)) {
+          parseErr = "В JSON не найден ожидаемый массив данных.";
+        } else {
+          const walk = (arr) => {
+            for (const item of (arr || [])) {
+              if (!item || typeof item !== "object") continue;
+              allRows.push(item);
+              if (spec.children_key && Array.isArray(item[spec.children_key])) {
+                walk(item[spec.children_key]);
+              }
+            }
+          };
+          walk(rootArr);
+        }
+      }
+    } else {
+      const rx = compileDisplayRegex(spec.regex);
+      if (!rx) {
+        parseErr = "Некорректный regex в display.";
+      } else {
+        const lines = text.split(/\r?\n/).slice(spec.skip_lines || 0);
+        for (const ln of lines) {
+          if (!ln.trim()) continue;
+          const m = rx.exec(ln);
+          if (!m) continue;
+          if (m.groups) {
+            const cleanObj = {};
+            for (const [gk, gv] of Object.entries(m.groups)) {
+              cleanObj[gk] = gv != null ? String(gv).trim() : "";
+            }
+            allRows.push(cleanObj);
+          } else {
+            const rowObj = {};
+            cols.forEach((c, idx) => { rowObj[c.key] = m[idx + 1] ?? ""; });
+            allRows.push(rowObj);
+          }
+        }
+      }
+    }
+
+    if (parseErr) {
+      return html`<div class="stack" style="gap:6px">
+        ${spec.title ? html`<div class="form-section-title">${spec.title}</div>` : null}
+        <div class="muted small">${parseErr}</div>
+      </div>`;
+    }
+
+    const enriched = allRows.map((raw) => {
+      const r = { ...raw };
+      for (const c of cols) {
+        if (c.expr) r[c.key] = evalDisplayExpr(c.expr, r);
+      }
+      return r;
+    });
+
+    let mainRows = enriched;
+    let otherRows = [];
+    if (spec.filter_in && typeof spec.filter_in === "object") {
+      mainRows = [];
+      for (const r of enriched) {
+        const ok = Object.entries(spec.filter_in).every(([k, allowed]) =>
+          Array.isArray(allowed) && allowed.includes(String(r[k] ?? ""))
+        );
+        if (ok) mainRows.push(r);
+        else otherRows.push(r);
+      }
+    }
+
+    const renderTable = (rowsList) => html`<div class="table-wrap">
+      <table class="no-last-border">
+        <thead>
+          <tr>${cols.map((c) => html`<th key=${c.key}>${c.label}</th>`)}</tr>
+        </thead>
+        <tbody>
+          ${rowsList.map((r, rIdx) => html`<tr key=${rIdx}>
+            ${cols.map((c) => {
+              const rawVal = r[c.key];
+              const num = Number(rawVal);
+              let cls = c.format === "mono" ? "mono" : "";
+              if (rawVal != null && !Number.isNaN(num)) {
+                if (c.danger_gt != null && num > Number(c.danger_gt)) cls += " err";
+                else if (c.warn_gt != null && num > Number(c.warn_gt)) cls += " cell-warn";
+              }
+              return html`<td key=${c.key} class=${cls.trim()}>${formatDisplayCell(rawVal, c.format)}</td>`;
+            })}
+          </tr>`)}
+        </tbody>
+      </table>
+    </div>`;
+
+    return html`<div class="stack" style="gap:6px">
+      ${spec.title ? html`<div class="form-section-title">${spec.title}</div>` : null}
+      ${mainRows.length === 0
+        ? html`<div class="muted small">${spec.empty_text || "Записей не найдено."}</div>`
+        : renderTable(mainRows)}
+      ${otherRows.length > 0 && spec.other_summary
+        ? html`<details>
+            <summary class="muted small">${spec.other_summary} (${otherRows.length})</summary>
+            ${renderTable(otherRows)}
+          </details>`
+        : null}
+    </div>`;
+  }
+
+  return null;
+}
+
+function OperationDisplayView({ display, steps, stdout }) {
+  if (!display) return null;
+  const runSteps = Array.isArray(steps) ? steps.filter((st) => st.phase === "run") : null;
+
+  function pickStdout(stepIdx) {
+    if (runSteps && runSteps.length > 0) {
+      const idx = stepIdx != null
+        ? (stepIdx < 0 ? runSteps.length + stepIdx : stepIdx)
+        : (runSteps.length - 1);
+      const chosen = runSteps[idx] || runSteps[runSteps.length - 1];
+      return chosen ? (chosen.stdout || "") : "";
+    }
+    return stdout || "";
+  }
+
+  if (display.type === "sections") {
+    const secs = Array.isArray(display.sections) ? display.sections : [];
+    return html`<div class="stack" style="gap:12px">
+      ${secs.map((sec, idx) => html`<div key=${idx} class="form-section">
+        <${DisplaySingleBlock} spec=${sec} stdout=${pickStdout(sec.step)} />
+      </div>`)}
+    </div>`;
+  }
+
+  return html`<${DisplaySingleBlock} spec=${display} stdout=${pickStdout(display.step)} />`;
+}
+
+function OperationResultView({ op, steps, stdout, stderr, exitCode }) {
+  const disp = op && op.display;
+  const hasSteps = Array.isArray(steps) && steps.length > 0;
+  const rawBlock = hasSteps
+    ? steps.map((s, idx) => html`<pre class="pre" key=${idx}>${s.phase} exit ${s.exit}
+${s.stdout}${s.stderr}</pre>`)
+    : html`<div class="stack">
+        ${stdout ? html`<pre class="pre">${stdout}</pre>` : null}
+        ${stderr ? html`<div class="form-section-title">stderr</div><pre class="pre">${stderr}</pre>` : null}
+        ${!stdout && !stderr ? html`<p class="muted">Вывод команды не сохранён (пустой или уже очищен).</p>` : null}
+      </div>`;
+
+  if (!disp) return rawBlock;
+
   return html`<div class="stack">
-    <div class="muted">exit ${step.exit}${step.stderr ? " · stderr: " + step.stderr.slice(0, 200) : ""}</div>
-    ${interesting.length
-      ? html`<table>
-          <thead><tr><th>Точка</th><th>ФС</th><th>Размер</th><th>Занято</th><th>Свободно</th><th>%</th></tr></thead>
-          <tbody>${interesting.map(
-            (m) => html`<tr>
-              <td class="mono">${m.target}</td><td>${m.fstype}</td>
-              <td>${fmtBytes(m.size)}</td><td>${fmtBytes(m.used)}</td><td>${fmtBytes(m.avail)}</td>
-              <td class=${m.pct > 85 ? "err" : ""}>${m.pct.toFixed(1)}%</td>
-            </tr>`
-          )}</tbody>
-        </table>`
-      : html`<div class="muted">Файловых систем ext4/xfs/btrfs не найдено</div>`}
-    ${other.length
-      ? html`<details><summary class="muted">прочие точки (${other.length})</summary>
-          <table><tbody>${other.map(
-            (m) => html`<tr>
-              <td class="mono">${m.target}</td><td>${m.fstype}</td>
-              <td>${m.size != null ? fmtBytes(m.size) : "—"}</td>
-              <td>${m.used != null ? fmtBytes(m.used) : "—"}</td>
-              <td>${m.avail != null ? fmtBytes(m.avail) : "—"}</td>
-              <td>${m.size > 0 ? m.pct.toFixed(1) + "%" : "—"}</td>
-            </tr>`
-          )}</tbody></table>
-        </details>`
+    <${OperationDisplayView} display=${disp} steps=${steps} stdout=${stdout} />
+    <details>
+      <summary class="muted small">Полный вывод команды</summary>
+      <div class="stack" style="margin-top:8px">${rawBlock}</div>
+    </details>
+  </div>`;
+}
+
+function SshKeyPathField({ value, onChange, disabled }) {
+  const [keysInfo, setKeysInfo] = useState({ profile_keys: [], local_keys: [] });
+  const [uploading, setUploading] = useState(false);
+  const [upErr, setUpErr] = useState("");
+  const fileRef = useRef(null);
+
+  async function loadKeys() {
+    try {
+      const r = await api("/api/v1/ssh-keys");
+      setKeysInfo({
+        profile_keys: r.profile_keys || [],
+        local_keys: r.local_keys || [],
+      });
+    } catch {}
+  }
+
+  useEffect(() => { loadKeys(); }, []);
+
+  async function onFilePicked(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setUploading(true);
+    setUpErr("");
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/api/v1/ssh-keys/upload", {
+        method: "POST",
+        headers: { "X-Session-Token": sessionToken },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error((data && data.error && data.error.message) || "Ошибка загрузки ключа");
+      }
+      onChange(data.ref);
+      await loadKeys();
+      showToast("Ключ зашифрован и сохранён в профиле", "ok");
+    } catch (ex) {
+      setUpErr(ex.message || String(ex));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  const isProfileKey = typeof value === "string" && value.startsWith("profile:keys/");
+
+  return html`<div class="stack" style="gap:6px">
+    <div class="row" style="align-items:center; justify-content:space-between">
+      <label style="margin:0">
+        Файл ключа
+        ${isProfileKey ? html` <span class="badge ok" title="Ключ зашифрован DEK в каталоге профиля">🔒 в профиле</span>` : null}
+      </label>
+      <button type="button" class="btn btn-sm"
+              disabled=${disabled || uploading}
+              onClick=${() => fileRef.current && fileRef.current.click()}>
+        ${uploading ? "Загрузка…" : "Загрузить в профиль…"}
+      </button>
+      <input type="file" ref=${fileRef} style="display:none" onChange=${onFilePicked} />
+    </div>
+    <input class="mono"
+           placeholder="/home/you/.ssh/id_ed25519 или загрузите файл"
+           value=${value || ""}
+           disabled=${disabled || uploading}
+           onInput=${(e) => onChange(e.target.value)} />
+    ${upErr ? html`<div class="err small">${upErr}</div>` : null}
+    ${(keysInfo.profile_keys.length > 0 || keysInfo.local_keys.length > 0)
+      ? html`<div class="preset-pills">
+          ${keysInfo.profile_keys.map((k) => html`<button type="button" key=${k.ref}
+              class=${"preset-pill" + (value === k.ref ? " on" : "")}
+              title=${"Зашифрованный ключ профиля: " + k.ref}
+              onClick=${() => onChange(k.ref)}>🔒 ${k.name}</button>`)}
+          ${keysInfo.local_keys.map((k) => html`<button type="button" key=${k.path}
+              class=${"preset-pill" + (value === k.path ? " on" : "")}
+              title=${k.path}
+              onClick=${() => onChange(k.path)}>📁 ${k.name}</button>`)}
+        </div>`
       : null}
-    <details><summary class="muted">сырой JSON</summary><pre class="pre">${step.stdout}</pre></details>
   </div>`;
 }
 
@@ -1092,8 +1462,7 @@ function Wizard({ onDone, profiles, activeSlug, onSwitchProfile, onCreateProfile
           </label>
         </div>
         ${form.auth_type === "key"
-          ? html`<label>Файл ключа (путь на этой машине)</label>
-              <input class="mono" placeholder="/home/you/.ssh/id_ed25519" value=${form.key_path} onInput=${(e) => setField("key_path", e.target.value)} />
+          ? html`<${SshKeyPathField} value=${form.key_path} onChange=${(v) => setField("key_path", v)} />
               <label>Passphrase (пароль ключа, если зашифрован)</label>
               <input type="password" autocomplete="off" value=${form.passphrase} onInput=${(e) => setField("passphrase", e.target.value)} />
               <label>Пароль пользователя (если сервер его требует)</label>
@@ -1705,7 +2074,120 @@ function Dashboard({ onOpen, llmEnabled, onOpenAlerts, internetOffline }) {
   </div>`;
 }
 
-function ServerView({ id, onBack, internetOffline }) {
+function StreamExecModal({ job, op, onClose }) {
+  const [stdout, setStdout] = useState("");
+  const [stderr, setStderr] = useState("");
+  const [doneInfo, setDoneInfo] = useState(null);
+  const [stopping, setStopping] = useState(false);
+  const [err, setErr] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const preRef = useRef(null);
+
+  useEffect(() => {
+    if (doneInfo) return undefined;
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - t0) / 1000));
+    }, 500);
+    return () => clearInterval(iv);
+  }, [job.job_id, !!doneInfo]);
+
+  useEffect(() => {
+    const el = preRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [stdout, stderr]);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const r = await fetch("/api/v1/operations/stream/" + encodeURIComponent(job.job_id), {
+          headers: sessionToken ? { "X-Session-Token": sessionToken } : {},
+          signal: ctrl.signal,
+        });
+        if (!r.ok || !r.body) {
+          throw new Error("HTTP " + r.status);
+        }
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const parts = buf.split("\n\n");
+          buf = parts.pop() || "";
+          for (const part of parts) {
+            for (const line of part.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const payload = line.slice(5).trim();
+              if (!payload) continue;
+              let obj;
+              try { obj = JSON.parse(payload); } catch { continue; }
+              if (obj.type === "chunk") {
+                if (obj.stream === "stderr") setStderr((p) => p + (obj.text || ""));
+                else setStdout((p) => p + (obj.text || ""));
+              } else if (obj.type === "done") {
+                if (obj.stdout != null) setStdout(obj.stdout);
+                if (obj.stderr != null) setStderr(obj.stderr);
+                setDoneInfo(obj);
+              }
+            }
+          }
+        }
+      } catch (ex) {
+        if (ex && ex.name !== "AbortError") setErr(ex.message || String(ex));
+      }
+    })();
+    return () => { try { ctrl.abort(); } catch {} };
+  }, [job.job_id]);
+
+  async function stopStream() {
+    setStopping(true);
+    try {
+      await api("/api/v1/operations/stream/" + encodeURIComponent(job.job_id) + "/stop", {
+        method: "POST",
+        body: "{}",
+      });
+    } catch (ex) {
+      setErr(ex.message);
+    } finally {
+      setStopping(false);
+    }
+  }
+
+  return html`<${Modal}
+      title=${(op ? op.name : job.oid) + " · поток"}
+      onClose=${() => { if (!doneInfo) stopStream(); onClose(); }}
+      footer=${html`<div class="row">
+        <span class="muted small grow">
+          ${doneInfo
+            ? `Завершено · exit ${doneInfo.exit} · ${doneInfo.duration_ms} мс${doneInfo.interrupted ? " · остановлено" : ""}`
+            : `Выполняется · ${elapsed}с (макс. ${job.max_duration_sec}с)`}
+        </span>
+        ${!doneInfo
+          ? html`<button type="button" class="btn btn-sm btn-danger"
+                    disabled=${stopping}
+                    onClick=${stopStream}>
+                ${stopping ? "Остановка…" : "Остановить (Ctrl+C)"}
+              </button>`
+          : html`<button type="button" class="btn btn-sm btn-primary" onClick=${onClose}>Закрыть</button>`}
+      </div>`}>
+    ${err ? html`<div class="err">${err}</div>` : null}
+    ${doneInfo && op && op.display
+      ? html`<${OperationResultView}
+            op=${op}
+            stdout=${doneInfo.stdout ?? stdout}
+            stderr=${doneInfo.stderr ?? stderr}
+            exitCode=${doneInfo.exit} />`
+      : html`<div class="stack">
+          <pre ref=${preRef} class="pre stream-pre">${stdout || (doneInfo ? "(вывод пуст)" : "Ожидание вывода…")}</pre>
+          ${stderr ? html`<div class="form-section-title">stderr</div><pre class="pre">${stderr}</pre>` : null}
+        </div>`}
+  </${Modal}>`;
+}
+
+function ServerView({ id, onBack, internetOffline, llmEnabled }) {
   const [tab, setTab] = useState("overview");
   const [srv, setSrv] = useState(null);
   const [metrics, setMetrics] = useState(null);
@@ -1713,15 +2195,19 @@ function ServerView({ id, onBack, internetOffline }) {
   const [services, setServices] = useState(null);
   const [plan, setPlan] = useState(null);
   const [exec, setExec] = useState(null);
+  const [streamExec, setStreamExec] = useState(null);
   const [tofu, setTofu] = useState(null);
   const [sudo, setSudo] = useState(null);
-  const [explain, setExplain] = useState(null);
   const [err, setErr] = useState("");
-  const [unit, setUnit] = useState("");
+  const [opParams, setOpParams] = useState({});
+  const [opsFilter, setOpsFilter] = useState("applicable");
   const [useSudo, setUseSudo] = useState(false);
   const [lines, setLines] = useState(100);
   const [svcQ, setSvcQ] = useState("");
   const [svcPage, setSvcPage] = useState(1);
+  const [svcFilter, setSvcFilter] = useState("all");
+  const [svcBusy, setSvcBusy] = useState(false);
+  const [svcErr, setSvcErr] = useState("");
   const [allowedSet, setAllowedSet] = useState(new Set());
   const [allowedDirty, setAllowedDirty] = useState(false);
   const [savingUnits, setSavingUnits] = useState(false);
@@ -1757,6 +2243,8 @@ function ServerView({ id, onBack, internetOffline }) {
     clear_passphrase: false,
   });
   const [authBusy, setAuthBusy] = useState(false);
+  const [metricsCfg, setMetricsCfg] = useState({ interval: "", raw_days: "", agg_days: "" });
+  const [metricsCfgBusy, setMetricsCfgBusy] = useState(false);
 
   async function load() {
     const s = await api("/api/v1/servers/" + id);
@@ -1764,7 +2252,15 @@ function ServerView({ id, onBack, internetOffline }) {
     setNameDraft(s.name || "");
     setAllowedSet(new Set(s.allowed_units || []));
     setAllowedDirty(false);
-    setOps((await api("/api/v1/operations")).items);
+    setOps((await api("/api/v1/operations?server_id=" + id)).items);
+  }
+  // Фоновое обновление метаданных сервера (статус, last_seen_at, anomaly,
+  // collect_error). Не трогает nameDraft и allowedSet — не теряем правки.
+  async function refreshServerMeta() {
+    try {
+      const s = await api("/api/v1/servers/" + id);
+      setSrv(s);
+    } catch {}
   }
   async function loadMetrics() {
     // Обзорная вкладка — всегда 15m. Метрики грузятся отдельно в
@@ -1778,12 +2274,10 @@ function ServerView({ id, onBack, internetOffline }) {
   }, [id]);
   useEffect(() => {
     if (!id) return undefined;
-    // Без явного k: loadMetrics читает fetchKRef.current. Даже если
-    // effect не успел перезапуститься при смене fetchK, следующий
-    // тик возьмёт актуальное окно.
     loadMetrics().catch((e) => setErr(e.message));
     const iv = setInterval(() => {
       loadMetrics().catch(() => {});
+      refreshServerMeta();
     }, 15000);
     return () => clearInterval(iv);
   }, [id]);
@@ -1805,24 +2299,37 @@ function ServerView({ id, onBack, internetOffline }) {
       clear_credential: false,
       clear_passphrase: false,
     });
+    setMetricsCfg({
+      interval: srv.metrics_interval_sec != null ? String(srv.metrics_interval_sec) : "",
+      raw_days: srv.retention_raw_days != null ? String(srv.retention_raw_days) : "",
+      agg_days: srv.retention_agg_days != null ? String(srv.retention_agg_days) : "",
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, srv && srv.id]);
 
-  // SSE: новая точка метрики. Реагируем только на свой server_id,
-  // дебаунс 400 мс — точка на этом сервере приходит раз в 30 сек.
-  // Это даёт «график обновляется сразу после сбора», не ожидая polling.
+  // SSE: новая точка метрики или событие алерта → обновляем графики и статус сервера.
   useEffect(() => {
     let timer = null;
-    const onEv = (e) => {
+    const onMetric = (e) => {
       const p = e && e.detail && e.detail.payload;
       if (!p || p.server_id !== Number(id)) return;
       clearTimeout(timer);
-      timer = setTimeout(() => { loadMetrics().catch(() => {}); }, 400);
+      timer = setTimeout(() => {
+        loadMetrics().catch(() => {});
+        refreshServerMeta();
+      }, 400);
     };
-    window.addEventListener("melecho:metric-event", onEv);
+    const onAlert = (e) => {
+      const p = e && e.detail && e.detail.payload;
+      if (p && p.server_id != null && p.server_id !== Number(id)) return;
+      refreshServerMeta();
+    };
+    window.addEventListener("melecho:metric-event", onMetric);
+    window.addEventListener("melecho:alert-event", onAlert);
     return () => {
       clearTimeout(timer);
-      window.removeEventListener("melecho:metric-event", onEv);
+      window.removeEventListener("melecho:metric-event", onMetric);
+      window.removeEventListener("melecho:alert-event", onAlert);
     };
   }, [id]);
 
@@ -1876,6 +2383,8 @@ function ServerView({ id, onBack, internetOffline }) {
   }
 
   async function doExec() {
+    const opObj = ops.find((o) => o.id === plan.oid);
+    const isStream = !!(opObj && opObj.flags && opObj.flags.streaming);
     try {
       const body = {
         server_id: Number(id),
@@ -1883,9 +2392,21 @@ function ServerView({ id, onBack, internetOffline }) {
         confirm: true,
       };
       if (plan.escalatable || plan.use_sudo) body.use_sudo = plan.use_sudo;
-      const r = await api("/api/v1/operations/" + plan.oid + "/execute", { method: "POST", body: JSON.stringify(body) });
-      setExec(Object.assign({}, r, { _oid: plan.oid }));
-      setPlan(null);
+      if (isStream) {
+        const job = await api("/api/v1/operations/" + plan.oid + "/stream/start", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        setStreamExec({ ...job, oid: plan.oid, op: opObj });
+        setPlan(null);
+      } else {
+        const r = await api("/api/v1/operations/" + plan.oid + "/execute", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        setExec(Object.assign({}, r, { _oid: plan.oid }));
+        setPlan(null);
+      }
     } catch (ex) {
       if (ex.code === "E_SUDO_REQUIRED") {
         setSudo({ alias: srv.llm_alias, pending: true });
@@ -1901,12 +2422,27 @@ function ServerView({ id, onBack, internetOffline }) {
     await doExec();
   }
 
-  async function loadServices(page) {
-    const p = page || svcPage;
-    const q = svcQ ? "&q=" + encodeURIComponent(svcQ) : "";
-    const r = await api("/api/v1/servers/" + id + "/services?per_page=50&page=" + p + q);
-    setServices(r);
-    setSvcPage(r.page);
+  async function loadServices(page, filterOverride, qOverride) {
+    const p = page || 1;
+    const f = filterOverride !== undefined ? filterOverride : svcFilter;
+    const qVal = qOverride !== undefined ? qOverride : svcQ;
+    const qs = new URLSearchParams({
+      per_page: "50",
+      page: String(p),
+      filter: f,
+    });
+    if (qVal && qVal.trim()) qs.set("q", qVal.trim());
+    setSvcBusy(true);
+    setSvcErr("");
+    try {
+      const r = await api("/api/v1/servers/" + id + "/services?" + qs.toString());
+      setServices(r);
+      setSvcPage(r.page);
+    } catch (ex) {
+      setSvcErr(ex.message);
+    } finally {
+      setSvcBusy(false);
+    }
   }
 
   function toggleUnit(u, on) {
@@ -1927,7 +2463,7 @@ function ServerView({ id, onBack, internetOffline }) {
       });
       setAllowedDirty(false);
       await load();
-      await loadServices();
+      await loadServices(svcPage);
     } catch (ex) {
       setErr(ex.message);
     } finally {
@@ -1940,21 +2476,45 @@ function ServerView({ id, onBack, internetOffline }) {
     setAllowedDirty(false);
   }
 
-  async function askExplain(metric) {
-    try {
-      let m = metric;
-      if (!m) {
-        const a = await api("/api/v1/llm/anomalies?server_id=" + id);
-        m = (a.items && a.items[0] && a.items[0].metric) || "cpu";
-      }
-      const r = await api("/api/v1/llm/explain-anomaly", {
-        method: "POST",
-        body: JSON.stringify({ server_id: Number(id), metric: m }),
-      });
-      setExplain(r);
-    } catch (ex) {
-      setErr(ex.message);
+  function fmtMetricVal(metric, val) {
+    if (val == null) return "—";
+    if (metric === "cpu" || metric === "ram" || metric === "disk") return fmtNum(val, 1) + "%";
+    if (metric === "net_rx_bps" || metric === "net_tx_bps") return fmtBytes(val) + "/с";
+    return fmtNum(val, 2);
+  }
+
+  function fmtAnomalyText(a) {
+    const valStr = fmtMetricVal(a.metric, a.value);
+    const parts = [];
+    if (a.reason === "zscore" || a.reason === "both") {
+      const sign = a.z_score >= 0 ? "+" : "";
+      parts.push(`норма ~${fmtMetricVal(a.metric, a.ewma)}, отклонение ${sign}${fmtNum(a.z_score, 2)}σ`);
     }
+    if ((a.reason === "threshold" || a.reason === "both") && a.abs_threshold != null) {
+      parts.push(`порог ≥ ${fmtMetricVal(a.metric, a.abs_threshold)}`);
+    }
+    if (!parts.length) parts.push("отклонение от нормы");
+    return `${a.label}: ${valStr} (${parts.join("; ")})`;
+  }
+
+  function askServerAnomalyInLLM() {
+    if (!srv) return;
+    const list = srv.anomalies || [];
+    const lines = [
+      `Сервер: ${srv.llm_alias}`,
+      `ОС: ${srv.os_family}`,
+      srv.nproc ? `CPU ядер: ${srv.nproc}` : null,
+      list.length
+        ? "Зафиксированные аномалии:\n" + list.map((a) => "  - " + fmtAnomalyText(a)).join("\n")
+        : "Статус: аномалия (подробности не зафиксированы)",
+    ].filter(Boolean);
+    window.dispatchEvent(new CustomEvent("melecho:llm-attach", {
+      detail: {
+        name: `anomaly: ${srv.llm_alias}`,
+        content: lines.join("\n"),
+        force_mode: "chat",
+      },
+    }));
   }
 
   async function doRotate() {
@@ -2036,6 +2596,36 @@ function ServerView({ id, onBack, internetOffline }) {
   //   - credential: приоритет — новый ввод; иначе «удалить сохранённый»
   //     (чекбокс) → пустая строка; иначе не шлём — не трогаем бэк;
   //   - passphrase: аналогично credential.
+  async function doSaveMetricsCfg() {
+    if (!srv) return;
+    setErr("");
+    setMetricsCfgBusy(true);
+    try {
+      const parseOptInt = (v) => (String(v ?? "").trim() === "" ? null : Number(v));
+      const body = {
+        metrics_interval_sec: parseOptInt(metricsCfg.interval),
+        retention_raw_days: parseOptInt(metricsCfg.raw_days),
+        retention_agg_days: parseOptInt(metricsCfg.agg_days),
+      };
+      const updated = await api("/api/v1/servers/" + id, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      });
+      setSrv(updated);
+      setMetricsCfg({
+        interval: updated.metrics_interval_sec != null ? String(updated.metrics_interval_sec) : "",
+        raw_days: updated.retention_raw_days != null ? String(updated.retention_raw_days) : "",
+        agg_days: updated.retention_agg_days != null ? String(updated.retention_agg_days) : "",
+      });
+      showToast("Настройки сбора и хранения сохранены", "ok");
+    } catch (ex) {
+      setErr(ex.message);
+      showToast("Ошибка: " + ex.message, "error");
+    } finally {
+      setMetricsCfgBusy(false);
+    }
+  }
+
   async function doToggleLocal(checked) {
     if (!srv) return;
     setErr("");
@@ -2112,6 +2702,7 @@ function ServerView({ id, onBack, internetOffline }) {
     ["services", "Сервисы"],
     ["ops", "Операции"],
     ["logs", "Логи"],
+    ["graph", "Граф"],
     ["settings", "Настройки"],
   ];
   return html`<div class="server-page">
@@ -2128,11 +2719,10 @@ function ServerView({ id, onBack, internetOffline }) {
           </div>
           <div class="row">
             <button class="btn btn-sm" disabled=${busy} onClick=${testConn}>${busy ? "Проверка…" : "Проверить SSH"}</button>
-            <button class="btn btn-sm" onClick=${() => askExplain()}>Объяснить аномалию</button>
           </div>
         </div>
         <div class="tabs">
-          ${tabs.map(([k, l]) => html`<button class=${tab === k ? "on" : ""} onClick=${() => { setTab(k); if (k === "services") loadServices().catch((e) => setErr(e.message)); }}>${l}</button>`)}
+          ${tabs.map(([k, l]) => html`<button class=${tab === k ? "on" : ""} onClick=${() => { setTab(k); if (k === "services") loadServices(1); }}>${l}</button>`)}
         </div>
       </div>
       ${err ? html`<p class="err">${err}</p>` : null}
@@ -2168,6 +2758,26 @@ function ServerView({ id, onBack, internetOffline }) {
           </div>`
         : null}
       ${incomplete.length ? html`<div class="banner warn">Неполные метрики: нет ${incomplete.join(", ")}</div>` : null}
+      ${srv && srv.anomaly
+        ? html`<div class="banner danger">
+            <div class="row">
+              <div class="grow stack" style="gap:4px">
+                <b>⚠ Зафиксирована аномалия</b>
+                <div class="small">
+                  ${(srv.anomalies && srv.anomalies.length)
+                    ? srv.anomalies.map((a, idx) => html`<div key=${a.metric || idx}>• ${fmtAnomalyText(a)}</div>`)
+                    : "Отклонение от нормы (подробности обновятся после следующего сбора)."}
+                </div>
+              </div>
+              ${llmEnabled
+                ? html`<button class="btn btn-sm" onClick=${askServerAnomalyInLLM}>↗ Спросить LLM</button>`
+                : null}
+            </div>
+          </div>`
+        : null}
+      ${srv && srv.collect_error && !srv.collect_error.startsWith("E_HOSTKEY") && !(!!internetOffline && !srv.is_local)
+        ? html`<div class="banner warn">${srv.collect_error}</div>`
+        : null}
     </div>
     <div class="server-page-content">
     ${tab === "overview"
@@ -2199,87 +2809,235 @@ function ServerView({ id, onBack, internetOffline }) {
       ? html`<${MetricsView} key=${id} serverId=${Number(id)} />`
       : null}
     ${tab === "services"
-      ? html`<div class="stack">
-          <div class="card stack">
-            <h3>Разрешённые unit</h3>
-            <p class="muted">
-              Отметьте systemd-юниты, которые разрешено указывать в качестве параметра
-              в операции <span class="mono">Перезапуск systemd-сервиса</span>.
-              Без галочки операция отклонит параметр. Каждое имя проверяется через
-              <span class="mono">systemctl cat</span> на сервере, поэтому в списке могут
-              быть только реально существующие unit.
-            </p>
-            <p class="muted">В списке: <b>${allowedSet.size}</b> разрешённых unit из <b>${services ? services.total : "…"}</b> найденных.</p>
-            ${allowedDirty
-              ? html`<div class="banner warn">
-                  <div class="row">
-                    <span class="grow">Есть несохранённые изменения (${allowedSet.size} unit).</span>
-                    <button class="btn btn-sm btn-primary" disabled=${savingUnits} onClick=${saveAllowedUnits}>${savingUnits ? "Сохранение…" : "Сохранить изменения"}</button>
-                    <button class="btn btn-sm btn-ghost" disabled=${savingUnits} onClick=${cancelAllowed}>Отменить</button>
-                  </div>
-                </div>`
-              : null}
-          </div>
-          <div class="card stack">
-            <div class="row">
-              <input class="grow" placeholder="поиск unit" value=${svcQ} onInput=${(e) => setSvcQ(e.target.value)} />
-              <button class="btn btn-sm" onClick=${() => loadServices().catch((e) => setErr(e.message))}>Искать</button>
+      ? (() => {
+          const cnt = (services && services.counts) || null;
+          const total = services ? services.total : 0;
+          const totalPages = Math.max(1, Math.ceil(total / 50));
+          const savedAllowed = new Set((srv && srv.allowed_units) || []);
+          const canRestart = ops.some((o) => o.id === "systemd_restart" && o.valid);
+          return html`<div class="stack">
+            <div class="card stack">
+              <div class="row">
+                <div class="grow">
+                  <h3>Системные сервисы и белый список</h3>
+                  <p class="muted small">
+                    Отметьте systemd-юниты, разрешённые в параметрах операций, проверок
+                    и реакций (<span class="mono">server.allowed_units</span>). При сохранении
+                    каждый юнит проверяется через <span class="mono">systemctl cat</span>.
+                  </p>
+                </div>
+                <button class="btn btn-sm" disabled=${svcBusy} onClick=${() => loadServices(svcPage)}>
+                  ${svcBusy ? "Обновление…" : "Обновить"}
+                </button>
+              </div>
+              <div class="row">
+                <${Segmented}
+                  value=${svcFilter}
+                  onChange=${(next) => { setSvcFilter(next); loadServices(1, next, svcQ); }}
+                  options=${[
+                    { value: "all", label: cnt ? `Все (${cnt.all})` : "Все" },
+                    { value: "allowed", label: `Разрешённые (${allowedSet.size})` },
+                    { value: "active", label: cnt ? `Активные (${cnt.active})` : "Активные" },
+                    { value: "failed", label: cnt ? `Упавшие (${cnt.failed})` : "Упавшие" },
+                  ]} />
+              </div>
+              <form class="row" onSubmit=${(e) => { e.preventDefault(); loadServices(1, svcFilter, svcQ); }}>
+                <input class="grow" placeholder="Поиск по имени юнита (например nginx)"
+                       value=${svcQ}
+                       onInput=${(e) => setSvcQ(e.target.value)} />
+                <button type="submit" class="btn btn-sm" disabled=${svcBusy}>Найти</button>
+                ${(svcQ || svcFilter !== "all")
+                  ? html`<button type="button" class="btn btn-sm btn-ghost" disabled=${svcBusy}
+                          onClick=${() => { setSvcQ(""); setSvcFilter("all"); loadServices(1, "all", ""); }}>
+                      Сбросить
+                    </button>`
+                  : null}
+              </form>
+              ${allowedDirty
+                ? html`<div class="banner warn">
+                    <div class="row">
+                      <span class="grow">Есть несохранённые изменения (выбрано в списке: <b>${allowedSet.size}</b>).</span>
+                      <button class="btn btn-sm btn-primary" disabled=${savingUnits} onClick=${saveAllowedUnits}>
+                        ${savingUnits ? "Сохранение…" : "Сохранить изменения"}
+                      </button>
+                      <button class="btn btn-sm btn-ghost" disabled=${savingUnits} onClick=${cancelAllowed}>Отменить</button>
+                    </div>
+                  </div>`
+                : null}
+              ${svcErr ? html`<div class="err">${svcErr}</div>` : null}
             </div>
-            <div class="table-wrap">
-            <table>
-              <thead><tr><th></th><th>Unit</th><th>Active</th></tr></thead>
-              <tbody>
-                ${(services?.items || []).map(
-                  (u) => html`<tr key=${u.unit}>
-                    <td><input type="checkbox" checked=${allowedSet.has(u.unit)} onChange=${(e) => toggleUnit(u.unit, e.target.checked)} /></td>
-                    <td class="mono">${u.unit}</td>
-                    <td>${u.active}</td>
-                  </tr>`
-                )}
-              </tbody>
-            </table>
+
+            <div class="card stack">
+              ${!services && svcBusy
+                ? html`<p class="muted">Загрузка списка сервисов…</p>`
+                : (services && services.items && services.items.length === 0)
+                ? html`<p class="muted">Подходящих сервисов не найдено.</p>`
+                : html`<div class="table-wrap">
+                    <table class="services-table no-last-border">
+                      <thead>
+                        <tr>
+                          <th style="width:36px"></th>
+                          <th>Юнит</th>
+                          <th>Статус</th>
+                          <th style="text-align:right">Действие</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${(services?.items || []).map((u) => {
+                          const isFailed = u.active === "failed" || u.sub === "failed";
+                          const isRunning = u.active === "active" && u.sub === "running";
+                          const isActive = u.active === "active";
+                          const statusCls = isFailed ? "danger" : (isRunning ? "ok" : (isActive ? "warn" : ""));
+                          const statusText = [u.active, u.sub].filter(Boolean).join(" · ") || "—";
+                          const isChecked = allowedSet.has(u.unit);
+                          const isSaved = savedAllowed.has(u.unit);
+                          return html`<tr key=${u.unit}>
+                            <td>
+                              <input type="checkbox" checked=${isChecked}
+                                     onChange=${(e) => toggleUnit(u.unit, e.target.checked)} />
+                            </td>
+                            <td>
+                              <div class="mono">${u.unit}</div>
+                              ${u.load && u.load !== "loaded"
+                                ? html`<div class="muted small">${u.load}</div>`
+                                : null}
+                            </td>
+                            <td>
+                              <span class=${"badge " + statusCls}>${statusText}</span>
+                            </td>
+                            <td style="text-align:right">
+                              ${isSaved && canRestart
+                                ? html`<button type="button" class="btn btn-sm btn-ghost"
+                                          title="Открыть план операции systemd_restart"
+                                          onClick=${() => doPlan("systemd_restart", { unit: u.unit }, false)}>
+                                    Перезапуск
+                                  </button>`
+                                : (isChecked && !isSaved
+                                    ? html`<span class="muted small">сохраните</span>`
+                                    : null)}
+                            </td>
+                          </tr>`;
+                        })}
+                      </tbody>
+                    </table>
+                  </div>`}
+              ${services
+                ? html`<div class="row">
+                    <span class="muted small grow">
+                      Найдено: ${total} · стр. ${svcPage} из ${totalPages}
+                    </span>
+                    ${total > 50
+                      ? html`<div class="row" style="gap:6px">
+                          <button class="btn btn-sm" disabled=${svcBusy || svcPage <= 1}
+                                  onClick=${() => loadServices(svcPage - 1)}>← Назад</button>
+                          <button class="btn btn-sm" disabled=${svcBusy || svcPage * 50 >= total}
+                                  onClick=${() => loadServices(svcPage + 1)}>Вперёд →</button>
+                        </div>`
+                      : null}
+                  </div>`
+                : null}
             </div>
-            <div class="muted">${services ? services.total + " unit, стр. " + services.page : ""}</div>
-            ${services && services.total > 50
-              ? html`<div class="row">
-                  <button class="btn btn-sm" disabled=${svcPage <= 1} onClick=${() => loadServices(svcPage - 1).catch((e) => setErr(e.message))}>Назад</button>
-                  <button class="btn btn-sm" disabled=${svcPage * 50 >= services.total} onClick=${() => loadServices(svcPage + 1).catch((e) => setErr(e.message))}>Далее</button>
-                </div>`
-              : null}
-          </div>
-        </div>`
+          </div>`;
+        })()
       : null}
     ${tab === "ops"
-      ? html`<div class="grid">
-          ${ops.filter((o) => o.valid).map(
-            (o) => html`<article class="card">
-              <h3>${o.name}</h3>
-              <div class="muted mono">${o.id}</div>
-              <div class="row">
-                ${o.flags?.state_changing ? html`<span class="badge warn">state</span>` : html`<span class="badge">read</span>`}
-                ${o.flags?.escalatable ? html`<span class="badge">sudo opt-in</span>` : null}
-              </div>
-              ${o.id === "systemd_restart"
-                ? html`<input list="allowed-units-datalist" placeholder="unit (начните вводить)" value=${unit} onInput=${(e) => setUnit(e.target.value)} />
-                    <datalist id="allowed-units-datalist">
-                      ${Array.from(allowedSet).sort().map((u) => html`<option value=${u} />`)}
-                    </datalist>`
-                : null}
-              ${o.id === "journalctl_view"
-                ? html`<input type="number" min="1" max="1000" value=${lines} onInput=${(e) => setLines(e.target.value)} />`
-                : null}
-              ${o.flags?.escalatable
-                ? html`<label class="check"><input type="checkbox" checked=${useSudo} onChange=${(e) => setUseSudo(e.target.checked)} /> Использовать sudo (явно)</label>`
-                : null}
-              <button class="btn btn-primary" onClick=${() =>
-                doPlan(
-                  o.id,
-                  o.id === "systemd_restart" ? { unit } : o.id === "journalctl_view" ? { lines: Number(lines) } : {},
-                  o.flags?.escalatable
-                )}>План</button>
-            </article>`
-          )}
-          ${ops.filter((o) => !o.valid).map((o) => html`<article class="card"><span class="badge danger">невалидна</span><div>${o.name}</div><div class="err">${o.error}</div></article>`)}
+      ? (() => {
+          const validOps = ops.filter((o) => o.valid);
+          const shownOps = validOps.filter((o) => {
+            if (opsFilter === "applicable") return o.applicable !== false;
+            if (opsFilter === "user") return o.source === "user";
+            return true;
+          });
+          const appCnt = validOps.filter((o) => o.applicable !== false).length;
+          const userCnt = validOps.filter((o) => o.source === "user").length;
+          return html`<div class="stack">
+          <div class="row">
+            <${Segmented}
+              value=${opsFilter}
+              onChange=${setOpsFilter}
+              options=${[
+                { value: "applicable", label: `Применимые (${appCnt})` },
+                { value: "user", label: `Пользовательские (${userCnt})` },
+                { value: "all", label: `Все (${validOps.length})` },
+              ]} />
+          </div>
+          <datalist id="allowed-units-datalist">
+            ${Array.from(allowedSet).sort().map((u) => html`<option value=${u} key=${u} />`)}
+          </datalist>
+          ${shownOps.length === 0
+            ? html`<div class="card empty">
+                <h3>Подходящих операций нет</h3>
+                <p class="muted">Пользовательские операции привязываются к серверу в разделе «Автоматизация → Операции».</p>
+              </div>`
+            : html`<div class="grid">
+            ${shownOps.map((o) => {
+              const specs = Array.isArray(o.params) ? o.params : [];
+              const curMap = opParams[o.id] || {};
+              const setOpField = (pName, pVal) => setOpParams((prev) => ({
+                ...prev,
+                [o.id]: { ...(prev[o.id] || {}), [pName]: pVal },
+              }));
+              const buildOpParams = () => {
+                const out = {};
+                for (const sp of specs) {
+                  const raw = curMap[sp.name] !== undefined
+                    ? curMap[sp.name]
+                    : (sp.default !== undefined ? String(sp.default) : "");
+                  if (raw === "" || raw == null) continue;
+                  out[sp.name] = sp.type === "int" ? Number(raw) : raw;
+                }
+                return out;
+              };
+              return html`<article class="card" key=${o.id}>
+                <h3>${o.name}</h3>
+                <div class="muted mono">${o.id}</div>
+                <div class="row">
+                  ${o.source === "user" ? html`<span class="badge">user</span>` : null}
+                  ${o.applicable === false ? html`<span class="badge danger">не привязана</span>` : null}
+                  ${o.flags?.state_changing ? html`<span class="badge warn">state</span>` : html`<span class="badge">read</span>`}
+                  ${o.flags?.escalatable ? html`<span class="badge">sudo opt-in</span>` : null}
+                  ${o.flags?.streaming ? html`<span class="badge">stream</span>` : null}
+                  ${o.display ? html`<span class="badge ok">display</span>` : null}
+                </div>
+                ${specs.map((sp) => {
+                  const val = curMap[sp.name] !== undefined
+                    ? curMap[sp.name]
+                    : (sp.default !== undefined ? String(sp.default) : "");
+                  const isUnits = sp.source === "server.allowed_units";
+                  return html`<div class="form-sub" key=${sp.name}>
+                    <label style="text-transform:none">
+                      <span class="mono">${sp.name}</span>
+                      ${sp.required ? html`<span class="err"> *</span>` : null}
+                    </label>
+                    ${sp.type === "int"
+                      ? html`<input type="number" min=${sp.min} max=${sp.max} value=${val}
+                                onInput=${(e) => setOpField(sp.name, e.target.value)} />`
+                      : isUnits
+                      ? html`<input list="allowed-units-datalist" placeholder="unit (начните вводить)" value=${val}
+                                onInput=${(e) => setOpField(sp.name, e.target.value)} />`
+                      : html`<input type=${sp.sensitive ? "password" : "text"}
+                                placeholder=${sp.name}
+                                value=${val}
+                                onInput=${(e) => setOpField(sp.name, e.target.value)} />`}
+                  </div>`;
+                })}
+                ${o.flags?.escalatable
+                  ? html`<label class="check"><input type="checkbox" checked=${useSudo} onChange=${(e) => setUseSudo(e.target.checked)} /> Использовать sudo (явно)</label>`
+                  : null}
+                <button class="btn btn-primary"
+                        disabled=${o.applicable === false}
+                        title=${o.applicable === false ? "Операция не привязана к этому серверу" : ""}
+                        onClick=${() => doPlan(o.id, buildOpParams(), o.flags?.escalatable)}>План</button>
+              </article>`;
+            })}
+            ${ops.filter((o) => !o.valid).map((o) => html`<article class="card" key=${o.id}><span class="badge danger">невалидна</span><div>${o.name}</div><div class="err">${o.error}</div></article>`)}
+          </div>`}
+        </div>`;
+        })()
+      : null}
+    ${tab === "graph"
+      ? html`<div class="stack" style="height: calc(100vh - 220px); min-height: 480px;">
+          <${AutomationGraphView} initialServerId=${Number(id)} isServerTab=${true} />
         </div>`
       : null}
     ${tab === "logs"
@@ -2311,6 +3069,88 @@ function ServerView({ id, onBack, internetOffline }) {
                       disabled=${nprocBusy}
                       onClick=${doRefreshNproc}>
                 ${nprocBusy ? "Обновление…" : "Обновить nproc"}
+              </button>
+            </div>
+          </div>
+          <div class="card stack">
+            <h3>Сбор и хранение метрик</h3>
+            <p class="muted small">
+              Сейчас действует: сбор каждые <b>${srv.effective_metrics_interval_sec ?? 30}с</b>
+              · сырые (raw): <b>${srv.effective_retention_raw_days === 0 ? "вечно" : ((srv.effective_retention_raw_days ?? 3) + " дн")}</b>
+              · агрегаты (5m): <b>${srv.effective_retention_agg_days === 0 ? "вечно" : ((srv.effective_retention_agg_days ?? 30) + " дн")}</b>.
+              Пустое значение = использовать глобальные настройки.
+            </p>
+
+            <div class="form-sub">
+              <label>Интервал сбора (сек, от 5 до 300)</label>
+              <div class="preset-pills">
+                ${[
+                  ["", "Глобально"],
+                  ["5", "5с"],
+                  ["10", "10с"],
+                  ["15", "15с"],
+                  ["30", "30с"],
+                  ["60", "60с"],
+                ].map(([val, lbl]) => html`<button type="button" key=${"iv-" + val}
+                    class=${"preset-pill" + (metricsCfg.interval === val ? " on" : "")}
+                    onClick=${() => setMetricsCfg({ ...metricsCfg, interval: val })}>${lbl}</button>`)}
+              </div>
+              <input type="number" min="5" max="300" style="max-width:220px"
+                     placeholder="глобально (по умолчанию 30с)"
+                     value=${metricsCfg.interval}
+                     onInput=${(e) => setMetricsCfg({ ...metricsCfg, interval: e.target.value })} />
+              ${metricsCfg.interval !== "" && Number(metricsCfg.interval) > 0 && Number(metricsCfg.interval) < 15
+                ? html`<div class="muted small" style="color:var(--warn)">
+                    Частый сбор (&lt; 15с) увеличивает нагрузку на SSH и объём БД — рекомендуется задать срок хранения ниже.
+                  </div>`
+                : null}
+            </div>
+
+            <div class="form-sub">
+              <label>Хранение сырых метрик (дней, 0 = вечно)</label>
+              <div class="preset-pills">
+                ${[
+                  ["", "Глобально"],
+                  ["1", "1 день"],
+                  ["3", "3 дня"],
+                  ["7", "7 дней"],
+                  ["30", "30 дней"],
+                  ["0", "Вечно"],
+                ].map(([val, lbl]) => html`<button type="button" key=${"raw-" + val}
+                    class=${"preset-pill" + (metricsCfg.raw_days === val ? " on" : "")}
+                    onClick=${() => setMetricsCfg({ ...metricsCfg, raw_days: val })}>${lbl}</button>`)}
+              </div>
+              <input type="number" min="0" max="3650" style="max-width:220px"
+                     placeholder="глобально"
+                     value=${metricsCfg.raw_days}
+                     onInput=${(e) => setMetricsCfg({ ...metricsCfg, raw_days: e.target.value })} />
+            </div>
+
+            <div class="form-sub">
+              <label>Хранение агрегатов 5m (дней, 0 = вечно)</label>
+              <div class="preset-pills">
+                ${[
+                  ["", "Глобально"],
+                  ["7", "7 дней"],
+                  ["30", "30 дней"],
+                  ["90", "90 дней"],
+                  ["365", "1 год"],
+                  ["0", "Вечно"],
+                ].map(([val, lbl]) => html`<button type="button" key=${"agg-" + val}
+                    class=${"preset-pill" + (metricsCfg.agg_days === val ? " on" : "")}
+                    onClick=${() => setMetricsCfg({ ...metricsCfg, agg_days: val })}>${lbl}</button>`)}
+              </div>
+              <input type="number" min="0" max="3650" style="max-width:220px"
+                     placeholder="глобально"
+                     value=${metricsCfg.agg_days}
+                     onInput=${(e) => setMetricsCfg({ ...metricsCfg, agg_days: e.target.value })} />
+            </div>
+
+            <div class="row">
+              <button type="button" class="btn btn-sm btn-primary"
+                      disabled=${metricsCfgBusy}
+                      onClick=${doSaveMetricsCfg}>
+                ${metricsCfgBusy ? "Сохранение…" : "Сохранить настройки метрик"}
               </button>
             </div>
           </div>
@@ -2417,10 +3257,9 @@ function ServerView({ id, onBack, internetOffline }) {
             </div>
 
             ${authDraft.auth_type === "key"
-              ? html`<label>Файл ключа (путь на этой машине)</label>
-                  <input class="mono" placeholder="/home/you/.ssh/id_ed25519"
-                         value=${authDraft.key_path}
-                         onInput=${(e) => setAuthDraft({ ...authDraft, key_path: e.target.value })} />
+              ? html`<${SshKeyPathField}
+                      value=${authDraft.key_path}
+                      onChange=${(v) => setAuthDraft({ ...authDraft, key_path: v })} />
                   <label>Passphrase
                     ${srv.has_passphrase && !authDraft.clear_passphrase && !authDraft.passphrase
                       ? html`<span class="muted small"> · сохранён</span>`
@@ -2512,17 +3351,16 @@ function ServerView({ id, onBack, internetOffline }) {
     ${exec
       ? html`<${Modal} title="Результат" onClose=${() => setExec(null)}>
           <div class="muted">${exec.duration_ms} мс · sudo ${exec.sudo_used ? "да" : "нет"}</div>
-          ${exec._oid === "disk_check"
-            ? html`<${DiskCheckResult} step=${(exec.steps || []).find((s) => s.phase === "run")} />`
-            : (exec.steps || []).map((s) => html`<pre class="pre">${s.phase} exit ${s.exit}\n${s.stdout}${s.stderr}</pre>`)}
+          <${OperationResultView}
+            op=${ops.find((o) => o.id === exec._oid) || null}
+            steps=${exec.steps || []} />
         </${Modal}>`
       : null}
-    ${explain
-      ? html`<${Modal} title="Интерпретация аномалии" onClose=${() => setExplain(null)}>
-          <div class="muted">${explain.llm_alias} · ${explain.metric} · ${explain.provider}</div>
-          <p>${explain.explanation}</p>
-          <div class="row">${(explain.recommendations || []).map((id) => html`<span class="badge">${id}</span>`)}</div>
-        </${Modal}>`
+    ${streamExec
+      ? html`<${StreamExecModal}
+            job=${streamExec}
+            op=${streamExec.op}
+            onClose=${() => setStreamExec(null)} />`
       : null}
   </div>`;
 }
@@ -2548,8 +3386,7 @@ function ServerAuthFields({ form, set }) {
       </label>
     </div>
     ${form.auth_type === "key"
-      ? html`<label>Файл ключа (путь на этой машине)</label>
-          <input class="mono" placeholder="/home/you/.ssh/id_ed25519" value=${form.key_path || ""} onInput=${(e) => set("key_path", e.target.value)} />
+      ? html`<${SshKeyPathField} value=${form.key_path || ""} onChange=${(v) => set("key_path", v)} />
           <label>Passphrase (пароль ключа, если зашифрован)</label>
           <input type="password" autocomplete="off" value=${form.passphrase} onInput=${(e) => set("passphrase", e.target.value)} />
           <label>Пароль пользователя (если сервер его требует)</label>
@@ -2666,9 +3503,8 @@ function AuditView() {
       </div>
     </div>
     ${integ
-      ? html`<div class=${"card " + (integ.ok ? "" : "")}>
-          <span class=${"badge " + (integ.ok ? "ok" : "danger")}>${integ.code}</span>
-          <span> ${integ.message}</span>
+      ? html`<div class=${"card audit-status-card " + (!integ.ok ? "danger" : (integ.code === "AUDIT_DISABLED" ? "warn" : "ok"))}>
+          <span>${integ.message}</span>
         </div>`
       : null}
     ${err ? html`<p class="err">${err}</p>` : null}
@@ -2917,16 +3753,53 @@ function setLLMSmoothEnabled(on) {
 //   - streaming: сообщение в процессе приёма — ещё не финал, брать нельзя;
 //   - blocked: сработала канарейка S4, сообщение не уходило и не пришло;
 //   - пустой content — служебная заглушка.
-function buildSuggestHistory(msgs, modeLabel) {
-  return msgs
-    .filter((m) =>
-      m && m._mode === modeLabel
-      && !m.streaming && !m.blocked
-      && (m.role === "user" || m.role === "assistant")
-      && typeof m.content === "string" && m.content.trim()
-    )
-    .slice(-6)
-    .map((m) => ({ role: m.role, content: m.content.trim() }));
+function expandMsgContent(m) {
+  let c = (m.content || "").trim();
+  if (m.attachment) {
+    c = "[вложение: " + m.attachment.name + "]\n\n"
+      + m.attachment.content
+      + (c ? "\n\n" + c : "");
+  }
+  return c;
+}
+
+function buildContextHistory(msgs, modeLabel, contextCfg, reserveChars = 0) {
+  const cfg = contextCfg || { max_messages: 20, max_chars: 32000, cross_mode: true };
+  const cross = cfg.cross_mode !== false;
+  const maxMsgs = Number(cfg.max_messages) > 0 ? Number(cfg.max_messages) : Infinity;
+  const maxChars = Number(cfg.max_chars) > 0 ? Number(cfg.max_chars) : Infinity;
+  const budget = maxChars === Infinity ? Infinity : Math.max(500, maxChars - reserveChars);
+
+  const filtered = msgs
+    .filter((m) => {
+      if (!m || m.streaming || m.blocked) return false;
+      if (m.role !== "user" && m.role !== "assistant") return false;
+      if (!m.content && !m.attachment) return false;
+      if (!cross) {
+        if (modeLabel === "chat") return !m._mode || m._mode === "chat";
+        return m._mode === modeLabel;
+      }
+      return true;
+    })
+    .map((m) => ({ role: m.role, content: expandMsgContent(m) }))
+    .filter((m) => m.content.trim().length > 0);
+
+  const selected = [];
+  let totalChars = 0;
+  for (let i = filtered.length - 1; i >= 0; i--) {
+    if (selected.length >= maxMsgs) break;
+    const item = filtered[i];
+    const len = item.content.length;
+    if (totalChars + len > budget) {
+      if (selected.length === 0 && budget !== Infinity) {
+        selected.unshift({ role: item.role, content: item.content.slice(-budget) });
+      }
+      break;
+    }
+    selected.unshift(item);
+    totalChars += len;
+  }
+  return selected;
 }
 
 function chatModeSpec(value) {
@@ -3007,6 +3880,9 @@ function LLMChatModal({
   chatMode, onChangeMode,
   onRequestClear,
   onClose,
+  errorNotification, setErrorNotification,
+  onMsgContextMenu,
+  justClosedCtxRef,
 }) {
   const [expanded, setExpanded] = useState(false);
   const [pillOpen, setPillOpen] = useState(false);
@@ -3052,8 +3928,12 @@ function LLMChatModal({
 
   const canSend = !streaming && (input.trim() || attachment);
 
-  return html`<div class="modal-back"
-      onClick=${(e) => e.target === e.currentTarget && onClose()}>
+  return html`<div class="modal-back llm-modal-back"
+      onClick=${(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (justClosedCtxRef && justClosedCtxRef.current) return;
+        onClose();
+      }}>
     <div class=${"modal llm-chat-modal "
                   + (expanded ? "expanded" : "")
                   + (!expanded && messages.length > 0 ? " has-reset" : "")}
@@ -3100,6 +3980,23 @@ function LLMChatModal({
         ${attachNotice
           ? html`<div class="llm-chat-modal-notice">${attachNotice}</div>`
           : null}
+        ${errorNotification
+          ? html`<div class="llm-modal-error-banner">
+              <span class="llm-error-icon">⚠</span>
+              <div class="llm-error-text grow">
+                <b>${errorNotification.code || "Ошибка"}:</b> ${errorNotification.message}
+              </div>
+              <div class="llm-error-actions">
+                ${errorNotification.onRetry
+                  ? html`<button type="button" class="btn btn-sm btn-ghost llm-error-retry"
+                                 onClick=${errorNotification.onRetry}>Повторить</button>`
+                  : null}
+                <button type="button" class="llm-error-close"
+                        title="Закрыть"
+                        onClick=${() => setErrorNotification && setErrorNotification(null)}>×</button>
+              </div>
+            </div>`
+          : null}
 
         ${!expanded
           ? html`<div class="llm-chat" ref=${chatBoxRef}>
@@ -3108,7 +4005,10 @@ function LLMChatModal({
                     Напишите сообщение, чтобы начать.
                     <br/><span class="mono">/help</span> — список команд
                   </div>`
-                : messages.map((m, i) => {
+                : (() => {
+                    const lastUserIdx = messages.map((x) => x.role).lastIndexOf("user");
+                    const lastAssistantIdx = messages.map((x) => x.role).lastIndexOf("assistant");
+                    return messages.map((m, i) => {
                     const actions = [];
                     if (m.suggested_op) {
                       actions.push(html`<button type="button" key="op" class="llm-open-editor-btn"
@@ -3156,7 +4056,8 @@ function LLMChatModal({
                         Применить
                       </button>`);
                     }
-                    return html`<div key=${i} class=${"llm-msg-block " + m.role}>
+                    return html`<div key=${i} class=${"llm-msg-block " + m.role}
+                        onContextMenu=${(e) => onMsgContextMenu && onMsgContextMenu(e, m, i, lastUserIdx, lastAssistantIdx)}>
                       <div class=${"llm-msg " + m.role
                           + (m.streaming ? " streaming" : "")
                           + (m.blocked ? " blocked" : "")}>
@@ -3170,7 +4071,7 @@ function LLMChatModal({
                               : null}
                           </div>
                         </div>
-                        ${m.blocked ? "🚫 " : ""}${(m.content || "").replace(/\n+$/, "") || (m.streaming ? "" : (m.attachment ? "" : "…"))}
+                        ${m.blocked ? "🚫 " : ""}${(m.content || "").replace(/\n+$/, "") || (m.streaming ? (m.retryNotice ? html`<span class="llm-retry-indicator">${m.retryNotice}</span>` : (m.waitingText || "")) : (m.attachment ? "" : "…"))}
                       </div>
                       <div class=${"llm-reveal" + (actions.length ? " shown" : "")}>
                         <div class="llm-reveal-inner">
@@ -3180,7 +4081,8 @@ function LLMChatModal({
                         </div>
                       </div>
                     </div>`;
-                  })}
+                  });
+                })()}
             </div>`
           : null}
 
@@ -3260,12 +4162,18 @@ function LLMWindow() {
   const [attachNotice, setAttachNotice] = useState("");
   const [chatMode, setChatMode] = useState(() => loadLLMChatMode());
   const [modePillOpen, setModePillOpen] = useState(false);
+  const [errorNotification, setErrorNotification] = useState(null);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [contextCfg, setContextCfg] = useState({ max_messages: 20, max_chars: 32000, cross_mode: true });
   const abortRef = useRef(null);
   const chatBoxRef = useRef(null);
   const inputRef = useRef(null);
   const dragRef = useRef(null);
   const resizeRef = useRef(null);
   const rafRef = useRef(null);
+  const chatOpenRef = useRef(chatOpen);
+  chatOpenRef.current = chatOpen;
+  const justClosedCtxRef = useRef(false);
   // Буфер стрима: чанки от сервера, ещё не отрисованные.
   // streamDoneRef — сервер прислал [DONE]; pump доделывает хвост.
   const streamBufRef = useRef("");
@@ -3289,6 +4197,26 @@ function LLMWindow() {
   // не могло опуститься до низа viewport, потому что клампинг шёл
   // по полной size.h, а фактическая высота была ~40px.
   const COLLAPSED_HEAD_H = 40;
+
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+    function onDoc(e) {
+      if (!e.target.closest(".llm-context-menu")) {
+        setContextMenu(null);
+        justClosedCtxRef.current = true;
+        setTimeout(() => { justClosedCtxRef.current = false; }, 100);
+      }
+    }
+    function onKey(e) {
+      if (e.key === "Escape") setContextMenu(null);
+    }
+    document.addEventListener("pointerdown", onDoc, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDoc, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     if (!pillOpen) return undefined;
@@ -3320,7 +4248,11 @@ function LLMWindow() {
     // Профили могли измениться в настройках — обновляем без F5.
     const onRefresh = () => loadProfiles();
     window.addEventListener("melecho:refresh-llm-profiles", onRefresh);
-    return () => window.removeEventListener("melecho:refresh-llm-profiles", onRefresh);
+    window.addEventListener("melecho:refresh-status", onRefresh);
+    return () => {
+      window.removeEventListener("melecho:refresh-llm-profiles", onRefresh);
+      window.removeEventListener("melecho:refresh-status", onRefresh);
+    };
   }, []);
 
   // Событие из AppShell: пользователь нажал «Открыть алерт #N».
@@ -3470,6 +4402,11 @@ function LLMWindow() {
       setProfiles(p.items || []);
       setActiveId(p.active_id);
       setProfileName(s.llm_active_profile_name || "");
+      setContextCfg({
+        max_messages: s.llm_context_max_messages ?? 20,
+        max_chars: s.llm_context_max_chars ?? 32000,
+        cross_mode: s.llm_context_cross_mode !== false,
+      });
     } catch {}
   }
 
@@ -3659,7 +4596,11 @@ function LLMWindow() {
     setPos(nextPos);
     persist("open", nextPos, size);
   }
-  function closeWindow() { setState("hidden"); persist("hidden", currentPos, size); }
+  function closeWindow() {
+    setState("hidden");
+    setErrorNotification(null);
+    persist("hidden", currentPos, size);
+  }
 
   async function onProfileChange(pid) {
     try {
@@ -3883,17 +4824,16 @@ function LLMWindow() {
   // читает SSE, дёргает handleSuggestEvent. applyFinal(fields) вызывается
   // ровно один раз при final-событии — он превращает структурный ответ
   // в { content, attachment, suggested_* } финального сообщения.
-  async function suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride) {
+  async function suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride, skipUserMsg = false) {
     if (streaming) return;
+    setErrorNotification(null);
     resetSuggestQueue();
     resetStreamQueue();     // на всякий случай: не должно быть активного чата
     const userContent = userContentOverride || ("/" + modeLabel + " " + (body.description || ""));
-    // _mode на обоих сообщениях — по нему собирается history для следующих
-    // вызовов в этом же режиме (см. buildSuggestHistory).
     const userMsg = { role: "user", content: userContent, _mode: modeLabel };
-    const placeholder = { role: "assistant", content: placeholderText, streaming: true, _mode: modeLabel };
-    setMessages((prev) => [...prev, userMsg, placeholder]);
-    setInput("");
+    const placeholder = { role: "assistant", content: "", waitingText: placeholderText, streaming: true, _mode: modeLabel };
+    setMessages((prev) => skipUserMsg ? [...prev, placeholder] : [...prev, userMsg, placeholder]);
+    if (!skipUserMsg) setInput("");
     setStreaming(true);
 
     suggestApplyFinalRef.current = applyFinal;
@@ -3936,8 +4876,23 @@ function LLMWindow() {
             if (!payload) continue;
             let obj;
             try { obj = JSON.parse(payload); } catch { continue; }
+            if (obj.type === "retry") {
+              const attemptStr = `${obj.attempt}/${obj.max_attempts}`;
+              replaceLastAssistant((last) => ({
+                ...last,
+                retryNotice: `Повтор запроса (${attemptStr})…`,
+              }));
+            } else if (obj.type === "chunk") {
+              replaceLastAssistant((last) => ({
+                ...last,
+                retryNotice: null,
+              }));
+            }
+            if (obj.type === "error") {
+              streamErr = { code: obj.code, message: obj.message };
+              break;
+            }
             handleSuggestEvent(obj);
-            if (obj.type === "error") streamErr = { code: obj.code, message: obj.message };
           }
         }
         if (streamErr) break;
@@ -3971,10 +4926,35 @@ function LLMWindow() {
         }));
       } else {
         const msg = (ex && ex.message) || String(ex);
-        replaceLastAssistant(() => ({
-          role: "assistant",
-          content: "⚠ " + code + ": " + msg,
-        }));
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.role === "assistant" && last.streaming) {
+            return prev.slice(0, -1);
+          }
+          return prev;
+        });
+        if (stateRef.current !== "hidden" || chatOpenRef.current) {
+          setErrorNotification({
+            code,
+            message: msg,
+            onRetry: () => {
+              setErrorNotification(null);
+              suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride, true);
+            },
+          });
+        }
+        if (code === "E_LLM_CANARY") {
+          setMessages((prev) => {
+            const copy = prev.slice();
+            for (let i = copy.length - 1; i >= 0; i--) {
+              if (copy[i].role === "user" && !copy[i].blocked) {
+                copy[i] = { ...copy[i], blocked: true };
+                break;
+              }
+            }
+            return copy;
+          });
+        }
       }
     } finally {
       setStreaming(false);
@@ -3983,9 +4963,9 @@ function LLMWindow() {
     }
   }
 
-  async function sendAlertCommand(description) {
+  async function sendAlertCommand(description, skipUserMsg = false, historyMsgs = null) {
     if (!description) return;
-    const history = buildSuggestHistory(messages, "alert");
+    const history = buildContextHistory(historyMsgs || messages, "alert", contextCfg, description.length);
     const body = { description };
     if (history.length) body.history = history;
     return suggestStream(
@@ -4020,12 +5000,14 @@ function LLMWindow() {
         const suggested = (valid.length && !needsClarification && !impossible) ? valid : null;
         return { content, attachment, suggested_alert_rules: suggested };
       },
+      undefined,
+      skipUserMsg,
     );
   }
 
-  async function sendReactionCommand(description) {
+  async function sendReactionCommand(description, skipUserMsg = false, historyMsgs = null) {
     if (!description) return;
-    const history = buildSuggestHistory(messages, "reaction");
+    const history = buildContextHistory(historyMsgs || messages, "reaction", contextCfg, description.length);
     const body = { description };
     if (history.length) body.history = history;
     return suggestStream(
@@ -4055,6 +5037,8 @@ function LLMWindow() {
         const suggested = (valid && !needsClarification && !impossible) ? valid : null;
         return { content, attachment, suggested_reaction: suggested };
       },
+      undefined,
+      skipUserMsg,
     );
   }
 
@@ -4062,7 +5046,7 @@ function LLMWindow() {
   // Пользователь пишет "/explain 42 почему упало?" — открывается контекст
   // алерта, LLM отвечает текстом (без JSON/YAML). Под ответом появляется
   // кнопка «Открыть алерт #N» для перехода к модалке.
-  async function sendExplainCommand(alertId, question, attach) {
+  async function sendExplainCommand(alertId, question, attach, skipUserMsg = false) {
     if (!alertId || streaming) return;
     resetStreamQueue();
     const q = (question || "").trim();
@@ -4071,12 +5055,14 @@ function LLMWindow() {
     //   - экспорт алерта (↗) + текст → userMsg обычный, attachment виден
     // Обработка одинаковая: POST /llm/explain-alert.
     const userMsg = attach
-      ? { role: "user", content: q, attachment: attach }
-      : { role: "user", content: "/explain " + alertId + (q ? " " + q : "") };
-    const placeholder = { role: "assistant", content: "Готовлю объяснение…", streaming: true };
-    setMessages((prev) => [...prev, userMsg, placeholder]);
-    setInput("");
-    setAttachment(null);   // attachment израсходован
+      ? { role: "user", content: q, attachment: attach, _mode: "chat" }
+      : { role: "user", content: "/explain " + alertId + (q ? " " + q : ""), _mode: "chat" };
+    const placeholder = { role: "assistant", content: "", waitingText: "Готовлю объяснение…", streaming: true, _mode: "chat" };
+    setMessages((prev) => skipUserMsg ? [...prev, placeholder] : [...prev, userMsg, placeholder]);
+    if (!skipUserMsg) {
+      setInput("");
+      setAttachment(null);   // attachment израсходован
+    }
     setStreaming(true);
     try {
       const r = await api("/api/v1/llm/explain-alert", {
@@ -4112,14 +5098,14 @@ function LLMWindow() {
 
   // /explain-rule <id> [вопрос] — одноразовое объяснение правила
   // алерта. Не sticky, режим чата не меняет.
-  async function sendExplainRuleCommand(ruleId, question) {
+  async function sendExplainRuleCommand(ruleId, question, skipUserMsg = false) {
     if (!ruleId || streaming) return;
     resetStreamQueue();
     const q = (question || "").trim();
-    const userMsg = { role: "user", content: "/explain-rule " + ruleId + (q ? " " + q : "") };
-    const placeholder = { role: "assistant", content: "Готовлю объяснение…", streaming: true };
-    setMessages((prev) => [...prev, userMsg, placeholder]);
-    setInput("");
+    const userMsg = { role: "user", content: "/explain-rule " + ruleId + (q ? " " + q : ""), _mode: "chat" };
+    const placeholder = { role: "assistant", content: "", waitingText: "Готовлю объяснение…", streaming: true, _mode: "chat" };
+    setMessages((prev) => skipUserMsg ? [...prev, placeholder] : [...prev, userMsg, placeholder]);
+    if (!skipUserMsg) setInput("");
     setStreaming(true);
     try {
       const r = await api("/api/v1/llm/explain-rule", {
@@ -4157,7 +5143,7 @@ function LLMWindow() {
   // Под ответом появится кнопка «Применить правку» — откроет
   // AlertRuleEditor с предзаполнением (данные patch мержатся на текущее
   // правило клиентом, backend уже отвалидировал патч).
-  async function sendEditRuleCommand(ruleId, description) {
+  async function sendEditRuleCommand(ruleId, description, skipUserMsg = false, historyMsgs = null) {
     if (!ruleId) return;
     const desc = (description || "").trim();
     if (!desc) {
@@ -4166,10 +5152,10 @@ function LLMWindow() {
         { role: "assistant",
           content: "Укажите описание правки: /edit-rule <id> <что изменить>" },
       ]);
-      setInput("");
+      if (!skipUserMsg) setInput("");
       return;
     }
-    const history = buildSuggestHistory(messages, "edit-rule");
+    const history = buildContextHistory(historyMsgs || messages, "edit-rule", contextCfg, desc.length);
     const body = { rule_id: ruleId, description: desc };
     if (history.length) body.history = history;
     return suggestStream(
@@ -4202,12 +5188,13 @@ function LLMWindow() {
         };
       },
       "/edit-rule " + ruleId + " " + desc,
+      skipUserMsg,
     );
   }
 
-  async function sendOperationCommand(description) {
+  async function sendOperationCommand(description, skipUserMsg = false, historyMsgs = null) {
     if (!description) return;
-    const history = buildSuggestHistory(messages, "operation");
+    const history = buildContextHistory(historyMsgs || messages, "operation", contextCfg, description.length);
     const body = { description };
     if (history.length) body.history = history;
     return suggestStream(
@@ -4248,22 +5235,81 @@ function LLMWindow() {
         }
         return { content, attachment, suggested_op: suggestedOp };
       },
+      undefined,
+      skipUserMsg,
     );
   }
 
-  async function sendMessage() {
+  function sendMessage() {
     const text = input.trim();
+    const attach = attachment;
+    if ((!text && !attach) || streaming) return;
+    return dispatchPrompt(text, attach, chatMode, false);
+  }
+
+  function editLastUserMessage(idx) {
+    if (streaming) return;
+    const targetIdx = idx != null ? idx : messages.map((m) => m.role).lastIndexOf("user");
+    if (targetIdx === -1) return;
+    const userMsg = messages[targetIdx];
+    if (!userMsg) return;
+    setInput(userMsg.content || "");
+    setAttachment(userMsg.attachment || null);
+    if (userMsg._mode && LLM_CHAT_MODES.some((m) => m.value === userMsg._mode)) {
+      setChatMode(userMsg._mode);
+    }
+    setMessages((prev) => prev.slice(0, targetIdx));
+    setErrorNotification(null);
+    setTimeout(() => {
+      try {
+        if (chatOpen) {
+          const modalTa = document.querySelector(".llm-chat-modal-input-area textarea");
+          if (modalTa) { modalTa.focus(); return; }
+        }
+        inputRef.current && inputRef.current.focus();
+      } catch {}
+    }, 50);
+  }
+
+  function regenerateLastResponse() {
+    if (streaming) return;
+    const lastAssistantIdx = messages.map((m) => m.role).lastIndexOf("assistant");
+    if (lastAssistantIdx === -1) return;
+    let prevUserIdx = -1;
+    for (let i = lastAssistantIdx - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        prevUserIdx = i;
+        break;
+      }
+    }
+    if (prevUserIdx === -1) return;
+    const userMsg = messages[prevUserIdx];
+    const historySlice = messages.slice(0, prevUserIdx);
+    setMessages((prev) => prev.slice(0, prevUserIdx + 1));
+    setErrorNotification(null);
+    dispatchPrompt(
+      userMsg.content || "",
+      userMsg.attachment || null,
+      userMsg._mode || "chat",
+      true,
+      historySlice,
+    );
+  }
+
+  async function dispatchPrompt(text, attach, mode, skipUserMsg = false, historyMsgs = null) {
     // Явный /operation <описание> — переключает режим и отправляет.
     // /operation без текста — только переключение, поле очищается,
     // пользователь пишет описание следующим сообщением.
     // /help — локальная справка, без LLM.
     if (text === "/help") {
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content: "/help" },
-        { role: "assistant", content: LLM_HELP_TEXT },
-      ]);
-      setInput("");
+      setMessages((prev) => skipUserMsg
+        ? [...prev, { role: "assistant", content: LLM_HELP_TEXT }]
+        : [
+            ...prev,
+            { role: "user", content: "/help" },
+            { role: "assistant", content: LLM_HELP_TEXT },
+          ]);
+      if (!skipUserMsg) setInput("");
       return;
     }
 
@@ -4279,12 +5325,12 @@ function LLMWindow() {
           { role: "assistant",
             content: "Укажите id правила: /explain-rule <id> [вопрос]" },
         ]);
-        setInput("");
+        if (!skipUserMsg) setInput("");
         return;
       }
       const rid = Number(m[1]);
       const q = (m[2] || "").trim();
-      return sendExplainRuleCommand(rid, q);
+      return sendExplainRuleCommand(rid, q, skipUserMsg);
     }
 
     // /edit-rule <id> <описание> — LLM предложит patch.
@@ -4298,12 +5344,12 @@ function LLMWindow() {
           { role: "assistant",
             content: "Укажите id правила и описание: /edit-rule <id> <что изменить>" },
         ]);
-        setInput("");
+        if (!skipUserMsg) setInput("");
         return;
       }
       const rid = Number(m[1]);
       const desc = (m[2] || "").trim();
-      return sendEditRuleCommand(rid, desc);
+      return sendEditRuleCommand(rid, desc, skipUserMsg, historyMsgs);
     }
 
     // /explain <id> [вопрос] — одноразовое объяснение конкретного алерта.
@@ -4319,20 +5365,20 @@ function LLMWindow() {
           { role: "assistant",
             content: "Укажите id алерта: /explain <id> [вопрос]" },
         ]);
-        setInput("");
+        if (!skipUserMsg) setInput("");
         return;
       }
       const aid = Number(m[1]);
       const q = (m[2] || "").trim();
-      return sendExplainCommand(aid, q);
+      return sendExplainCommand(aid, q, undefined, skipUserMsg);
     }
 
     // Если во вложении есть alert_id — работаем как /explain: тот же
     // endpoint, тот же промпт, тот же формат ответа. Это унифицирует
     // «/explain 1 вопрос» и «экспорт алерта + вопрос» — поведение
     // одинаковое, отличается только способ передать контекст.
-    if (attachment && typeof attachment.alert_id === "number") {
-      return sendExplainCommand(attachment.alert_id, text, attachment);
+    if (attach && typeof attach.alert_id === "number") {
+      return sendExplainCommand(attach.alert_id, text, attach, skipUserMsg);
     }
 
     // Явные префиксы режимов: /operation, /alert, /reaction.
@@ -4341,68 +5387,53 @@ function LLMWindow() {
       const pfx = "/" + m;
       if (text === pfx || text.startsWith(pfx + " ")) {
         const desc = text.slice(pfx.length).trim();
-        setChatMode(m);
+        if (!skipUserMsg) setChatMode(m);
         if (!desc) {
-          setInput("");
+          if (!skipUserMsg) setInput("");
           return;
         }
-        if (m === "operation") return sendOperationCommand(desc);
-        if (m === "alert")     return sendAlertCommand(desc);
-        if (m === "reaction")  return sendReactionCommand(desc);
+        if (m === "operation") return sendOperationCommand(desc, skipUserMsg, historyMsgs);
+        if (m === "alert")     return sendAlertCommand(desc, skipUserMsg, historyMsgs);
+        if (m === "reaction")  return sendReactionCommand(desc, skipUserMsg, historyMsgs);
       }
     }
     // sticky-режим: каждое сообщение в operation идёт в suggest.
     // Пустое поле — не отправляем. Вложение игнорируется: suggest
     // принимает только текст-описание.
-    if (chatMode !== "chat") {
+    if (mode !== "chat") {
       if (!text) return;
-      if (chatMode === "operation") return sendOperationCommand(text);
-      if (chatMode === "alert")     return sendAlertCommand(text);
-      if (chatMode === "reaction")  return sendReactionCommand(text);
+      if (mode === "operation") return sendOperationCommand(text, skipUserMsg, historyMsgs);
+      if (mode === "alert")     return sendAlertCommand(text, skipUserMsg, historyMsgs);
+      if (mode === "reaction")  return sendReactionCommand(text, skipUserMsg, historyMsgs);
     }
-    const attach = attachment;  // снапшот; ниже очистим
     // Отправляем, если есть хоть что-то: текст или вложение.
     if ((!text && !attach) || streaming) return;
 
     // Для LLM собираем плоский content: если у сообщения было вложение —
     // разворачиваем его в маркированный блок. Так LLM видит содержимое
     // независимо от того, читается история из LS или с текущего состояния.
-    const expand = (m) => {
-      let c = m.content || "";
-      if (m.attachment) {
-        c = "[вложение: " + m.attachment.name + "]\n\n"
-          + m.attachment.content
-          + (c ? "\n\n" + c : "");
-      }
-      return c;
-    };
-    // История для /llm/chat: только сообщения режима chat.
-    //
-    // Без фильтра в chat-запрос попадали reaction/alert/operation-сообщения
-    // — LLM видела предыдущий ответ как JSON-правило и продолжала его
-    // в том же формате, игнорируя роль chat-ассистента. Разные режимы —
-    // разные контексты.
-    //
-    // Сообщения БЕЗ _mode — это старые записи (до введения поля);
-    // в доктрине «сначала был только chat» считаем их chat-контекстом.
-    const history = messages
-      .filter((m) => !m.streaming && (m.content || m.attachment) && !m.blocked
-                     && (!m._mode || m._mode === "chat"))
-      .map((m) => ({ role: m.role, content: expand(m) }));
-    // System-сообщение НЕ шлём — backend подставит свежий
-    // (build_chat_system_prompt с актуальным whitelist).
+    const currentContent = expandMsgContent({ content: text, attachment: attach });
+    const history = buildContextHistory(historyMsgs || messages, "chat", contextCfg, currentContent.length);
+
     const outgoing = [
       ...history,
-      { role: "user", content: expand({ content: text, attachment: attach }) },
+      { role: "user", content: currentContent },
     ];
 
-    const userMsg = { role: "user", content: text, _mode: "chat" };
-    if (attach) userMsg.attachment = attach;
+    return sendChatStream(outgoing, skipUserMsg, text, attach);
+  }
+
+  async function sendChatStream(outgoingMessages, skipUserMsg, userText, userAttach) {
+    setErrorNotification(null);
+    const userMsg = { role: "user", content: userText, _mode: "chat" };
+    if (userAttach) userMsg.attachment = userAttach;
     const placeholder = { role: "assistant", content: '', streaming: true, _mode: "chat" };
     resetStreamQueue();
-    setMessages((prev) => [...prev, userMsg, placeholder]);
-    setInput('');
-    setAttachment(null);
+    setMessages((prev) => skipUserMsg ? [...prev, placeholder] : [...prev, userMsg, placeholder]);
+    if (!skipUserMsg) {
+      setInput('');
+      setAttachment(null);
+    }
     setStreaming(true);
 
     const ctrl = new AbortController();
@@ -4415,16 +5446,11 @@ function LLMWindow() {
           "Content-Type": "application/json",
           "X-Session-Token": sessionToken,
         },
-        // 4000 токенов: chat-режим — короткие ответы, но reasoning-модели
-        // (Gemma, Gemini 2.x) тратят бюджет на внутренние рассуждения
-        // до появления видимого контента. 600 не хватало — ответ
-        // обрезался или приходил пустым.
-        body: JSON.stringify({ messages: outgoing, max_tokens: 4000 }),
+        body: JSON.stringify({ messages: outgoingMessages, max_tokens: 4000 }),
         signal: ctrl.signal,
       });
 
       if (!r.ok) {
-        // Валидация тела (пустой messages и т.п.) возвращает JSON-ошибку 400.
         const data = await r.json().catch(() => null);
         const code = (data && data.error && data.error.code) || "E_HTTP_" + r.status;
         const msg = (data && data.error && data.error.message) || r.statusText || ("HTTP " + r.status);
@@ -4452,10 +5478,17 @@ function LLMWindow() {
           } catch {
             continue;
           }
-          if (obj.type === "chunk" && typeof obj.text === "string") {
-            // Не рисуем сразу: копим в буфер, pump отрендерит постепенно.
-            // Это сглаживает случай, когда reasoning-модель присылает
-            // весь видимый ответ одним куском после <thought>.
+          if (obj.type === "retry") {
+            const attemptStr = `${obj.attempt}/${obj.max_attempts}`;
+            replaceLastAssistant((last) => ({
+              ...last,
+              retryNotice: `Повтор запроса (${attemptStr})…`,
+            }));
+          } else if (obj.type === "chunk" && typeof obj.text === "string") {
+            replaceLastAssistant((last) => ({
+              ...last,
+              retryNotice: null,
+            }));
             streamBufRef.current += obj.text;
             kickStreamPump();
           } else if (obj.type === "error") {
@@ -4468,9 +5501,6 @@ function LLMWindow() {
 
       if (sseError) throw sseError;
 
-      // Поток закрыт: помечаем done и ждём, пока pump доедет очередь.
-      // Финализацию сообщения (снятие streaming-флага) делает pump —
-      // иначе finally снимет setStreaming раньше, чем текст дорисуется.
       streamDoneRef.current = true;
       kickStreamPump();
       await new Promise((resolve) => {
@@ -4481,8 +5511,6 @@ function LLMWindow() {
         check();
       });
     } catch (ex) {
-      // На ошибке/отмене не даём хвосту доехать — иначе отложенный
-      // текст наложится на сообщение об ошибке.
       resetStreamQueue();
       const code = (ex && ex.code) || (ex && ex.name) || "E_UNKNOWN";
       if (ex && ex.name === "AbortError") {
@@ -4493,13 +5521,23 @@ function LLMWindow() {
         }));
       } else {
         const msg = (ex && ex.message) || String(ex);
-        replaceLastAssistant((last) => ({
-          role: "assistant",
-          content: "⚠ " + code + ": " + msg,
-          ...(last && last._mode ? { _mode: last._mode } : {}),
-        }));
-        // S4: сообщение, вызвавшее срабатывание канарейки, из истории убираем —
-        // иначе оно будет валиться при каждой следующей отправке.
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.role === "assistant" && last.streaming) {
+            return prev.slice(0, -1);
+          }
+          return prev;
+        });
+        if (stateRef.current !== "hidden" || chatOpenRef.current) {
+          setErrorNotification({
+            code,
+            message: msg,
+            onRetry: () => {
+              setErrorNotification(null);
+              sendChatStream(outgoingMessages, true, userText, userAttach);
+            },
+          });
+        }
         if (code === "E_LLM_CANARY") {
           setMessages((prev) => {
             const copy = prev.slice();
@@ -4532,176 +5570,223 @@ function LLMWindow() {
     setConfirmClearOpen(false);
   }
 
-  if (state === "hidden") {
-    return html`<button class="llm-window-fab" title="Открыть окно LLM" onClick=${openWindow}>LLM</button>`;
+  function handleMsgContextMenu(e, m, i, lastUserIdx, lastAssistantIdx) {
+    if (streaming) return;
+    if (m.role === "user" && i === lastUserIdx) {
+      e.preventDefault();
+      setContextMenu({
+        x: Math.min(e.clientX, window.innerWidth - 190),
+        y: Math.min(e.clientY, window.innerHeight - 45),
+        label: "✎ Редактировать запрос",
+        action: () => editLastUserMessage(i),
+      });
+    } else if (m.role === "assistant" && i === lastAssistantIdx) {
+      e.preventDefault();
+      setContextMenu({
+        x: Math.min(e.clientX, window.innerWidth - 210),
+        y: Math.min(e.clientY, window.innerHeight - 45),
+        label: "⟳ Перегенерировать ответ",
+        action: () => regenerateLastResponse(),
+      });
+    }
   }
 
   const cls = "llm-window " + (state === "collapsed" ? "collapsed" : "") + (dragging ? " dragging" : "");
   const style = `left: ${currentPos.x}px; top: ${currentPos.y}px; width: ${size.w}px;` +
     (state === "open" ? ` height: ${size.h}px;` : "");
+  const errBannerStyle = currentPos.y >= 72
+    ? `left: ${currentPos.x}px; width: ${size.w}px; bottom: calc(100vh - ${currentPos.y}px + 8px);`
+    : `left: ${currentPos.x}px; width: ${size.w}px; top: ${Math.min(currentPos.y + size.h + 8, window.innerHeight - 60)}px;`;
 
-  return html`<div class=${cls} style=${style}>
-    <div class="llm-window-head"
-         onPointerDown=${onPointerDown}
-         onPointerMove=${onPointerMove}
-         onPointerUp=${onPointerUp}
-         onPointerCancel=${onPointerUp}>
-      <button type="button"
-              class=${"llm-window-pill " + (pillOpen ? "open" : "")}
-              title="Профиль LLM — клик для выбора, drag для перемещения окна">
-        <span class="llm-window-pill-label">LLM</span>
-        <span class="llm-window-pill-sep">·</span>
-        <span class="llm-window-pill-text">${profileName || "профиль не задан"}</span>
-        ${profiles.length > 0
-          ? html`<span class="llm-window-pill-arrow" aria-hidden="true">▾</span>`
-          : null}
-      </button>
-      <${ModePill}
-          value=${chatMode}
-          onChange=${setChatMode}
-          open=${modePillOpen}
-          setOpen=${setModePillOpen} />
-      <div class="grow"></div>
-      <button class="llm-window-btn"
-              title=${state === "open" ? "Свернуть" : "Развернуть"}
-              onClick=${state === "open" ? collapseWindow : expandWindow}>
-        ${state === "open" ? "—" : "+"}
-      </button>
-      <button class="llm-window-btn" title="Закрыть" onClick=${closeWindow}>×</button>
-      ${pillOpen && profiles.length > 0
-        ? html`<div class="llm-window-dropdown">
-            ${profiles.map((p) => html`<button type="button"
-                class=${p.id === activeId ? "active" : ""}
-                onClick=${() => { setPillOpen(false); if (p.id !== activeId) onProfileChange(p.id); }}>
-              ${p.name} <span class="muted small">· ${p.provider}</span>
-            </button>`)}
-          </div>`
-        : null}
-    </div>
-    ${state === "open"
-      ? html`<div class="llm-window-body">
-          <div class="llm-chat" ref=${chatBoxRef}>
-            ${messages.length === 0
-              ? html`<div class="llm-chat-empty">
-                  Напишите сообщение, чтобы начать.
-                  <br/><span class="mono">/help</span> — список команд
-                </div>`
-              : messages.map((m, i) => {
-                  const actions = [];
-                  if (m.suggested_op) {
-                    actions.push(html`<button type="button" key="op" class="llm-open-editor-btn"
-                        onClick=${() => openUserOpEditorFromChat(m.suggested_op.yaml)}>
-                      В редактор
-                    </button>`);
-                  }
-                  if (m.suggested_alert_rules && m.suggested_alert_rules.length) {
-                    actions.push(html`<button type="button" key="ar" class="llm-open-editor-btn"
-                        onClick=${() => window.dispatchEvent(new CustomEvent(
-                          "melecho:llm-create-alert-rules",
-                          { detail: { rules: m.suggested_alert_rules } }))}>
-                      Создать (${m.suggested_alert_rules.length})
-                    </button>`);
-                  }
-                  if (m.suggested_reaction) {
-                    actions.push(html`<button type="button" key="rx" class="llm-open-editor-btn"
-                        onClick=${() => window.dispatchEvent(new CustomEvent(
-                          "melecho:llm-create-reaction",
-                          { detail: { rule: m.suggested_reaction } }))}>
-                      В реакциях
-                    </button>`);
-                  }
-                  if (typeof m.suggested_alert_id === "number") {
-                    actions.push(html`<button type="button" key="aid" class="llm-open-editor-btn"
-                        onClick=${() => window.dispatchEvent(new CustomEvent(
-                          "melecho:llm-open-alert",
-                          { detail: { alert_id: m.suggested_alert_id } }))}>
-                      Алерт #${m.suggested_alert_id}
-                    </button>`);
-                  }
-                  if (typeof m.suggested_rule_id === "number") {
-                    actions.push(html`<button type="button" key="rid" class="llm-open-editor-btn"
-                        onClick=${() => window.dispatchEvent(new CustomEvent(
-                          "melecho:llm-open-rule",
-                          { detail: { rule_id: m.suggested_rule_id } }))}>
-                      Правило #${m.suggested_rule_id}
-                    </button>`);
-                  }
-                  if (m.suggested_rule_patch) {
-                    actions.push(html`<button type="button" key="patch" class="llm-open-editor-btn"
-                        onClick=${() => window.dispatchEvent(new CustomEvent(
-                          "melecho:llm-apply-rule-patch",
-                          { detail: m.suggested_rule_patch }))}>
-                      Применить
-                    </button>`);
-                  }
-                  return html`<div key=${i} class=${"llm-msg-block " + m.role}>
-                    <div class=${"llm-msg " + m.role
-                        + (m.streaming ? " streaming" : "")
-                        + (m.blocked ? " blocked" : "")}
-                        title=${m.blocked ? "Сообщение не отправлено: сработала защита от утечки секретов" : ""}>
-                      <div class=${"llm-reveal" + (m.attachment ? " shown" : "")}>
-                        <div class="llm-reveal-inner">
-                          ${m.attachment
-                            ? html`<details class="llm-attach-inline">
-                                <summary>${m.attachment.name}</summary>
-                                <pre class="llm-attach-pre">${m.attachment.content}</pre>
-                              </details>`
-                            : null}
-                        </div>
-                      </div>
-                      ${m.blocked ? "🚫 " : ""}${(m.content || "").replace(/\n+$/, "") || (m.streaming ? "" : (m.attachment ? "" : "…"))}
-                    </div>
-                    <div class=${"llm-reveal" + (actions.length ? " shown" : "")}>
-                      <div class="llm-reveal-inner">
-                        ${actions.length
-                          ? html`<div class="llm-msg-actions">${actions}</div>`
-                          : null}
-                      </div>
-                    </div>
-                  </div>`;
-                })}
-          </div>
-          ${attachNotice
-            ? html`<div class="llm-attach-notice">${attachNotice}</div>`
+  return html`
+    ${state === "hidden"
+      ? html`<button class="llm-window-fab" title="Открыть окно LLM" onClick=${openWindow}>LLM</button>`
+      : html`
+          ${errorNotification && state === "open" && !chatOpen
+            ? html`<div class="llm-window-error-banner" style=${errBannerStyle}>
+                <span class="llm-error-icon">⚠</span>
+                <div class="llm-error-text grow">
+                  <b>${errorNotification.code || "Ошибка"}:</b> ${errorNotification.message}
+                </div>
+                <div class="llm-error-actions">
+                  ${errorNotification.onRetry
+                    ? html`<button type="button" class="btn btn-sm btn-ghost llm-error-retry"
+                                   onClick=${errorNotification.onRetry}>Повторить</button>`
+                    : null}
+                  <button type="button" class="llm-error-close"
+                          title="Закрыть"
+                          onClick=${() => setErrorNotification(null)}>×</button>
+                </div>
+              </div>`
             : null}
-          <div class="llm-chat-foot">
-            ${attachment
-              ? html`<div class="llm-attach-pill">
-                  <span class="llm-attach-name" title=${attachment.name}>${attachment.name}</span>
-                  <button type="button" class="llm-attach-x"
-                          title="Убрать вложение"
-                          onClick=${() => setAttachment(null)}>×</button>
-                </div>`
+          <div class=${cls} style=${style}>
+            <div class="llm-window-head"
+                 onPointerDown=${onPointerDown}
+                 onPointerMove=${onPointerMove}
+                 onPointerUp=${onPointerUp}
+                 onPointerCancel=${onPointerUp}>
+              <button type="button"
+                      class=${"llm-window-pill " + (pillOpen ? "open" : "")}
+                      title="Профиль LLM — клик для выбора, drag для перемещения окна">
+                <span class="llm-window-pill-label">LLM</span>
+                <span class="llm-window-pill-sep">·</span>
+                <span class="llm-window-pill-text">${profileName || "профиль не задан"}</span>
+                ${profiles.length > 0
+                  ? html`<span class="llm-window-pill-arrow" aria-hidden="true">▾</span>`
+                  : null}
+              </button>
+              <${ModePill}
+                  value=${chatMode}
+                  onChange=${setChatMode}
+                  open=${modePillOpen}
+                  setOpen=${setModePillOpen} />
+              <div class="grow"></div>
+              <button class="llm-window-btn"
+                      title=${state === "open" ? "Свернуть" : "Развернуть"}
+                      onClick=${state === "open" ? collapseWindow : expandWindow}>
+                ${state === "open" ? "—" : "+"}
+              </button>
+              <button class="llm-window-btn" title="Закрыть" onClick=${closeWindow}>×</button>
+              ${pillOpen && profiles.length > 0
+                ? html`<div class="llm-window-dropdown">
+                    ${profiles.map((p) => html`<button type="button"
+                        class=${p.id === activeId ? "active" : ""}
+                        onClick=${() => { setPillOpen(false); if (p.id !== activeId) onProfileChange(p.id); }}>
+                      ${p.name} <span class="muted small">· ${p.provider}</span>
+                    </button>`)}
+                  </div>`
+                : null}
+            </div>
+            ${state === "open"
+              ? html`<div class="llm-window-body">
+                  <div class="llm-chat" ref=${chatBoxRef}>
+                    ${messages.length === 0
+                      ? html`<div class="llm-chat-empty">
+                          Напишите сообщение, чтобы начать.
+                          <br/><span class="mono">/help</span> — список команд
+                        </div>`
+                      : (() => {
+                          const lastUserIdx = messages.map((x) => x.role).lastIndexOf("user");
+                          const lastAssistantIdx = messages.map((x) => x.role).lastIndexOf("assistant");
+                          return messages.map((m, i) => {
+                          const actions = [];
+                          if (m.suggested_op) {
+                            actions.push(html`<button type="button" key="op" class="llm-open-editor-btn"
+                                onClick=${() => openUserOpEditorFromChat(m.suggested_op.yaml)}>
+                              В редактор
+                            </button>`);
+                          }
+                          if (m.suggested_alert_rules && m.suggested_alert_rules.length) {
+                            actions.push(html`<button type="button" key="ar" class="llm-open-editor-btn"
+                                onClick=${() => window.dispatchEvent(new CustomEvent(
+                                  "melecho:llm-create-alert-rules",
+                                  { detail: { rules: m.suggested_alert_rules } }))}>
+                              Создать (${m.suggested_alert_rules.length})
+                            </button>`);
+                          }
+                          if (m.suggested_reaction) {
+                            actions.push(html`<button type="button" key="rx" class="llm-open-editor-btn"
+                                onClick=${() => window.dispatchEvent(new CustomEvent(
+                                  "melecho:llm-create-reaction",
+                                  { detail: { rule: m.suggested_reaction } }))}>
+                              В реакциях
+                            </button>`);
+                          }
+                          if (typeof m.suggested_alert_id === "number") {
+                            actions.push(html`<button type="button" key="aid" class="llm-open-editor-btn"
+                                onClick=${() => window.dispatchEvent(new CustomEvent(
+                                  "melecho:llm-open-alert",
+                                  { detail: { alert_id: m.suggested_alert_id } }))}>
+                              Алерт #${m.suggested_alert_id}
+                            </button>`);
+                          }
+                          if (typeof m.suggested_rule_id === "number") {
+                            actions.push(html`<button type="button" key="rid" class="llm-open-editor-btn"
+                                onClick=${() => window.dispatchEvent(new CustomEvent(
+                                  "melecho:llm-open-rule",
+                                  { detail: { rule_id: m.suggested_rule_id } }))}>
+                              Правило #${m.suggested_rule_id}
+                            </button>`);
+                          }
+                          if (m.suggested_rule_patch) {
+                            actions.push(html`<button type="button" key="patch" class="llm-open-editor-btn"
+                                onClick=${() => window.dispatchEvent(new CustomEvent(
+                                  "melecho:llm-apply-rule-patch",
+                                  { detail: m.suggested_rule_patch }))}>
+                              Применить
+                            </button>`);
+                          }
+                          return html`<div key=${i} class=${"llm-msg-block " + m.role}
+                              onContextMenu=${(e) => handleMsgContextMenu(e, m, i, lastUserIdx, lastAssistantIdx)}>
+                            <div class=${"llm-msg " + m.role
+                                + (m.streaming ? " streaming" : "")
+                                + (m.blocked ? " blocked" : "")}
+                                title=${m.blocked ? "Сообщение не отправлено: сработала защита от утечки секретов" : ""}>
+                              <div class=${"llm-reveal" + (m.attachment ? " shown" : "")}>
+                                <div class="llm-reveal-inner">
+                                  ${m.attachment
+                                    ? html`<details class="llm-attach-inline">
+                                        <summary>${m.attachment.name}</summary>
+                                        <pre class="llm-attach-pre">${m.attachment.content}</pre>
+                                      </details>`
+                                    : null}
+                                </div>
+                              </div>
+                              ${m.blocked ? "🚫 " : ""}${(m.content || "").replace(/\n+$/, "") || (m.streaming ? (m.retryNotice ? html`<span class="llm-retry-indicator">${m.retryNotice}</span>` : (m.waitingText || "")) : (m.attachment ? "" : "…"))}
+                            </div>
+                            <div class=${"llm-reveal" + (actions.length ? " shown" : "")}>
+                              <div class="llm-reveal-inner">
+                                ${actions.length
+                                  ? html`<div class="llm-msg-actions">${actions}</div>`
+                                  : null}
+                              </div>
+                            </div>
+                          </div>`;
+                        });
+                      })()}
+                  </div>
+                  ${attachNotice
+                    ? html`<div class="llm-attach-notice">${attachNotice}</div>`
+                    : null}
+                  <div class="llm-chat-foot">
+                    ${attachment
+                      ? html`<div class="llm-attach-pill">
+                          <span class="llm-attach-name" title=${attachment.name}>${attachment.name}</span>
+                          <button type="button" class="llm-attach-x"
+                                  title="Убрать вложение"
+                                  onClick=${() => setAttachment(null)}>×</button>
+                        </div>`
+                      : null}
+                    ${messages.length > 0
+                      ? html`<${SymBtn} symbol="↺" tooltip="Очистить историю"
+                            onClick=${requestClearChat} />`
+                      : null}
+                    <textarea ref=${inputRef}
+                              placeholder=${chatModeSpec(chatMode).placeholder}
+                              rows="1"
+                              value=${input}
+                              disabled=${streaming}
+                              onInput=${(e) => setInput(e.target.value)}
+                              onKeyDown=${onInputKey}></textarea>
+                    <button type="button" class="llm-chat-expand"
+                            title="Открыть большой формат"
+                            onClick=${() => setChatOpen(true)}>⤢</button>
+                    ${streaming
+                      ? html`<${SymBtn} symbol="■" tooltip="Остановить"
+                            onClick=${cancelStream} />`
+                      : html`<${SymBtn} symbol="➤" tooltip="Отправить"
+                            disabled=${!input.trim() && !attachment}
+                            send=${true} onClick=${sendMessage} />`}
+                  </div>
+                </div>
+                <div class="llm-window-resize"
+                     onPointerDown=${onResizePointerDown}
+                     onPointerMove=${onResizePointerMove}
+                     onPointerUp=${onResizePointerUp}
+                     onPointerCancel=${onResizePointerUp}></div>`
               : null}
-            ${messages.length > 0
-              ? html`<${SymBtn} symbol="↺" tooltip="Очистить историю"
-                    onClick=${requestClearChat} />`
-              : null}
-            <textarea ref=${inputRef}
-                      placeholder=${chatModeSpec(chatMode).placeholder}
-                      rows="1"
-                      value=${input}
-                      disabled=${streaming}
-                      onInput=${(e) => setInput(e.target.value)}
-                      onKeyDown=${onInputKey}></textarea>
-            <button type="button" class="llm-chat-expand"
-                    title="Открыть большой формат"
-                    disabled=${streaming}
-                    onClick=${() => setChatOpen(true)}>⤢</button>
-            ${streaming
-              ? html`<${SymBtn} symbol="■" tooltip="Остановить"
-                    onClick=${cancelStream} />`
-              : html`<${SymBtn} symbol="➤" tooltip="Отправить"
-                    disabled=${!input.trim() && !attachment}
-                    send=${true} onClick=${sendMessage} />`}
           </div>
-        </div>
-        <div class="llm-window-resize"
-             onPointerDown=${onResizePointerDown}
-             onPointerMove=${onResizePointerMove}
-             onPointerUp=${onResizePointerUp}
-             onPointerCancel=${onResizePointerUp}></div>`
-      : null}
+        `}
     ${chatOpen
       ? html`<${LLMChatModal}
             messages=${messages}
@@ -4713,7 +5798,24 @@ function LLMWindow() {
             activeId=${activeId} onProfileChange=${onProfileChange}
             chatMode=${chatMode} onChangeMode=${setChatMode}
             onRequestClear=${requestClearChat}
-            onClose=${() => setChatOpen(false)} />`
+            onClose=${() => setChatOpen(false)}
+            errorNotification=${errorNotification}
+            setErrorNotification=${setErrorNotification}
+            onMsgContextMenu=${handleMsgContextMenu}
+            justClosedCtxRef=${justClosedCtxRef} />`
+      : null}
+    ${contextMenu
+      ? html`<div class="llm-context-menu"
+                  style=${`left: ${contextMenu.x}px; top: ${contextMenu.y}px;`}
+                  onContextMenu=${(e) => e.preventDefault()}>
+          <button type="button" class="llm-context-menu-item" onClick=${() => {
+            const act = contextMenu.action;
+            setContextMenu(null);
+            act();
+          }}>
+            ${contextMenu.label}
+          </button>
+        </div>`
       : null}
     ${confirmClearOpen
       ? html`<${Modal} title="Очистить историю?" onClose=${() => setConfirmClearOpen(false)}
@@ -4724,7 +5826,7 @@ function LLMWindow() {
           <p>Все сообщения этого чата будут удалены. Действие необратимо.</p>
         </${Modal}>`
       : null}
-  </div>`;
+  `;
 }
 
 function SudoUnlockModal({ onClose, onDone }) {
@@ -5010,9 +6112,10 @@ function RetentionSection() {
   return html`<div class="card stack">
     <h3>Хранение данных</h3>
     <p class="muted small">
-      Срок хранения каждого типа данных. Активные алерты и незавершённые
-      реакции не удаляются никогда — только закрытые. Журнал аудита
-      (HMAC-chain, S2) не удаляется вообще.
+      Глобальный срок хранения (для метрик может быть переопределён
+      в настройках каждого сервера, в т. ч. на «вечно»). Активные алерты и
+      незавершённые реакции не удаляются никогда, журнал аудита (HMAC-chain,
+      S2) — вечный.
     </p>
     ${err ? html`<div class="err">${err}</div>` : null}
 
@@ -6685,11 +7788,19 @@ function PendingReactionsModal({ onClose, onChanged }) {
 
 function ReactionDetailModal({ rid, onClose }) {
   const [r, setR] = useState(null);
+  const [opMeta, setOpMeta] = useState(null);
   const [err, setErr] = useState("");
 
   async function load() {
     try {
-      setR(await api("/api/v1/reactions/" + rid));
+      const rec = await api("/api/v1/reactions/" + rid);
+      setR(rec);
+      if (rec && rec.operation_id) {
+        api("/api/v1/operations").then((res) => {
+          const found = (res.items || []).find((o) => o.id === rec.operation_id);
+          setOpMeta(found || null);
+        }).catch(() => {});
+      }
     } catch (ex) { setErr(ex.message); }
   }
   useEffect(() => { load(); }, [rid]);
@@ -6731,24 +7842,14 @@ function ReactionDetailModal({ rid, onClose }) {
           <pre class="pre">${r.params_json}</pre>
         </div>`
       : null}
-    ${r.stdout_trunc
-      ? html`<div>
-          <div class="form-section-title">Вывод</div>
-          ${r.operation_id === "disk_check"
-            ? html`<${DiskCheckResult}
-                step=${{ phase: "run", exit: r.exit_code, stdout: r.stdout_trunc, stderr: r.stderr_trunc || "" }} />`
-            : html`<pre class="pre">${r.stdout_trunc}</pre>`}
-        </div>`
-      : null}
-    ${r.stderr_trunc
-      ? html`<div>
-          <div class="form-section-title">stderr</div>
-          <pre class="pre">${r.stderr_trunc}</pre>
-        </div>`
-      : null}
-    ${!r.stdout_trunc && !r.stderr_trunc && (r.status === "ok" || r.status === "failed")
-      ? html`<p class="muted">Вывод команды не сохранён (пустой или уже очищен).</p>`
-      : null}
+    <div>
+      <div class="form-section-title" style="margin-bottom:6px">Вывод</div>
+      <${OperationResultView}
+        op=${opMeta}
+        stdout=${r.stdout_trunc || ""}
+        stderr=${r.stderr_trunc || ""}
+        exitCode=${r.exit_code} />
+    </div>
   </${Modal}>`;
 }
 
@@ -6759,6 +7860,106 @@ function ReactionDetailModal({ rid, onClose }) {
 // Сам загружает servers/ops/alert_rules при монтировании: списки нужны
 // для селектов. Раньше это жило в ReactionsView, теперь — здесь, чтобы
 // компонент можно было вызвать откуда угодно.
+
+function fmtSecHint(sec) {
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n < 60) return `${n} с`;
+  const m = n / 60;
+  return Number.isInteger(m) ? `${m} мин` : `${m.toFixed(1)} мин`;
+}
+
+// Автоматическая форма параметров операции по op.params из каталога.
+// Держит синхронизацию со строкой JSON paramsStr; при невалидном JSON
+// открывает сырой редактор, чтобы ничего не потерялось.
+function OperationParamsFields({ op, paramsStr, onChangeStr, servers }) {
+  const specs = (op && Array.isArray(op.params)) ? op.params : [];
+  let obj = {};
+  let jsonErr = false;
+  try {
+    const parsed = JSON.parse(paramsStr || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) obj = parsed;
+    else jsonErr = true;
+  } catch {
+    jsonErr = true;
+  }
+
+  const allAllowedUnits = useMemo(() => {
+    const u = new Set();
+    for (const srv of (servers || [])) {
+      for (const name of (srv.allowed_units || [])) u.add(name);
+    }
+    return [...u].sort();
+  }, [servers]);
+
+  function setField(key, rawVal, type) {
+    const next = { ...obj };
+    if (rawVal === "" || rawVal == null) {
+      delete next[key];
+    } else if (type === "int") {
+      const n = Number(rawVal);
+      next[key] = Number.isFinite(n) ? n : rawVal;
+    } else {
+      next[key] = rawVal;
+    }
+    onChangeStr(JSON.stringify(next, null, 2));
+  }
+
+  if (jsonErr) {
+    return html`<div class="form-sub">
+      <label>Параметры операции (JSON)</label>
+      <div class="err small">JSON содержит синтаксическую ошибку — исправьте ниже:</div>
+      <textarea class="mono llm-rule-cond" rows="3" value=${paramsStr}
+                onInput=${(e) => onChangeStr(e.target.value)}></textarea>
+    </div>`;
+  }
+
+  return html`<div class="form-sub">
+    <label>Параметры операции</label>
+    ${specs.length === 0
+      ? html`<div class="muted small">У выбранной операции параметров нет.</div>`
+      : html`<div class="stack" style="gap:8px">
+          ${specs.map((sp) => {
+            const val = obj[sp.name] !== undefined
+              ? String(obj[sp.name])
+              : (sp.default !== undefined ? String(sp.default) : "");
+            const isUnits = sp.source === "server.allowed_units";
+            const dlId = "op_units_" + sp.name;
+            const hints = [];
+            if (sp.required) hints.push("обязательный");
+            if (sp.type) hints.push(sp.type);
+            if (sp.min != null || sp.max != null) hints.push(`${sp.min ?? ""}..${sp.max ?? ""}`);
+            if (sp.default != null) hints.push(`по умолч.: ${sp.default}`);
+            return html`<div class="form-sub" key=${sp.name}>
+              <label style="text-transform:none">
+                <span class="mono">${sp.name}</span>
+                ${sp.required ? html`<span class="err"> *</span>` : null}
+                ${hints.length ? html`<span class="muted small"> · ${hints.join(", ")}</span>` : null}
+              </label>
+              ${sp.type === "int"
+                ? html`<input type="number" min=${sp.min} max=${sp.max} value=${val}
+                          onInput=${(e) => setField(sp.name, e.target.value, "int")} />`
+                : isUnits
+                ? html`<input list=${dlId} placeholder="например nginx.service" value=${val}
+                          onInput=${(e) => setField(sp.name, e.target.value, "str")} />
+                      <datalist id=${dlId}>
+                        ${allAllowedUnits.map((u) => html`<option value=${u} key=${u} />`)}
+                      </datalist>`
+                : html`<input type=${sp.sensitive ? "password" : "text"}
+                          placeholder=${sp.pattern ? `шаблон: ${sp.pattern}` : ""}
+                          value=${val}
+                          onInput=${(e) => setField(sp.name, e.target.value, "str")} />`}
+            </div>`;
+          })}
+        </div>`}
+    <details>
+      <summary class="muted small">Параметры как JSON</summary>
+      <textarea class="mono llm-rule-cond" rows="3" style="margin-top:6px"
+                value=${paramsStr}
+                onInput=${(e) => onChangeStr(e.target.value)}></textarea>
+    </details>
+  </div>`;
+}
 
 const DEFAULT_REACTION_INITIAL = {
   name: "",
@@ -6792,8 +7993,6 @@ function reactionRuleToEditorInitial(r) {
   if (!r) return null;
   const m = r.match || {};
   const srv = m.server_ids || null;
-  // condition_kinds — канонический ключ (v10+). Legacy sources —
-  // fallback для очень старых данных. Маппинг см. REACTION_LEGACY_SOURCE_TO_KIND.
   let kinds = Array.isArray(m.condition_kinds) ? m.condition_kinds : [];
   if (kinds.length === 0 && Array.isArray(m.sources)) {
     const seen = new Set();
@@ -6859,7 +8058,6 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
         setOps((o.items || []).filter((x) => x.valid));
         setServers(s.items || []);
         setRules(ar.items || []);
-        // Если operation_id пустой (создание с нуля) — возьмём первую доступную.
         if (editing && !editing.operation_id && o.items && o.items.length) {
           setEditing({ ...editing, operation_id: o.items[0].id });
         }
@@ -6871,13 +8069,20 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
     })();
   }, []);
 
-  // Фильтр правил алертов по выбранным серверам. Глобальные — всегда.
   const filteredAlertRules = useMemo(() => {
     if (!editing || editing.match_servers_all) return rules;
     const sids = new Set(editing.match_server_ids || []);
     if (sids.size === 0) return rules;
     return rules.filter((r) => r.server_id == null || sids.has(r.server_id));
   }, [rules, editing]);
+
+  const selectedOp = useMemo(
+    () => ops.find((o) => o.id === (editing && editing.operation_id)) || null,
+    [ops, editing && editing.operation_id],
+  );
+  const opForcesConfirm = !!(
+    selectedOp && selectedOp.flags && (selectedOp.flags.dangerous || selectedOp.flags.state_changing)
+  );
 
   async function save() {
     if (!editing) return;
@@ -6899,7 +8104,7 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
         params,
         run_on_server: editing.run_on_server,
         sudo_mode: editing.sudo_mode,
-        action_policy: editing.action_policy,
+        action_policy: opForcesConfirm ? "confirm" : editing.action_policy,
         cooldown_sec: editing.cooldown_sec,
         max_attempts_per_alert: editing.max_attempts_per_alert,
         max_depth: editing.max_depth,
@@ -6925,6 +8130,13 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
 
   const headTitle = title
     || (editing.id ? "Правка правила реакции" : "Новое правило реакции");
+  const sudoOptions = [
+    { value: "never", label: "без sudo", hint: "— команда не требует root-прав" },
+    { value: "auto", label: "автосудо", hint: "— использовать пароль из Настройки → Автосудо" },
+  ];
+  if (editing.sudo_mode === "confirm") {
+    sudoOptions.push({ value: "confirm", label: "confirm (как автосудо)", hint: "— использует пароль из Автосудо" });
+  }
 
   return html`<${Modal} title=${headTitle} onClose=${onClose}
     footer=${html`<div class="row">
@@ -6947,18 +8159,23 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
         <span>${editing.enabled ? "включена" : "выключена"}</span>
       </label>
     </div>
-    <input value=${editing.name} onInput=${(e) => setEditing({ ...editing, name: e.target.value })} />
+    <input placeholder="например: Перезапуск nginx при критическом сбое"
+           value=${editing.name}
+           onInput=${(e) => setEditing({ ...editing, name: e.target.value })} />
 
     <div class="form-section">
       <div class="form-section-title">
-        Условие срабатывания
-        <${InfoHint} text="Правило срабатывает, когда алерт соответствует всем указанным условиям. Пустое поле = без ограничения по этому критерию. Хотя бы одно условие обязательно." />
+        Когда срабатывает (условие И)
+        <${InfoHint} text="Реакция запускается на алерты, подходящие под ВСЕ заполненные фильтры одновременно. Пустой фильтр означает «без ограничения». Хотя бы один фильтр обязателен." />
+      </div>
+      <div class="muted small">
+        Должны совпасть все указанные фильтры (пустое поле = любое значение).
       </div>
 
       <div class="form-sub">
         <label>
-          Алерты
-          <${InfoHint} text="Конкретные правила алертов. Пусто = любое правило." />
+          Конкретные правила алертов
+          <${InfoHint} text="Выберите правила, на срабатывание которых должна отвечать реакция. Пусто = любое правило." />
         </label>
         <${MultiSelect}
           options=${filteredAlertRules.map((ar) => ({
@@ -6967,12 +8184,12 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
           }))}
           selected=${editing.match_rule_ids}
           onChange=${(ids) => setEditing({ ...editing, match_rule_ids: ids })}
-          placeholder="все алерты"
+          placeholder="все правила алертов"
           emptyText="нет подходящих правил" />
       </div>
 
       <div class="form-sub">
-        <label>Severity <${InfoHint} text="Критичность алерта. Пусто = любая." /></label>
+        <label>Важность (Severity) <${InfoHint} text="Критичность алерта. Пусто = любая." /></label>
         <${MultiSelect}
           options=${[
             { value: "critical", label: "critical" },
@@ -6981,22 +8198,22 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
           ]}
           selected=${editing.match_severities}
           onChange=${(s) => setEditing({ ...editing, match_severities: s })}
-          placeholder="любая severity" />
+          placeholder="любая важность" />
       </div>
 
       <div class="form-sub">
-        <label>Типы условий <${InfoHint} text="Ограничение по типу алерта. Пусто = любое правило. Значения: порог метрики, аномалия детектора, нет данных, проверка операции, провал ручной операции, провал реакции." /></label>
+        <label>Типы условий <${InfoHint} text="На какие типы условий алерта реагировать. Пусто = на любые." /></label>
         <${MultiSelect}
           options=${Object.entries(CONDITION_KIND_LABELS).map(([k, label]) => ({
             value: k, label,
           }))}
           selected=${editing.match_condition_kinds}
           onChange=${(s) => setEditing({ ...editing, match_condition_kinds: s })}
-          placeholder="любой тип" />
+          placeholder="любой тип условия" />
       </div>
 
       <div class="form-sub">
-        <label>Серверы <${InfoHint} text="Ограничение по серверам: реакция сработает только для алертов на этих серверах." /></label>
+        <label>Серверы <${InfoHint} text="Реакция сработает только для алертов с выбранных серверов." /></label>
         <${Radio}
           value=${editing.match_servers_all ? "all" : "specific"}
           onChange=${(v) => setEditing({ ...editing, match_servers_all: v === "all" })}
@@ -7016,24 +8233,24 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
     </div>
 
     <div class="form-section">
-      <div class="form-section-title">Действие</div>
+      <div class="form-section-title">Что выполнять (Действие)</div>
       <div class="form-sub">
         <label>Операция</label>
         <select value=${editing.operation_id}
-                onChange=${(e) => setEditing({ ...editing, operation_id: e.target.value })}>
+                onChange=${(e) => setEditing({ ...editing, operation_id: e.target.value, params: "{}" })}>
           ${ops.map((o) => html`<option value=${o.id}>${o.name} (${o.id})</option>`)}
         </select>
       </div>
+      <${OperationParamsFields}
+        op=${selectedOp}
+        paramsStr=${editing.params}
+        onChangeStr=${(v) => setEditing({ ...editing, params: v })}
+        servers=${servers} />
       <div class="form-sub">
-        <label>Параметры операции (JSON) <${InfoHint} text="У системных операций параметров нет — оставьте {}." /></label>
-        <textarea class="mono" rows="4" value=${editing.params}
-                  onInput=${(e) => setEditing({ ...editing, params: e.target.value })}></textarea>
-      </div>
-      <div class="form-sub">
-        <label>Сервер запуска</label>
+        <label>На каком сервере выполнять</label>
         <select value=${editing.run_on_server}
                 onChange=${(e) => setEditing({ ...editing, run_on_server: e.target.value })}>
-          <option value="same_as_alert">Тот же, что у алерта</option>
+          <option value="same_as_alert">Тот же сервер, где возник алерт</option>
           ${servers.map((s) => html`<option value=${String(s.id)}>${s.name} (${s.llm_alias})</option>`)}
         </select>
       </div>
@@ -7042,43 +8259,54 @@ function ReactionRuleEditor({ initial, onClose, onSaved, title }) {
     <div class="form-section">
       <div class="form-section-title">Права и подтверждение</div>
       <div class="form-sub">
-        <label>Sudo режим</label>
+        <label>Права sudo</label>
         <${Radio}
           value=${editing.sudo_mode}
           onChange=${(v) => setEditing({ ...editing, sudo_mode: v })}
-          options=${[
-            { value: "never", label: "never", hint: "— без sudo" },
-            { value: "auto", label: "auto", hint: "— автосудо, если активно" },
-            { value: "confirm", label: "confirm", hint: "— ждать пароль" },
-          ]} />
+          options=${sudoOptions} />
       </div>
       <div class="form-sub">
-        <label>Политика выполнения</label>
-        <${Radio}
-          value=${editing.action_policy}
-          onChange=${(v) => setEditing({ ...editing, action_policy: v })}
-          options=${[
-            { value: "confirm", label: "confirm", hint: "— ждать подтверждения" },
-            { value: "auto", label: "auto", hint: "— запускать сразу" },
-          ]} />
+        <label>Политика запуска</label>
+        ${opForcesConfirm
+          ? html`<div class="banner warn small">
+              Выбранная операция меняет состояние или отмечена как опасная —
+              запуск всегда требует вашего подтверждения (confirm) в очереди реакций.
+            </div>`
+          : html`<${Radio}
+              value=${editing.action_policy}
+              onChange=${(v) => setEditing({ ...editing, action_policy: v })}
+              options=${[
+                { value: "confirm", label: "confirm (с подтверждением)", hint: "— попадёт в очередь ожидания" },
+                { value: "auto", label: "auto (автоматически)", hint: "— выполнится сразу без запроса" },
+              ]} />`}
       </div>
     </div>
 
     <div class="form-section">
-      <div class="form-section-title">Тайминги</div>
+      <div class="form-section-title">Тайминги и ограничения</div>
       <div class="row">
         <div style="flex:1">
-          <label>Cooldown, сек</label>
+          <label>
+            Пауза (Cooldown), сек
+            <${InfoHint} text="Минимальная пауза между запусками этого правила на одном и том же сервере." />
+          </label>
           <input type="number" min="0" max="86400" value=${editing.cooldown_sec}
                  onInput=${(e) => setEditing({ ...editing, cooldown_sec: Number(e.target.value) })} />
+          <div class="muted small">${fmtSecHint(editing.cooldown_sec)}</div>
         </div>
         <div style="flex:1">
-          <label>Max попыток на алерт</label>
+          <label>
+            Попыток на алерт
+            <${InfoHint} text="Максимум срабатываний этого правила на один и тот же активный алерт." />
+          </label>
           <input type="number" min="1" max="20" value=${editing.max_attempts_per_alert}
                  onInput=${(e) => setEditing({ ...editing, max_attempts_per_alert: Number(e.target.value) })} />
         </div>
         <div style="flex:1">
-          <label>Max depth</label>
+          <label>
+            Глубина цепочки
+            <${InfoHint} text="Ограничивает вложенные цепочки реакций (защита от зацикливания; у обычных алертов depth = 0)." />
+          </label>
           <input type="number" min="1" max="10" value=${editing.max_depth}
                  onInput=${(e) => setEditing({ ...editing, max_depth: Number(e.target.value) })} />
         </div>
@@ -7286,20 +8514,34 @@ function Segmented({ value, onChange, options }) {
   </div>`;
 }
 
+const OP_CATEGORY_LABELS = {
+  storage: "хранение",
+  services: "сервисы",
+  logs: "логи",
+  packages: "пакеты",
+  network: "сеть",
+  other: "прочее",
+};
+
+function opCategoryLabel(cat) {
+  const k = cat || "other";
+  return OP_CATEGORY_LABELS[k] || k;
+}
+
 function renderLinksStatus(links, servers) {
   if (!links) return null;
   const ids = links.server_ids || [];
   if (links.is_unbound || (!links.is_global && ids.length === 0)) {
-    return html`<span class="badge warn">не привязана</span>`;
+    return html`<span class="sev-warning" title="Привяжите серверы в правке, чтобы операцию можно было запускать">серверы: не привязана</span>`;
   }
   if (links.is_global) {
-    return html`<span class="badge">все серверы</span>`;
+    return html`<span>серверы: все</span>`;
   }
   const names = ids.map((id) => {
-    const s = servers.find((x) => x.id === id);
-    return s ? s.name : ("#" + id);
+    const srv = servers.find((x) => x.id === id);
+    return srv ? srv.name : ("#" + id);
   });
-  return html`<span class="badge">${names.join(", ")}</span>`;
+  return html`<span>серверы: ${names.join(", ")}</span>`;
 }
 
 
@@ -7585,7 +8827,7 @@ function MetricsView({ serverId }) {
       const p = e && e.detail && e.detail.payload;
       if (!p || p.server_id !== Number(serverId)) return;
       clearTimeout(timer);
-      timer = setTimeout(() => { fetchBatch(false); }, 400);
+      timer = setTimeout(() => { fetchBatch(false); }, 1000);
     };
     window.addEventListener("melecho:metric-event", onEv);
     return () => {
@@ -8034,6 +9276,374 @@ function SymBtn({ symbol, tooltip, onClick, onContextMenu, disabled, send }) {
 }
 
 
+function yamlScalar(v) {
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return JSON.stringify(String(v ?? ""));
+}
+
+function serializeDisplayBlock(disp) {
+  if (!disp || !disp.type) return "";
+  const lines = ["display:", `  type: ${disp.type}`];
+  if (disp.title) lines.push(`  title: ${yamlScalar(disp.title)}`);
+  if (disp.empty_text) lines.push(`  empty_text: ${yamlScalar(disp.empty_text)}`);
+  if (disp.step != null) lines.push(`  step: ${Number(disp.step)}`);
+
+  if (disp.type === "lines") {
+    if (disp.include && disp.include.length) {
+      lines.push("  include:");
+      for (const p of disp.include) lines.push(`    - ${yamlScalar(p)}`);
+    }
+    if (disp.exclude && disp.exclude.length) {
+      lines.push("  exclude:");
+      for (const p of disp.exclude) lines.push(`    - ${yamlScalar(p)}`);
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  lines.push(`  format: ${disp.format || (disp.type === "kv" ? "regex" : "json")}`);
+  if (disp.type === "kv") {
+    lines.push("  fields:");
+    for (const f of (disp.fields || [])) {
+      lines.push(`    - label: ${yamlScalar(f.label || "")}`);
+      if ((disp.format || "regex") === "regex") {
+        lines.push(`      regex: ${yamlScalar(f.regex || "")}`);
+        if (f.group != null && f.group !== "") lines.push(`      group: ${Number(f.group)}`);
+      } else {
+        lines.push(`      key: ${yamlScalar(f.key || "")}`);
+      }
+      for (const opt of ["format", "ok_if", "warn_if", "danger_if"]) {
+        if (f[opt]) lines.push(`      ${opt}: ${yamlScalar(f[opt])}`);
+      }
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  if (disp.type === "table") {
+    if ((disp.format || "json") === "regex") {
+      lines.push(`  regex: ${yamlScalar(disp.regex || "")}`);
+      if (disp.skip_lines) lines.push(`  skip_lines: ${Number(disp.skip_lines)}`);
+    } else {
+      if (disp.items_path) lines.push(`  items_path: ${yamlScalar(disp.items_path)}`);
+      if (disp.children_key) lines.push(`  children_key: ${yamlScalar(disp.children_key)}`);
+      if (disp.other_summary) lines.push(`  other_summary: ${yamlScalar(disp.other_summary)}`);
+    }
+    lines.push("  columns:");
+    for (const c of (disp.columns || [])) {
+      lines.push(`    - key: ${yamlScalar(c.key || "")}`);
+      lines.push(`      label: ${yamlScalar(c.label || "")}`);
+      if (c.format) lines.push(`      format: ${yamlScalar(c.format)}`);
+      if (c.expr) lines.push(`      expr: ${yamlScalar(c.expr)}`);
+      if (c.warn_gt != null && c.warn_gt !== "") lines.push(`      warn_gt: ${Number(c.warn_gt)}`);
+      if (c.danger_gt != null && c.danger_gt !== "") lines.push(`      danger_gt: ${Number(c.danger_gt)}`);
+    }
+    return lines.join("\n") + "\n";
+  }
+  return "";
+}
+
+function replaceYamlFlagsSection(yamlText, flagsObj) {
+  const lines = String(yamlText || "").split(/\r?\n/);
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^flags\s*:/.test(lines[i])) {
+      start = i;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (/^[A-Za-z_][A-Za-z0-9_]*\s*:/.test(lines[j])) {
+          end = j;
+          break;
+        }
+      }
+      break;
+    }
+  }
+  const keys = [
+    "dangerous", "requires_confirmation", "idempotent",
+    "plan_preview_supported", "reversible", "expect_disconnect",
+    "escalatable", "state_changing", "streaming",
+  ];
+  const block = ["flags:"];
+  for (const k of keys) {
+    if (flagsObj[k] !== undefined) block.push(`  ${k}: ${Boolean(flagsObj[k])}`);
+  }
+  let nextLines;
+  if (start !== -1) {
+    nextLines = [...lines.slice(0, start), ...block, ...lines.slice(end)];
+  } else {
+    const idxSteps = lines.findIndex((l) => /^steps\s*:/.test(l));
+    if (idxSteps !== -1) {
+      nextLines = [...lines.slice(0, idxSteps), ...block, ...lines.slice(idxSteps)];
+    } else {
+      nextLines = [...lines, ...block];
+    }
+  }
+  return nextLines.join("\n").replace(/\n+$/, "") + "\n";
+}
+
+function replaceYamlDisplaySection(yamlText, disp) {
+  const lines = String(yamlText || "").split(/\r?\n/);
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^display\s*:/.test(lines[i])) {
+      start = i;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (/^[A-Za-z_][A-Za-z0-9_]*\s*:/.test(lines[j])) {
+          end = j;
+          break;
+        }
+      }
+      break;
+    }
+  }
+  const block = disp ? serializeDisplayBlock(disp).trimEnd().split("\n") : [];
+  let nextLines;
+  if (start !== -1) {
+    nextLines = [...lines.slice(0, start), ...block, ...lines.slice(end)];
+  } else if (block.length) {
+    const trimmed = lines.slice();
+    while (trimmed.length && trimmed[trimmed.length - 1] === "") trimmed.pop();
+    nextLines = [...trimmed, ...block];
+  } else {
+    nextLines = lines;
+  }
+  return nextLines.join("\n").replace(/\n+$/, "") + "\n";
+}
+
+function UserOpDisplayBuilder({ activeDisplay, onApplyDisplay }) {
+  const [sampleOut, setSampleOut] = useState("");
+  const isSections = activeDisplay && activeDisplay.type === "sections";
+  const curType = activeDisplay ? activeDisplay.type : "none";
+
+  function switchType(nextType) {
+    if (nextType === "none") {
+      onApplyDisplay(null);
+      return;
+    }
+    if (nextType === "kv") {
+      onApplyDisplay({
+        type: "kv",
+        format: "regex",
+        fields: [{ label: "Resolver", regex: "^Resolver\\s*:\\s*(.+)$" }],
+      });
+    } else if (nextType === "lines") {
+      onApplyDisplay({
+        type: "lines",
+        include: ["^Resolver\\s*:"],
+        exclude: [],
+      });
+    } else if (nextType === "table") {
+      onApplyDisplay({
+        type: "table",
+        format: "regex",
+        regex: "^(?P<col1>\\S+)\\s+(?P<col2>.+)$",
+        skip_lines: 0,
+        columns: [
+          { key: "col1", label: "Колонка 1", format: "mono" },
+          { key: "col2", label: "Колонка 2" },
+        ],
+      });
+    }
+  }
+
+  return html`<details class="form-section">
+    <summary class="form-section-title" style="cursor:pointer">
+      Оформление результата (display)${activeDisplay ? html` · <span class="badge ok">${curType}</span>` : html` · <span class="muted small">обычный вывод</span>`}
+    </summary>
+    <div class="stack" style="margin-top:10px">
+      <p class="muted small">
+        Задайте, какие поля или строки показывать сверху в карточке результата. Полный вывод останется доступным ниже в спойлере.
+      </p>
+      ${isSections
+        ? html`<div class="muted small">Секция <b>sections</b> настроена напрямую в YAML.</div>`
+        : html`
+            <${Segmented}
+              value=${curType}
+              onChange=${switchType}
+              options=${[
+                { value: "none", label: "Обычный вывод" },
+                { value: "kv", label: "Ключ–значение" },
+                { value: "lines", label: "Фильтр строк" },
+                { value: "table", label: "Таблица" },
+              ]} />
+
+            ${curType === "kv" ? html`<div class="stack">
+              <div class="row">
+                <div style="flex:0 0 140px">
+                  <label>Формат</label>
+                  <select value=${activeDisplay.format || "regex"}
+                          onChange=${(e) => onApplyDisplay({ ...activeDisplay, format: e.target.value })}>
+                    <option value="regex">regex</option>
+                    <option value="json">json</option>
+                  </select>
+                </div>
+                <div class="grow">
+                  <label>Заголовок (опционально)</label>
+                  <input value=${activeDisplay.title || ""}
+                         onInput=${(e) => onApplyDisplay({ ...activeDisplay, title: e.target.value || undefined })} />
+                </div>
+              </div>
+              ${(activeDisplay.fields || []).map((f, idx) => html`<div class="row" key=${idx} style="align-items:flex-end">
+                <div style="flex:1">
+                  <label>Подпись</label>
+                  <input value=${f.label || ""}
+                         onInput=${(e) => {
+                           const next = (activeDisplay.fields || []).slice();
+                           next[idx] = { ...f, label: e.target.value };
+                           onApplyDisplay({ ...activeDisplay, fields: next });
+                         }} />
+                </div>
+                <div style="flex:2">
+                  <label>${(activeDisplay.format || "regex") === "regex" ? "Regex (группа 1)" : "JSON ключ"}</label>
+                  <input class="mono"
+                         value=${(activeDisplay.format || "regex") === "regex" ? (f.regex || "") : (f.key || "")}
+                         onInput=${(e) => {
+                           const next = (activeDisplay.fields || []).slice();
+                           const patch = (activeDisplay.format || "regex") === "regex"
+                             ? { regex: e.target.value }
+                             : { key: e.target.value };
+                           next[idx] = { ...f, ...patch };
+                           onApplyDisplay({ ...activeDisplay, fields: next });
+                         }} />
+                </div>
+                <button type="button" class="btn btn-sm btn-ghost"
+                        title="Удалить поле"
+                        onClick=${() => {
+                          const next = (activeDisplay.fields || []).filter((_, j) => j !== idx);
+                          onApplyDisplay({ ...activeDisplay, fields: next });
+                        }}>×</button>
+              </div>`)}
+              <div class="row">
+                <button type="button" class="btn btn-sm"
+                        onClick=${() => onApplyDisplay({
+                          ...activeDisplay,
+                          fields: [...(activeDisplay.fields || []),
+                            (activeDisplay.format || "regex") === "regex"
+                              ? { label: "Поле", regex: "^Key\\s*:\\s*(.+)$" }
+                              : { label: "Поле", key: "field" }],
+                        })}>+ Поле</button>
+              </div>
+            </div>` : null}
+
+            ${curType === "lines" ? html`<div class="stack">
+              <div class="form-sub">
+                <label>Показывать строки, подходящие под regex (по одному на строку)</label>
+                <textarea class="mono llm-rule-cond" rows="3"
+                          value=${(activeDisplay.include || []).join("\n")}
+                          onInput=${(e) => {
+                            const inc = e.target.value.split("\n").filter((x) => x.trim());
+                            onApplyDisplay({ ...activeDisplay, include: inc });
+                          }}></textarea>
+              </div>
+              <div class="form-sub">
+                <label>Исключить строки (regex, опционально)</label>
+                <textarea class="mono llm-rule-cond" rows="2"
+                          value=${(activeDisplay.exclude || []).join("\n")}
+                          onInput=${(e) => {
+                            const exc = e.target.value.split("\n").filter((x) => x.trim());
+                            onApplyDisplay({ ...activeDisplay, exclude: exc });
+                          }}></textarea>
+              </div>
+            </div>` : null}
+
+            ${curType === "table" ? html`<div class="stack">
+              <div class="row">
+                <div style="flex:0 0 140px">
+                  <label>Формат</label>
+                  <select value=${activeDisplay.format || "regex"}
+                          onChange=${(e) => onApplyDisplay({ ...activeDisplay, format: e.target.value })}>
+                    <option value="regex">regex</option>
+                    <option value="json">json</option>
+                  </select>
+                </div>
+                ${(activeDisplay.format || "regex") === "regex"
+                  ? html`<div class="grow">
+                        <label>Regex строки (группы (?P&lt;key&gt;...))</label>
+                        <input class="mono" value=${activeDisplay.regex || ""}
+                               onInput=${(e) => onApplyDisplay({ ...activeDisplay, regex: e.target.value })} />
+                      </div>
+                      <div style="flex:0 0 110px">
+                        <label>Пропуск строк</label>
+                        <input type="number" min="0" value=${activeDisplay.skip_lines || 0}
+                               onInput=${(e) => onApplyDisplay({ ...activeDisplay, skip_lines: Number(e.target.value) })} />
+                      </div>`
+                  : html`<div class="grow">
+                        <label>Путь к массиву в JSON (items_path)</label>
+                        <input class="mono" placeholder="например filesystems" value=${activeDisplay.items_path || ""}
+                               onInput=${(e) => onApplyDisplay({ ...activeDisplay, items_path: e.target.value })} />
+                      </div>`}
+              </div>
+              ${(activeDisplay.columns || []).map((c, idx) => html`<div class="row" key=${idx} style="align-items:flex-end">
+                <div style="flex:1">
+                  <label>Ключ</label>
+                  <input class="mono" value=${c.key || ""}
+                         onInput=${(e) => {
+                           const next = (activeDisplay.columns || []).slice();
+                           next[idx] = { ...c, key: e.target.value };
+                           onApplyDisplay({ ...activeDisplay, columns: next });
+                         }} />
+                </div>
+                <div style="flex:1">
+                  <label>Заголовок</label>
+                  <input value=${c.label || ""}
+                         onInput=${(e) => {
+                           const next = (activeDisplay.columns || []).slice();
+                           next[idx] = { ...c, label: e.target.value };
+                           onApplyDisplay({ ...activeDisplay, columns: next });
+                         }} />
+                </div>
+                <div style="flex:0 0 110px">
+                  <label>Формат</label>
+                  <select value=${c.format || ""}
+                          onChange=${(e) => {
+                            const next = (activeDisplay.columns || []).slice();
+                            next[idx] = { ...c, format: e.target.value || undefined };
+                            onApplyDisplay({ ...activeDisplay, columns: next });
+                          }}>
+                    <option value="">текст</option>
+                    <option value="mono">mono</option>
+                    <option value="bytes">bytes</option>
+                    <option value="percent">percent</option>
+                    <option value="number">number</option>
+                  </select>
+                </div>
+                <button type="button" class="btn btn-sm btn-ghost"
+                        title="Удалить колонку"
+                        onClick=${() => {
+                          const next = (activeDisplay.columns || []).filter((_, j) => j !== idx);
+                          onApplyDisplay({ ...activeDisplay, columns: next });
+                        }}>×</button>
+              </div>`)}
+              <div class="row">
+                <button type="button" class="btn btn-sm"
+                        onClick=${() => onApplyDisplay({
+                          ...activeDisplay,
+                          columns: [...(activeDisplay.columns || []), { key: "col", label: "Колонка" }],
+                        })}>+ Колонка</button>
+              </div>
+            </div>` : null}
+          `}
+
+      ${activeDisplay
+        ? html`<details>
+            <summary class="muted small" style="cursor:pointer">Проверить на примере вывода</summary>
+            <div class="stack" style="margin-top:8px">
+              <textarea class="mono llm-rule-cond" rows="4"
+                        placeholder="Вставьте пример вывода команды из терминала для проверки..."
+                        value=${sampleOut}
+                        onInput=${(e) => setSampleOut(e.target.value)}></textarea>
+              ${sampleOut.trim()
+                ? html`<div class="card" style="padding:10px">
+                    <${OperationDisplayView} display=${activeDisplay} stdout=${sampleOut} />
+                  </div>`
+                : null}
+            </div>
+          </details>`
+        : null}
+    </div>
+  </details>`;
+}
+
 function UserOpEditor({ mode, oid, initialYaml, onClose, onSaved }) {
   const isCreate = mode === "create";
   const [yaml, setYaml] = useState(initialYaml || (isCreate ? USER_OP_SKELETON : ""));
@@ -8046,6 +9656,8 @@ function UserOpEditor({ mode, oid, initialYaml, onClose, onSaved }) {
   const [servers, setServers] = useState([]);
   const [linksMode, setLinksMode] = useState("unbound");
   const [serverIds, setServerIds] = useState([]);
+  const [displayDraft, setDisplayDraft] = useState(undefined);
+  const [flagsDraft, setFlagsDraft] = useState(undefined);
 
   useEffect(() => {
     (async () => {
@@ -8199,6 +9811,8 @@ function UserOpEditor({ mode, oid, initialYaml, onClose, onSaved }) {
                     value=${yaml}
                     onInput=${(e) => {
                       setYaml(e.target.value);
+                      setDisplayDraft(undefined);
+                      setFlagsDraft(undefined);
                       setValidation(null);
                       setErr("");
                     }}></textarea>
@@ -8216,6 +9830,63 @@ function UserOpEditor({ mode, oid, initialYaml, onClose, onSaved }) {
                ${validation.parsed ? html`<span class="muted small">· ${validation.parsed.name}</span>` : null}`
         : html`<span class="err small">✗ ${validation.error || "невалидно"}</span>`}
     </div>
+
+    ${(() => {
+      const activeFlags = flagsDraft !== undefined
+        ? flagsDraft
+        : ((validation && validation.parsed && validation.parsed.flags) || {
+            dangerous: false, state_changing: false, streaming: false,
+            requires_confirmation: false, escalatable: false,
+            idempotent: true, reversible: true,
+          });
+      const toggleFlag = (k, val) => {
+        const next = { ...activeFlags, [k]: val };
+        if (k === "state_changing" && val) next.requires_confirmation = true;
+        setFlagsDraft(next);
+        setYaml((cur) => replaceYamlFlagsSection(cur, next));
+        setValidation(null);
+      };
+      return html`<details class="form-section">
+        <summary class="form-section-title" style="cursor:pointer">
+          Флаги выполнения${activeFlags.streaming ? html` · <span class="badge">stream</span>` : null}${activeFlags.state_changing ? html` · <span class="badge warn">state</span>` : null}
+        </summary>
+        <div class="stack" style="margin-top:10px; gap:8px">
+          <label class="check">
+            <input type="checkbox" checked=${!!activeFlags.streaming}
+                   onChange=${(e) => toggleFlag("streaming", e.target.checked)} />
+            <span>Потоковый вывод (streaming) — для бесконечных команд с кнопкой остановки (ping, tail -f)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" checked=${!!activeFlags.state_changing}
+                   onChange=${(e) => toggleFlag("state_changing", e.target.checked)} />
+            <span>Меняет состояние (state_changing) — в реакциях всегда требует подтверждения</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" checked=${!!activeFlags.requires_confirmation}
+                   onChange=${(e) => toggleFlag("requires_confirmation", e.target.checked)} />
+            <span>Требовать подтверждение плана перед запуском (requires_confirmation)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" checked=${!!activeFlags.escalatable}
+                   onChange=${(e) => toggleFlag("escalatable", e.target.checked)} />
+            <span>Опциональное sudo (escalatable) — выбор в UI с sudo или без</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" checked=${!!activeFlags.dangerous}
+                   onChange=${(e) => toggleFlag("dangerous", e.target.checked)} />
+            <span>Опасная операция (dangerous) — дополнительное предупреждение в плане</span>
+          </label>
+        </div>
+      </details>`;
+    })()}
+
+    <${UserOpDisplayBuilder}
+      activeDisplay=${displayDraft !== undefined ? displayDraft : (validation && validation.parsed ? validation.parsed.display : null)}
+      onApplyDisplay=${(nextDisp) => {
+        setDisplayDraft(nextDisp);
+        setYaml((cur) => replaceYamlDisplaySection(cur, nextDisp));
+        setValidation(null);
+      }} />
 
     <div class="form-section">
       <div class="form-section-title">Привязка к серверам</div>
@@ -8413,10 +10084,14 @@ function UserOpsView() {
               <span class="muted small mono">${op.id}</span>
             </div>
             <div class="check-meta">
-              <span>${op.category || "other"}</span>
+              <span>категория: ${opCategoryLabel(op.category)}</span>
               ${renderLinksStatus(op.links, servers)}
-              ${op.flags && op.flags.state_changing ? html`<span>state-changing</span>` : null}
-              ${op.flags && op.flags.dangerous ? html`<span>dangerous</span>` : null}
+              ${op.flags && op.flags.dangerous
+                ? html`<span class="sev-critical">опасная</span>`
+                : (op.flags && op.flags.state_changing
+                    ? html`<span>меняет состояние</span>`
+                    : html`<span>только чтение</span>`)}
+              ${op.flags && op.flags.streaming ? html`<span>потоковая</span>` : null}
             </div>
             ${!op.valid && op.error
               ? html`<div class="err">${op.error}</div>`
@@ -8440,6 +10115,1398 @@ function UserOpsView() {
   </div>`;
 }
 
+
+const SERVER_PALETTE = [
+  "#38bdf8", // Sky blue
+  "#34d399", // Emerald
+  "#fbbf24", // Amber
+  "#a78bfa", // Violet
+  "#f472b6", // Rose
+  "#fb923c", // Orange
+  "#2dd4bf", // Teal
+  "#a3e635", // Lime
+  "#818cf8", // Indigo
+  "#e879f9", // Fuchsia
+];
+
+function getServerColor(serverIndex) {
+  if (serverIndex == null || serverIndex < 0) return "#9aa0a6";
+  return SERVER_PALETTE[serverIndex % SERVER_PALETTE.length];
+}
+
+function truncateWithEllipsis(str, maxLen) {
+  if (!str) return "";
+  const s = String(str);
+  return s.length > maxLen ? s.slice(0, maxLen - 1) + "…" : s;
+}
+
+function splitLabelTwoLines(str, maxPerLine = 15) {
+  if (!str) return ["", ""];
+  const s = String(str);
+  if (s.length <= maxPerLine) return [s, ""];
+  const words = s.split(/\s+/);
+  let line1 = "";
+  let line2 = "";
+  for (const w of words) {
+    if (!line1 || (line1 + " " + w).length <= maxPerLine) {
+      line1 = line1 ? line1 + " " + w : w;
+    } else {
+      line2 = line2 ? line2 + " " + w : w;
+    }
+  }
+  if (!line2) {
+    return [s.slice(0, maxPerLine), truncateWithEllipsis(s.slice(maxPerLine), maxPerLine)];
+  }
+  return [truncateWithEllipsis(line1, maxPerLine), truncateWithEllipsis(line2, maxPerLine)];
+}
+
+function AutomationGraphView({ initialServerId = null, isServerTab = false, onRefreshStatus }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  // Фильтры тулбара
+  const [selectedServerIds, setSelectedServerIds] = useState(() => (
+    initialServerId != null ? new Set([Number(initialServerId)]) : new Set()
+  ));
+  const [serverPickerOpen, setServerPickerOpen] = useState(false);
+  const [searchQ, setSearchQ] = useState("");
+  const [showGrid, setShowGrid] = useState(true);
+  const [legendOpen, setLegendOpen] = useState(false);
+
+  // Режим отображения правил: all (все) | enabled (только on) | hidden (выкл/скрыты)
+  const [rulesMode, setRulesMode] = useState("all");
+
+  const [typeFilters, setTypeFilters] = useState({
+    servers: true,
+    ops: true,
+    reactions: true,
+  });
+
+  // Полноэкранный режим
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Модалки
+  const [modalState, setModalState] = useState(null);
+
+  // Контекстное меню ПКМ
+  const [contextMenu, setContextMenu] = useState(null);
+
+  // Pan / Zoom холста
+  const [pan, setPan] = useState({ x: 340, y: 240 });
+  const [zoom, setZoom] = useState(1.0);
+  const panRef = useRef({ x: 340, y: 240 }); panRef.current = pan;
+  const zoomRef = useRef(1.0); zoomRef.current = zoom;
+  const svgRef = useRef(null);
+  const containerRef = useRef(null);
+  const isPanningRef = useRef(false);
+  const panStartRef = useRef({ x: 0, y: 0 });
+  const hasCenteredRef = useRef(false);
+
+  // Выделение узлов и разделение клика / drag
+  const [hoveredId, setHoveredId] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  const [inspectorData, setInspectorData] = useState(null);
+  const didDragNodeRef = useRef(false);
+
+  // Радиальная физика + Alpha Decay
+  const simNodesRef = useRef([]);
+  const simEdgesRef = useRef([]);
+  const animFrameRef = useRef(null);
+  const alphaRef = useRef(0);
+  const draggedNodeRef = useRef(null);
+
+  const nodeElMap = useRef(new Map());
+  const edgeElMap = useRef(new Map());
+
+  async function loadGraph() {
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await api("/api/v1/automation/graph");
+      setData(res);
+      if (initialServerId == null) {
+        setSelectedServerIds(new Set((res.servers || []).map((s) => s.id)));
+      }
+      initSimulation(res);
+    } catch (ex) {
+      setErr(ex.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { loadGraph(); }, []);
+
+  // Первичное центрирование ровно один раз
+  useEffect(() => {
+    if (!hasCenteredRef.current && data && svgRef.current) {
+      const rect = svgRef.current.getBoundingClientRect();
+      if (rect.width > 50 && rect.height > 50) {
+        hasCenteredRef.current = true;
+        setPan({ x: Math.round(rect.width / 2), y: Math.round(rect.height / 2) });
+      }
+    }
+  }, [data]);
+
+  // Reheat при смене фильтров
+  useEffect(() => {
+    if (data && simNodesRef.current.length > 0) {
+      startSimulation(0.4);
+    }
+  }, [
+    selectedServerIds,
+    rulesMode,
+    typeFilters.servers,
+    typeFilters.ops,
+    typeFilters.reactions,
+    searchQ,
+  ]);
+
+  // Выход из полноэкранного режима по Escape
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === "Escape") {
+        if (contextMenu) setContextMenu(null);
+        else if (isFullscreen) setIsFullscreen(false);
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [isFullscreen, contextMenu]);
+
+  // Закрытие контекстного меню и дропдауна серверов
+  useEffect(() => {
+    if (!contextMenu && !serverPickerOpen) return undefined;
+    function onDoc(e) {
+      if (!e.target.closest(".graph-context-menu")) setContextMenu(null);
+      if (!e.target.closest(".graph-server-picker-wrap")) setServerPickerOpen(false);
+    }
+    document.addEventListener("pointerdown", onDoc, true);
+    return () => document.removeEventListener("pointerdown", onDoc, true);
+  }, [contextMenu, serverPickerOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, []);
+
+  function initSimulation(raw) {
+    if (!raw) return;
+    const { servers = [], operations = [], alert_rules = [], reaction_rules = [] } = raw;
+
+    const rawNodes = [];
+    const rawEdges = [];
+
+    const serverColorMap = new Map();
+    servers.forEach((s, idx) => {
+      serverColorMap.set(s.id, { color: getServerColor(idx), idx });
+    });
+
+    const opById = new Map(operations.map((o) => [o.id, o]));
+
+    const sCount = servers.length;
+    const serverAnchors = new Map();
+    const serverOutward = new Map();
+
+    if (sCount === 1) {
+      serverAnchors.set(servers[0].id, { x: -160, y: 0 });
+      serverOutward.set(servers[0].id, { x: -1, y: 0 });
+    } else if (sCount === 2) {
+      serverAnchors.set(servers[0].id, { x: -240, y: 0 });
+      serverOutward.set(servers[0].id, { x: -1, y: 0 });
+      serverAnchors.set(servers[1].id, { x: 240, y: 0 });
+      serverOutward.set(servers[1].id, { x: 1, y: 0 });
+    } else if (sCount === 3) {
+      const rad = 280;
+      const angles = [-Math.PI / 2, Math.PI / 6, (5 * Math.PI) / 6];
+      servers.forEach((s, idx) => {
+        const a = angles[idx];
+        const ox = Math.cos(a), oy = Math.sin(a);
+        serverAnchors.set(s.id, { x: ox * rad, y: oy * rad });
+        serverOutward.set(s.id, { x: ox, y: oy });
+      });
+    } else if (sCount === 4) {
+      const sx = 260, sy = 200;
+      const coords = [
+        { x: -sx, y: -sy }, { x: sx, y: -sy },
+        { x: -sx, y: sy },  { x: sx, y: sy },
+      ];
+      servers.forEach((s, idx) => {
+        const c = coords[idx];
+        const len = Math.sqrt(c.x * c.x + c.y * c.y) || 1;
+        serverAnchors.set(s.id, c);
+        serverOutward.set(s.id, { x: c.x / len, y: c.y / len });
+      });
+    } else {
+      const rad = Math.max(300, sCount * 90);
+      servers.forEach((s, idx) => {
+        const a = (idx / Math.max(1, sCount)) * 2 * Math.PI;
+        const ox = Math.cos(a), oy = Math.sin(a);
+        serverAnchors.set(s.id, { x: ox * rad, y: oy * rad });
+        serverOutward.set(s.id, { x: ox, y: oy });
+      });
+    }
+
+    // Серверы
+    servers.forEach((s) => {
+      const anc = serverAnchors.get(s.id) || { x: 0, y: 0 };
+      const sColor = serverColorMap.get(s.id)?.color || "#38bdf8";
+      rawNodes.push({
+        id: `srv_${s.id}`,
+        label: s.name,
+        sub: s.llm_alias,
+        type: "server",
+        w: 175, h: 54,
+        radius: 135,
+        initX: anc.x,
+        initY: anc.y,
+        isServer: true,
+        themeColor: sColor,
+        data: s,
+      });
+    });
+
+    // Операции
+    operations.forEach((o) => {
+      const sids = Array.isArray(o.server_ids) ? o.server_ids : [];
+      let ix = (Math.random() - 0.5) * 140;
+      let iy = (Math.random() - 0.5) * 140;
+      let primaryColor = "var(--border-strong)";
+
+      if (sids.length === 1 && serverAnchors.has(sids[0])) {
+        const anc = serverAnchors.get(sids[0]);
+        const out = serverOutward.get(sids[0]);
+        ix = anc.x + out.x * 220 + (Math.random() - 0.5) * 60;
+        iy = anc.y + out.y * 220 + (Math.random() - 0.5) * 60;
+        primaryColor = serverColorMap.get(sids[0])?.color || primaryColor;
+      }
+
+      rawNodes.push({
+        id: `op_${o.id}`,
+        label: o.name,
+        sub: o.id,
+        type: "operation",
+        w: 150, h: 42,
+        radius: 110,
+        initX: ix,
+        initY: iy,
+        isServer: false,
+        themeColor: primaryColor,
+        data: o,
+      });
+
+      if (o.is_global) {
+        servers.forEach((s) => {
+          const edgeColor = serverColorMap.get(s.id)?.color || "var(--border-strong)";
+          rawEdges.push({ source: `srv_${s.id}`, target: `op_${o.id}`, type: "global", rest: 280, color: edgeColor });
+        });
+      } else if (sids.length > 0) {
+        sids.forEach((sid) => {
+          const edgeColor = serverColorMap.get(sid)?.color || "var(--border-strong)";
+          rawEdges.push({ source: `srv_${sid}`, target: `op_${o.id}`, type: "explicit", rest: 220, color: edgeColor });
+        });
+      }
+    });
+
+    // Правила алертов
+    alert_rules.forEach((r) => {
+      const sj = r.servers_json || {};
+      const hasSpecificIds = Array.isArray(sj.ids) && sj.ids.length > 0;
+      const isAllServers = (r.server_id == null) && (!hasSpecificIds || sj.all === true);
+      const singleSid = r.server_id != null ? r.server_id : (hasSpecificIds && sj.ids.length === 1 ? sj.ids[0] : null);
+
+      let ix = (Math.random() - 0.5) * 180;
+      let iy = (Math.random() - 0.5) * 180;
+      let primaryColor = "var(--border-strong)";
+
+      if (singleSid != null && serverAnchors.has(singleSid)) {
+        const anc = serverAnchors.get(singleSid);
+        const out = serverOutward.get(singleSid);
+        ix = anc.x + out.x * 210 + (Math.random() - 0.5) * 60;
+        iy = anc.y + out.y * 210 + (Math.random() - 0.5) * 60;
+        primaryColor = serverColorMap.get(singleSid)?.color || primaryColor;
+      }
+
+      rawNodes.push({
+        id: `rule_${r.id}`,
+        label: r.name,
+        sub: conditionKindLabel(r.condition_kind),
+        type: "alert_rule",
+        w: 160, h: 46,
+        radius: 115,
+        initX: ix,
+        initY: iy,
+        isServer: false,
+        themeColor: primaryColor,
+        data: r,
+      });
+
+      if (r.condition_kind === "operation_check" && r.operation_id) {
+        rawEdges.push({ source: `op_${r.operation_id}`, target: `rule_${r.id}`, type: "explicit", rest: 210, color: primaryColor });
+      }
+
+      if (r.server_id != null) {
+        const edgeColor = serverColorMap.get(r.server_id)?.color || "var(--border-strong)";
+        rawEdges.push({ source: `srv_${r.server_id}`, target: `rule_${r.id}`, type: "explicit", rest: 220, color: edgeColor });
+      } else if (hasSpecificIds) {
+        sj.ids.forEach((sid) => {
+          const edgeColor = serverColorMap.get(sid)?.color || "var(--border-strong)";
+          rawEdges.push({ source: `srv_${sid}`, target: `rule_${r.id}`, type: "explicit", rest: 220, color: edgeColor });
+        });
+      } else if (isAllServers) {
+        servers.forEach((s) => {
+          const edgeColor = serverColorMap.get(s.id)?.color || "var(--border-strong)";
+          rawEdges.push({ source: `srv_${s.id}`, target: `rule_${r.id}`, type: "global", rest: 290, color: edgeColor });
+        });
+      }
+    });
+
+    // Реакции — размещаем на внешней орбите и связываем с защищаемыми серверами
+    const rxCount = Math.max(1, reaction_rules.length);
+    reaction_rules.forEach((rx, rIdx) => {
+      let primaryColor = "#b794f6";
+      const match = rx.match || {};
+      const matchSrvs = Array.isArray(match.server_ids) ? match.server_ids : [];
+
+      if (rx.run_on_server && rx.run_on_server !== "same_as_alert") {
+        const sid = Number(rx.run_on_server);
+        if (serverColorMap.has(sid)) primaryColor = serverColorMap.get(sid).color;
+      } else if (matchSrvs.length === 1 && serverColorMap.has(matchSrvs[0])) {
+        primaryColor = serverColorMap.get(matchSrvs[0]).color;
+      }
+
+      // Начальная позиция на внешней орбите (R = 400)
+      const angle = (rIdx / rxCount) * 2 * Math.PI + Math.PI / 4;
+      const rxInitX = Math.cos(angle) * 400;
+      const rxInitY = Math.sin(angle) * 400;
+
+      rawNodes.push({
+        id: `rx_${rx.id}`,
+        label: rx.name,
+        sub: `${rx.action_policy} · sudo: ${rx.sudo_mode}`,
+        type: "reaction_rule",
+        w: 160, h: 46,
+        radius: 125,
+        initX: rxInitX,
+        initY: rxInitY,
+        isServer: false,
+        isReaction: true,
+        themeColor: primaryColor,
+        data: rx,
+      });
+
+      if (rx.operation_id) {
+        rawEdges.push({ source: `rx_${rx.id}`, target: `op_${rx.operation_id}`, type: "explicit", rest: 260, color: primaryColor });
+      }
+
+      // Связи к правилам алертов
+      const rids = match.rule_ids || [];
+      if (rids.length) {
+        rids.forEach((rid) => {
+          rawEdges.push({ source: `rule_${rid}`, target: `rx_${rx.id}`, type: "explicit", rest: 260, color: primaryColor });
+        });
+      } else if (Array.isArray(match.condition_kinds) && match.condition_kinds.length) {
+        alert_rules.forEach((ar) => {
+          if (match.condition_kinds.includes(ar.condition_kind)) {
+            rawEdges.push({ source: `rule_${ar.id}`, target: `rx_${rx.id}`, type: "implicit", rest: 280, color: primaryColor });
+          }
+        });
+      } else {
+        alert_rules.forEach((ar) => {
+          rawEdges.push({ source: `rule_${ar.id}`, target: `rx_${rx.id}`, type: "implicit", rest: 280, color: primaryColor });
+        });
+      }
+
+      // Связи к серверам: учитываем run_on_server, match.server_ids и применимость операции
+      let targetSrvIds = [];
+      let isRxGlobalSrv = false;
+      if (rx.run_on_server && rx.run_on_server !== "same_as_alert") {
+        targetSrvIds = [Number(rx.run_on_server)];
+      } else if (matchSrvs.length > 0) {
+        targetSrvIds = matchSrvs.map(Number);
+      } else {
+        isRxGlobalSrv = true;
+        const opObj = opById.get(rx.operation_id);
+        if (!opObj || opObj.is_global) {
+          targetSrvIds = servers.map((s) => s.id);
+        } else if (Array.isArray(opObj.server_ids)) {
+          targetSrvIds = opObj.server_ids.slice();
+        }
+      }
+
+      targetSrvIds.forEach((sid) => {
+        const edgeColor = serverColorMap.get(sid)?.color || primaryColor;
+        rawEdges.push({
+          source: `rx_${rx.id}`,
+          target: `srv_${sid}`,
+          type: isRxGlobalSrv ? "global" : "explicit",
+          rest: 360,
+          color: edgeColor,
+        });
+      });
+    });
+
+    const existingPos = new Map(simNodesRef.current.map((n) => [n.id, { x: n.x, y: n.y }]));
+
+    simNodesRef.current = rawNodes.map((n) => {
+      const prev = existingPos.get(n.id);
+      return {
+        ...n,
+        x: prev ? prev.x : n.initX,
+        y: prev ? prev.y : n.initY,
+        vx: 0,
+        vy: 0,
+      };
+    });
+    simEdgesRef.current = rawEdges;
+    startSimulation(1.0);
+  }
+
+  function startSimulation(initialAlpha = 1.0) {
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    alphaRef.current = Math.max(alphaRef.current, initialAlpha);
+
+    function step() {
+      const nodes = simNodesRef.current.filter((n) => isNodeVisible(n));
+      const edges = simEdgesRef.current.filter((e) => {
+        const u = simNodesRef.current.find((n) => n.id === e.source);
+        const v = simNodesRef.current.find((n) => n.id === e.target);
+        return u && v && isNodeVisible(u) && isNodeVisible(v);
+      });
+
+      if (!nodes.length) {
+        animFrameRef.current = null;
+        return;
+      }
+
+      const alpha = alphaRef.current;
+      if (alpha < 0.005 && !draggedNodeRef.current) {
+        animFrameRef.current = null;
+        return;
+      }
+
+      const damping = 0.81;
+
+      // 1. Радиальное расталкивание + барьер серверов 50px + отталкивание реакций
+      for (let i = 0; i < nodes.length; i++) {
+        const u = nodes[i];
+        for (let j = i + 1; j < nodes.length; j++) {
+          const v = nodes[j];
+
+          let dx = v.x - u.x;
+          let dy = v.y - u.y;
+          let dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < 1) {
+            dx = (Math.random() - 0.5) || 1;
+            dy = (Math.random() - 0.5) || 1;
+            dist = Math.sqrt(dx * dx + dy * dy);
+          }
+
+          const isServers = u.isServer && v.isServer;
+          const isRxSrv = (u.isReaction && v.isServer) || (v.isReaction && u.isServer);
+          const isReactions = u.isReaction && v.isReaction;
+          const nx = dx / dist;
+          const ny = dy / dist;
+
+          if (isServers) {
+            const minServerDist = 2 * (87.5 * Math.abs(nx) + 27 * Math.abs(ny)) + 50;
+            if (dist < minServerDist) {
+              const overlap = minServerDist - dist;
+              const push = Math.max(2.0, overlap * 0.45);
+              if (draggedNodeRef.current !== u) { u.x -= nx * push * 0.5; u.y -= ny * push * 0.5; }
+              if (draggedNodeRef.current !== v) { v.x += nx * push * 0.5; v.y += ny * push * 0.5; }
+            } else {
+              const force = (4500 / (dist * dist)) * alpha;
+              const fx = nx * Math.min(force, 8.0);
+              const fy = ny * Math.min(force, 8.0);
+              if (draggedNodeRef.current !== u) { u.vx -= fx; u.vy -= fy; }
+              if (draggedNodeRef.current !== v) { v.vx += fx; v.vy += fy; }
+            }
+          } else if (isRxSrv) {
+            // Реакции держат дистанцию от серверов и не лезут в их кластеры
+            const minRxSrvDist = 310;
+            if (dist < minRxSrvDist) {
+              const overlap = minRxSrvDist - dist;
+              const push = (overlap / minRxSrvDist) * 10.0 * alpha;
+              if (draggedNodeRef.current !== u) { u.vx -= nx * push; u.vy -= ny * push; }
+              if (draggedNodeRef.current !== v) { v.vx += nx * push; v.vy += ny * push; }
+            } else {
+              const force = (3500 / (dist * dist)) * alpha;
+              const fx = nx * Math.min(force, 8.0);
+              const fy = ny * Math.min(force, 8.0);
+              if (draggedNodeRef.current !== u) { u.vx -= fx; u.vy -= fy; }
+              if (draggedNodeRef.current !== v) { v.vx += fx; v.vy += fy; }
+            }
+          } else {
+            const extraGap = isReactions ? 65 : 48;
+            const minDist = u.radius + v.radius + extraGap;
+            if (dist < minDist) {
+              const overlap = minDist - dist;
+              const push = (overlap / minDist) * 7.5 * alpha;
+              const fx = nx * push;
+              const fy = ny * push;
+              if (draggedNodeRef.current !== u) { u.vx -= fx; u.vy -= fy; }
+              if (draggedNodeRef.current !== v) { v.vx += fx; v.vy += fy; }
+            } else {
+              const force = ((isReactions ? 4000 : 2500) / (dist * dist)) * alpha;
+              const fx = nx * Math.min(force, 8.0);
+              const fy = ny * Math.min(force, 8.0);
+              if (draggedNodeRef.current !== u) { u.vx -= fx; u.vy -= fy; }
+              if (draggedNodeRef.current !== v) { v.vx += fx; v.vy += fy; }
+            }
+          }
+        }
+      }
+
+      // 2. Пружины связей
+      const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+      for (let k = 0; k < edges.length; k++) {
+        const e = edges[k];
+        const u = nodeMap.get(e.source);
+        const v = nodeMap.get(e.target);
+        if (!u || !v) continue;
+
+        let dx = v.x - u.x;
+        let dy = v.y - u.y;
+        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+
+        const rest = e.rest || 220;
+        const delta = dist - rest;
+        const springK = (e.type === "global" || e.type === "implicit") ? 0.015 : 0.035;
+        const force = delta * springK * alpha;
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+
+        if (draggedNodeRef.current !== u) { u.vx += fx; u.vy += fy; }
+        if (draggedNodeRef.current !== v) { v.vx -= fx; v.vy -= fy; }
+      }
+
+      // 3. Орбитальная гравитация: реакции — на внешнее кольцо (R=400), остальные — мягко к центру
+      const centerG = 0.00045;
+      for (let i = 0; i < nodes.length; i++) {
+        const u = nodes[i];
+        if (draggedNodeRef.current === u) continue;
+
+        if (u.isReaction) {
+          const rDist = Math.sqrt(u.x * u.x + u.y * u.y) || 1;
+          const targetR = 400;
+          const radialForce = (targetR - rDist) * 0.015 * alpha;
+          u.vx += (u.x / rDist) * radialForce;
+          u.vy += (u.y / rDist) * radialForce;
+        } else {
+          u.vx -= u.x * centerG * alpha;
+          u.vy -= u.y * centerG * alpha;
+        }
+
+        u.vx = Math.max(-35, Math.min(35, u.vx * damping));
+        u.vy = Math.max(-35, Math.min(35, u.vy * damping));
+
+        u.x = Math.max(-3000, Math.min(3000, u.x + u.vx));
+        u.y = Math.max(-3000, Math.min(3000, u.y + u.vy));
+        if (!Number.isFinite(u.x)) u.x = 0;
+        if (!Number.isFinite(u.y)) u.y = 0;
+      }
+
+      if (!draggedNodeRef.current) {
+        alphaRef.current *= 0.965;
+      }
+
+      renderGraphNodes();
+      animFrameRef.current = requestAnimationFrame(step);
+    }
+
+    animFrameRef.current = requestAnimationFrame(step);
+  }
+
+  function renderGraphNodes() {
+    const nodes = simNodesRef.current;
+    const edges = simEdgesRef.current;
+    const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      const el = nodeElMap.current.get(n.id);
+      if (el) el.setAttribute("transform", `translate(${Math.round(n.x)}, ${Math.round(n.y)})`);
+    }
+
+    for (let i = 0; i < edges.length; i++) {
+      const el = edgeElMap.current.get(i);
+      if (!el) continue;
+      const e = edges[i];
+      const u = nodeMap.get(e.source);
+      const v = nodeMap.get(e.target);
+      if (u && v) {
+        el.setAttribute("x1", Math.round(u.x));
+        el.setAttribute("y1", Math.round(u.y));
+        el.setAttribute("x2", Math.round(v.x));
+        el.setAttribute("y2", Math.round(v.y));
+      }
+    }
+  }
+
+  const qStr = searchQ.trim().toLowerCase();
+
+  const connectedIdsForFilteredServers = useMemo(() => {
+    if (!data) return null;
+    const totalServers = (data.servers || []).length;
+    if (selectedServerIds.size === totalServers && totalServers > 0) return null;
+    const connected = new Set();
+
+    selectedServerIds.forEach((sid) => connected.add(`srv_${sid}`));
+
+    (data.operations || []).forEach((o) => {
+      if (o.is_global) {
+        connected.add(`op_${o.id}`);
+      } else if (Array.isArray(o.server_ids) && o.server_ids.some((sid) => selectedServerIds.has(sid))) {
+        connected.add(`op_${o.id}`);
+      }
+    });
+
+    (data.alert_rules || []).forEach((r) => {
+      const sj = r.servers_json || {};
+      const hasSpecificIds = Array.isArray(sj.ids) && sj.ids.length > 0;
+      const isAllServers = (r.server_id == null) && (!hasSpecificIds || sj.all === true);
+      const matchesSrv = (r.server_id != null && selectedServerIds.has(r.server_id))
+        || (hasSpecificIds && sj.ids.some((sid) => selectedServerIds.has(sid)))
+        || isAllServers;
+      if (matchesSrv) connected.add(`rule_${r.id}`);
+    });
+
+    const opById = new Map((data.operations || []).map((o) => [o.id, o]));
+    (data.reaction_rules || []).forEach((rx) => {
+      const match = rx.match || {};
+      const matchSrvs = Array.isArray(match.server_ids) ? match.server_ids : [];
+      if (rx.run_on_server && rx.run_on_server !== "same_as_alert") {
+        if (selectedServerIds.has(Number(rx.run_on_server))) connected.add(`rx_${rx.id}`);
+      } else if (matchSrvs.length > 0) {
+        if (matchSrvs.some((sid) => selectedServerIds.has(Number(sid)))) connected.add(`rx_${rx.id}`);
+      } else {
+        const opObj = opById.get(rx.operation_id);
+        if (!opObj || opObj.is_global) {
+          if (selectedServerIds.size > 0) connected.add(`rx_${rx.id}`);
+        } else if (Array.isArray(opObj.server_ids) && opObj.server_ids.some((sid) => selectedServerIds.has(sid))) {
+          connected.add(`rx_${rx.id}`);
+        }
+      }
+    });
+
+    return connected;
+  }, [selectedServerIds, data]);
+
+  const highlightFocusId = selectedId || hoveredId;
+  const highlightNeighbors = useMemo(() => {
+    if (!highlightFocusId) return null;
+    const set = new Set([highlightFocusId]);
+    (simEdgesRef.current || []).forEach((e) => {
+      if (e.source === highlightFocusId) set.add(e.target);
+      if (e.target === highlightFocusId) set.add(e.source);
+    });
+    return set;
+  }, [highlightFocusId]);
+
+  function isNodeVisible(n) {
+    if (n.type === "server" && !typeFilters.servers) return false;
+    if (n.type === "operation" && !typeFilters.ops) return false;
+    if (n.type === "reaction_rule" && !typeFilters.reactions) return false;
+
+    if (n.type === "alert_rule") {
+      if (rulesMode === "hidden") return false;
+      if (rulesMode === "enabled" && !n.data.enabled) return false;
+    }
+
+    if (connectedIdsForFilteredServers && !connectedIdsForFilteredServers.has(n.id)) return false;
+
+    if (qStr) {
+      const matchLbl = n.label.toLowerCase().includes(qStr);
+      const matchSub = (n.sub || "").toLowerCase().includes(qStr);
+      if (!matchLbl && !matchSub) return false;
+    }
+    return true;
+  }
+
+  // Pan / Zoom
+  function onWheel(e) {
+    e.preventDefault();
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+    const rect = svgEl.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.12 : 0.89;
+    const curZoom = zoomRef.current;
+    const nextZoom = Math.max(0.25, Math.min(2.8, curZoom * factor));
+    const nextPanX = mouseX - (mouseX - panRef.current.x) * (nextZoom / curZoom);
+    const nextPanY = mouseY - (mouseY - panRef.current.y) * (nextZoom / curZoom);
+    setZoom(nextZoom);
+    setPan({ x: nextPanX, y: nextPanY });
+  }
+
+  // Панорамирование: СКМ (e.button === 1) работает с любого места (включая узлы),
+  // ЛКМ (e.button === 0) — только по пустому фону и снимает выделение.
+  function onSvgPointerDown(e) {
+    if (e.button === 1) {
+      e.preventDefault();
+      setContextMenu(null);
+      isPanningRef.current = true;
+      panStartRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
+      e.currentTarget.setPointerCapture && e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+    if (e.button !== 0) return;
+    if (
+      e.target.closest(".graph-node-group")
+      || e.target.closest("button")
+      || e.target.closest(".graph-inspector")
+      || e.target.closest(".graph-legend-wrap")
+    ) return;
+    setSelectedId(null);
+    setInspectorData(null);
+    setContextMenu(null);
+    isPanningRef.current = true;
+    panStartRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
+    e.currentTarget.setPointerCapture && e.currentTarget.setPointerCapture(e.pointerId);
+  }
+
+  function onSvgPointerMove(e) {
+    if (isPanningRef.current) {
+      setPan({
+        x: e.clientX - panStartRef.current.x,
+        y: e.clientY - panStartRef.current.y,
+      });
+    }
+  }
+
+  function onSvgPointerUp(e) {
+    if (isPanningRef.current) {
+      isPanningRef.current = false;
+      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    }
+  }
+
+  function centerGraph() {
+    if (!svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    setPan({ x: Math.round(rect.width / 2), y: Math.round(rect.height / 2) });
+    setZoom(1.0);
+    startSimulation(0.6);
+  }
+
+  function toggleFullscreen() {
+    setIsFullscreen((prev) => !prev);
+    setTimeout(() => centerGraph(), 40);
+  }
+
+  function openGraphModal(st) {
+    setInspectorData(null);
+    setLegendOpen(false);
+    setModalState(st);
+  }
+
+  function openInspectorForNode(node) {
+    setSelectedId(node.id);
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+    const rect = svgEl.getBoundingClientRect();
+    const screenX = panRef.current.x + node.x * zoomRef.current;
+    const screenY = panRef.current.y + node.y * zoomRef.current;
+    const cardW = 270;
+    const cardH = 210;
+
+    let left = screenX + (node.w / 2) * zoomRef.current + 16;
+    if (left + cardW > rect.width - 12) {
+      left = screenX - (node.w / 2) * zoomRef.current - cardW - 16;
+    }
+    left = Math.max(12, Math.min(left, rect.width - cardW - 12));
+
+    let top = screenY - 30;
+    if (top + cardH > rect.height - 12) {
+      top = Math.max(12, rect.height - cardH - 12);
+    }
+    top = Math.max(12, top);
+
+    setInspectorData({
+      node,
+      style: `left: ${Math.round(left)}px; top: ${Math.round(top)}px;`,
+    });
+  }
+
+  function onNodeClick(e, node) {
+    e.stopPropagation();
+    // Если узел перетаскивали — клик игнорируем
+    if (didDragNodeRef.current) {
+      didDragNodeRef.current = false;
+      return;
+    }
+    if (selectedId === node.id && inspectorData) {
+      setSelectedId(null);
+      setInspectorData(null);
+      return;
+    }
+    openInspectorForNode(node);
+  }
+
+  function onNodePointerDown(e, node) {
+    // При СКМ (button === 1) не останавливаем всплытие: отдаём панорамированию холста
+    if (e.button === 1) return;
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    draggedNodeRef.current = node;
+    didDragNodeRef.current = false;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const origX = node.x;
+    const origY = node.y;
+
+    function onMove(ev) {
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) > 4) {
+        didDragNodeRef.current = true;
+      }
+      const z = zoomRef.current;
+      node.x = origX + (ev.clientX - startX) / z;
+      node.y = origY + (ev.clientY - startY) / z;
+      node.vx = 0;
+      node.vy = 0;
+      startSimulation(0.2);
+    }
+
+    function onUp() {
+      draggedNodeRef.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      startSimulation(0.3);
+    }
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  function onCanvasContextMenu(e) {
+    e.preventDefault();
+    setContextMenu({
+      x: Math.min(e.clientX, window.innerWidth - 210),
+      y: Math.min(e.clientY, window.innerHeight - 230),
+      items: [
+        { label: "+ Новая операция", action: () => openGraphModal({ type: "new_op" }) },
+        { label: "+ Новое правило алерта", action: () => openGraphModal({ type: "new_rule" }) },
+        { label: "+ Новая реакция", action: () => openGraphModal({ type: "new_rx" }) },
+        { sep: true },
+        { label: "⤢ По центру", action: centerGraph },
+        { label: isFullscreen ? "🗗 Свернуть окно" : "⛶ Во весь экран", action: toggleFullscreen },
+        { label: showGrid ? "• Сетка: выключить" : "• Сетка: включить", action: () => setShowGrid(!showGrid) },
+      ],
+    });
+  }
+
+  function onNodeContextMenu(e, node) {
+    e.preventDefault();
+    e.stopPropagation();
+    // ПКМ подсвечивает узел и открывает ТОЛЬКО меню (без карточки инспектора)
+    setSelectedId(node.id);
+    setInspectorData(null);
+
+    const items = [];
+    if (node.type === "server") {
+      items.push({
+        label: "Открыть сервер",
+        action: () => window.dispatchEvent(new CustomEvent("melecho:open-server", { detail: { id: node.data.id } })),
+      });
+    } else if (node.type === "operation") {
+      const clean = node.data.id.startsWith("user:") ? node.data.id.slice(5) : node.data.id;
+      if (node.data.source === "user") {
+        items.push({ label: "Правка операции", action: () => openGraphModal({ type: "edit_op", oid: clean }) });
+      }
+    } else if (node.type === "alert_rule") {
+      items.push({ label: "Подробнее", action: () => openGraphModal({ type: "view_rule", id: node.data.id }) });
+      items.push({
+        label: "Правка правила",
+        action: () => openGraphModal({ type: "edit_rule", id: node.data.id, initial: alertRuleToEditorInitial(node.data) }),
+      });
+      items.push({
+        label: node.data.enabled ? "Отключить правило" : "Включить правило",
+        action: async () => {
+          await api("/api/v1/alert-rules/" + node.data.id, {
+            method: "PATCH",
+            body: JSON.stringify({ enabled: !node.data.enabled }),
+          });
+          await loadGraph();
+          onRefreshStatus && onRefreshStatus();
+        },
+      });
+    } else if (node.type === "reaction_rule") {
+      items.push({ label: "Правка реакции", action: () => openGraphModal({ type: "edit_rx", id: node.data.id }) });
+      items.push({
+        label: node.data.enabled ? "Отключить реакцию" : "Включить реакцию",
+        action: async () => {
+          await api("/api/v1/reaction-rules/" + node.data.id, {
+            method: "PATCH",
+            body: JSON.stringify({ enabled: !node.data.enabled }),
+          });
+          await loadGraph();
+          onRefreshStatus && onRefreshStatus();
+        },
+      });
+    }
+
+    items.push({ sep: true });
+    items.push({ label: isFullscreen ? "🗗 Свернуть окно" : "⛶ Во весь экран", action: toggleFullscreen });
+
+    setContextMenu({
+      x: Math.min(e.clientX, window.innerWidth - 210),
+      y: Math.min(e.clientY, window.innerHeight - 230),
+      items,
+    });
+  }
+
+  function cycleRulesMode() {
+    setRulesMode((prev) => (prev === "all" ? "enabled" : prev === "enabled" ? "hidden" : "all"));
+  }
+
+  const rulesBtnLabel = rulesMode === "all" ? "Правила: Все" : (rulesMode === "enabled" ? "Правила: Только on" : "Правила: Выкл");
+  const rulesBtnTip = rulesMode === "all"
+    ? "Правила: отображаются все (включённые и отключённые)"
+    : (rulesMode === "enabled" ? "Правила: отображаются только активные (on)" : "Правила: полностью скрыты с холста");
+
+  const allServers = data?.servers || [];
+  const allSelected = allServers.length > 0 && selectedServerIds.size === allServers.length;
+  const serverBtnLabel = allSelected
+    ? `Серверы: Все (${allServers.length})`
+    : (selectedServerIds.size === 0 ? "Серверы: 0" : `Серверы: ${selectedServerIds.size} из ${allServers.length}`);
+
+  function toggleServerId(sid) {
+    const next = new Set(selectedServerIds);
+    if (next.has(sid)) next.delete(sid);
+    else next.add(sid);
+    setSelectedServerIds(next);
+  }
+
+  return html`<div class=${"graph-container" + (isFullscreen ? " fullscreen" : "")} ref=${containerRef}>
+    <div class="graph-toolbar stack" style="gap:8px">
+      <!-- Строка 1: фильтры и вид -->
+      <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap">
+        <div class="graph-server-picker-wrap">
+          <button type="button" class="btn btn-sm" onClick=${() => setServerPickerOpen(!serverPickerOpen)}>
+            ${serverBtnLabel} ▾
+          </button>
+          ${serverPickerOpen ? html`
+            <div class="graph-server-picker-dropdown card stack">
+              <div class="row" style="gap:6px; margin-bottom:4px">
+                <button type="button" class="btn btn-sm btn-ghost small"
+                        onClick=${() => setSelectedServerIds(new Set(allServers.map((s) => s.id)))}>
+                  Все
+                </button>
+                <button type="button" class="btn btn-sm btn-ghost small"
+                        onClick=${() => setSelectedServerIds(new Set())}>
+                  Сбросить
+                </button>
+              </div>
+              <div class="stack" style="gap:4px; max-height:220px; overflow-y:auto">
+                ${allServers.map((s, idx) => {
+                  const sColor = getServerColor(idx);
+                  return html`<label class="check small" key=${s.id} style="gap:6px; cursor:pointer">
+                    <input type="checkbox" checked=${selectedServerIds.has(s.id)}
+                           onChange=${() => toggleServerId(s.id)} />
+                    <span style=${`display:inline-block; width:8px; height:8px; border-radius:50%; background:${sColor}`}></span>
+                    <span>${s.name} <span class="muted mono">(${s.llm_alias})</span></span>
+                  </label>`;
+                })}
+              </div>
+            </div>
+          ` : null}
+        </div>
+
+        <input class="graph-search-input"
+               placeholder="Поиск по графу…"
+               value=${searchQ}
+               onInput=${(e) => setSearchQ(e.target.value)} />
+
+        <div class="row" style="gap:4px">
+          <button type="button"
+                  class=${"btn btn-sm " + (typeFilters.servers ? "btn-primary" : "btn-ghost")}
+                  onClick=${() => setTypeFilters({ ...typeFilters, servers: !typeFilters.servers })}>
+            Серверы
+          </button>
+          <button type="button"
+                  class=${"btn btn-sm " + (typeFilters.ops ? "btn-primary" : "btn-ghost")}
+                  onClick=${() => setTypeFilters({ ...typeFilters, ops: !typeFilters.ops })}>
+            Операции
+          </button>
+          <button type="button"
+                  class=${"btn btn-sm " + (rulesMode !== "hidden" ? "btn-primary" : "btn-ghost")}
+                  onClick=${cycleRulesMode}
+                  title=${rulesBtnTip}>
+            ${rulesBtnLabel}
+          </button>
+          <button type="button"
+                  class=${"btn btn-sm " + (typeFilters.reactions ? "btn-primary" : "btn-ghost")}
+                  onClick=${() => setTypeFilters({ ...typeFilters, reactions: !typeFilters.reactions })}>
+            Реакции
+          </button>
+        </div>
+
+        <div class="grow"></div>
+
+        <button type="button" class="btn btn-sm btn-ghost" onClick=${() => setShowGrid(!showGrid)} title="Переключить фон">
+          ${showGrid ? "• Сетка: вкл" : "• Сетка: выкл"}
+        </button>
+        <button type="button" class="btn btn-sm btn-ghost" onClick=${centerGraph} title="Центрировать">
+          ⤢ По центру
+        </button>
+      </div>
+
+      <!-- Строка 2: действия создания слева, полноэкранный режим справа -->
+      <div class="row" style="gap:8px; align-items:center">
+        <div class="row" style="gap:6px">
+          <button type="button" class="btn btn-sm btn-graph-action" onClick=${() => openGraphModal({ type: "new_op" })}>+ Операция</button>
+          <button type="button" class="btn btn-sm btn-graph-action" onClick=${() => openGraphModal({ type: "new_rule" })}>+ Правило</button>
+          <button type="button" class="btn btn-sm btn-graph-action" onClick=${() => openGraphModal({ type: "new_rx" })}>+ Реакция</button>
+        </div>
+        <div class="grow"></div>
+        <button type="button"
+                class="btn btn-sm btn-ghost"
+                onClick=${toggleFullscreen}
+                title="Полноэкранный режим (Escape — выход)">
+          ${isFullscreen ? "🗗 Свернуть" : "⛶ Во весь экран"}
+        </button>
+      </div>
+    </div>
+
+    ${err ? html`<div class="banner danger">${err}</div>` : null}
+
+    <div class="graph-canvas-wrap"
+         ref=${svgRef}
+         onWheel=${onWheel}
+         onAuxClick=${(e) => { if (e.button === 1) e.preventDefault(); }}
+         onPointerDown=${onSvgPointerDown}
+         onPointerMove=${onSvgPointerMove}
+         onPointerUp=${onSvgPointerUp}
+         onContextMenu=${onCanvasContextMenu}>
+      <svg class="graph-svg" width="100%" height="100%">
+        <defs>
+          <pattern id="dot-grid"
+                   x=${((pan.x % (24 * zoom)) + 24 * zoom) % (24 * zoom)}
+                   y=${((pan.y % (24 * zoom)) + 24 * zoom) % (24 * zoom)}
+                   width=${24 * zoom}
+                   height=${24 * zoom}
+                   patternUnits="userSpaceOnUse">
+            <circle cx=${12 * zoom}
+                    cy=${12 * zoom}
+                    r=${Math.max(1.0, 1.3 * Math.min(zoom, 1.4))}
+                    fill="var(--fg-subtle)"
+                    opacity=${showGrid ? "0.32" : "0"} />
+          </pattern>
+        </defs>
+
+        <rect width="100%" height="100%" fill="url(#dot-grid)" />
+
+        <g class="graph-viewport" transform=${`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
+          <!-- Линии связей -->
+          <g class="graph-edges-layer">
+            ${(simEdgesRef.current || []).map((e, idx) => {
+              const u = (simNodesRef.current || []).find((n) => n.id === e.source);
+              const v = (simNodesRef.current || []).find((n) => n.id === e.target);
+              if (!u || !v || !isNodeVisible(u) || !isNodeVisible(v)) return null;
+
+              const isEdgeActive = highlightFocusId && (e.source === highlightFocusId || e.target === highlightFocusId);
+              const isEdgeDimmed = highlightFocusId && !isEdgeActive;
+              const isDashed = e.type === "global" || e.type === "implicit";
+              const strokeColor = isEdgeActive ? (e.color || "var(--accent)") : (e.color || "var(--border-strong)");
+
+              return html`<line
+                key=${idx}
+                ref=${(el) => { if (el) edgeElMap.current.set(idx, el); else edgeElMap.current.delete(idx); }}
+                data-edge-idx=${idx}
+                x1=${Math.round(u.x)} y1=${Math.round(u.y)}
+                x2=${Math.round(v.x)} y2=${Math.round(v.y)}
+                stroke=${strokeColor}
+                stroke-width=${isEdgeActive ? 2.2 : 1.3}
+                stroke-dasharray=${isDashed ? "4,4" : "none"}
+                opacity=${isEdgeDimmed ? (selectedId ? 0.08 : 0.25) : (isEdgeActive ? 1.0 : (isDashed ? 0.45 : 0.75))} />`;
+            })}
+          </g>
+
+          <!-- Узлы -->
+          <g class="graph-nodes-layer">
+            ${(simNodesRef.current || []).map((n) => {
+              if (!isNodeVisible(n)) return null;
+              const isSelected = selectedId === n.id;
+              const isNeighbor = highlightNeighbors && highlightNeighbors.has(n.id);
+              const isDimmed = highlightFocusId && !isNeighbor;
+              const dimClass = isDimmed ? (selectedId ? "dimmed-strong" : "dimmed-soft") : "";
+
+              return html`<g
+                key=${n.id}
+                ref=${(el) => { if (el) nodeElMap.current.set(n.id, el); else nodeElMap.current.delete(n.id); }}
+                data-node-id=${n.id}
+                class=${"graph-node-group " + dimClass + (isSelected ? " selected" : "")}
+                transform=${`translate(${Math.round(n.x)}, ${Math.round(n.y)})`}
+                onPointerDown=${(e) => onNodePointerDown(e, n)}
+                onPointerEnter=${() => setHoveredId(n.id)}
+                onPointerLeave=${() => setHoveredId(null)}
+                onClick=${(e) => onNodeClick(e, n)}
+                onContextMenu=${(e) => onNodeContextMenu(e, n)}>
+
+                ${n.type === "server" ? html`
+                  <rect x="-87" y="-27" width="175" height="54" rx="10"
+                        class=${"graph-node-rect server " + (n.data.status_kind || "ok")} />
+                  <circle cx="-68" cy="0" r="6" class=${"status-dot " + (n.data.status_kind || "ok")} />
+                  <text x="-52" y="-4" class="node-title server">${truncateWithEllipsis(n.label, 14)}</text>
+                  <text x="-52" y="14" class="node-sub">${n.sub}</text>
+                  ${n.data.active_alerts_count > 0 ? html`
+                    <circle cx="70" cy="-17" r="9" fill="var(--danger)" />
+                    <text x="70" y="-13" class="node-badge-text">${n.data.active_alerts_count}</text>
+                  ` : null}
+                ` : null}
+
+                ${n.type === "operation" ? (() => {
+                  const [l1, l2] = splitLabelTwoLines(n.label, 15);
+                  return html`
+                    <rect x="-75" y="-21" width="150" height="42" rx="21"
+                          style=${n.themeColor ? `stroke: ${n.themeColor}` : ""}
+                          class=${"graph-node-rect operation " + (n.data.source === "user" ? "user" : "system")} />
+                    ${l2
+                      ? html`<text x="0" y="-8" text-anchor="middle" class="node-title">${l1}</text>
+                             <text x="0" y="5" text-anchor="middle" class="node-title">${l2}</text>
+                             <text x="0" y="15" text-anchor="middle" class="node-sub" style="font-size:8px">
+                               ${n.data.source === "user" ? "user" : "system"}${n.data.flags?.streaming ? " · stream" : ""}
+                             </text>`
+                      : html`<text x="0" y="-3" text-anchor="middle" class="node-title">${l1}</text>
+                             <text x="0" y="11" text-anchor="middle" class="node-sub">
+                               ${n.data.source === "user" ? "user" : "system"}${n.data.flags?.streaming ? " · stream" : ""}
+                             </text>`}
+                  `;
+                })() : null}
+
+                ${n.type === "alert_rule" ? (() => {
+                  const [l1, l2] = splitLabelTwoLines(n.label, 15);
+                  const isOff = !n.data.enabled;
+                  return html`
+                    <rect x="-80" y="-23" width="160" height="46" rx="6"
+                          class=${"graph-node-rect rule " + n.data.severity + (isOff ? " rule-disabled" : "")} />
+                    <rect x="-80" y="-23" width="5" height="46" rx="2"
+                          fill=${n.data.severity === "critical" ? "var(--danger)" : (n.data.severity === "warning" ? "var(--warn)" : "var(--info)")} />
+                    ${l2
+                      ? html`<text x="-67" y="-9" class="node-title">${l1}</text>
+                             <text x="-67" y="4" class="node-title">${l2}</text>
+                             <text x="-67" y="16" class="node-sub">${n.sub}</text>`
+                      : html`<text x="-67" y="-4" class="node-title">${l1}</text>
+                             <text x="-67" y="12" class="node-sub">${n.sub}</text>`}
+                    ${isOff ? html`
+                      <rect x="52" y="-19" width="22" height="13" rx="3" fill="var(--bg-subtle)" stroke="var(--border)" />
+                      <text x="63" y="-10" text-anchor="middle" class="node-policy-text" style="fill:var(--fg-muted)">off</text>
+                    ` : null}
+                    ${n.data.active_alerts_count > 0 ? html`
+                      <circle cx="68" cy="-15" r="9" fill="var(--danger)" />
+                      <text x="68" y="-12" class="node-badge-text">${n.data.active_alerts_count}</text>
+                    ` : null}
+                  `;
+                })() : null}
+
+                ${n.type === "reaction_rule" ? (() => {
+                  const [l1, l2] = splitLabelTwoLines(n.label, 15);
+                  const isOff = !n.data.enabled;
+                  return html`
+                    <rect x="-80" y="-23" width="160" height="46" rx="6"
+                          class=${"graph-node-rect reaction" + (isOff ? " reaction-disabled" : "")} />
+                    ${l2
+                      ? html`<text x="-71" y="-9" class="node-title">${l1}</text>
+                             <text x="-71" y="4" class="node-title">${l2}</text>
+                             <text x="-71" y="16" class="node-sub">${n.sub}</text>`
+                      : html`<text x="-71" y="-4" class="node-title">${l1}</text>
+                             <text x="-71" y="12" class="node-sub">${n.sub}</text>`}
+                    <rect x="38" y="-14" width="36" height="15" rx="4"
+                          fill=${n.data.action_policy === "auto" ? "color-mix(in oklab, var(--ok) 25%, transparent)" : "color-mix(in oklab, var(--warn) 25%, transparent)"} />
+                    <text x="56" y="-3" text-anchor="middle" class="node-policy-text">
+                      ${n.data.action_policy}
+                    </text>
+                  `;
+                })() : null}
+              </g>`;
+            })}
+          </g>
+        </g>
+      </svg>
+
+      <!-- Легенда в правом верхнем углу (скрывается при открытой модалке) -->
+      ${!modalState ? html`<div class="graph-legend-wrap" onClick=${(e) => e.stopPropagation()}>
+        <button type="button"
+                class="btn btn-sm graph-legend-btn"
+                onClick=${() => setLegendOpen(!legendOpen)}
+                title="Показать / скрыть легенду">
+          ⓘ Легенда
+        </button>
+        ${legendOpen ? html`
+          <div class="graph-legend-card card stack">
+            <div class="row">
+              <b class="small grow">Легенда графа</b>
+              <button type="button" class="sym-btn" style="width:22px;height:22px" onClick=${() => setLegendOpen(false)}>×</button>
+            </div>
+            <div class="stack small" style="gap:4px">
+              <div class="row" style="gap:6px"><span class="legend-shape srv"></span><span>Сервер (цвет = статус)</span></div>
+              <div class="row" style="gap:6px"><span class="legend-shape op"></span><span>Операция (sys / user)</span></div>
+              <div class="row" style="gap:6px"><span class="legend-shape rule"></span><span>Правило алерта (пунктир = off)</span></div>
+              <div class="row" style="gap:6px"><span class="legend-shape rx"></span><span>Реакция (внешняя орбита)</span></div>
+              <div class="row" style="gap:6px"><span class="legend-line solid"></span><span>Прямая привязка</span></div>
+              <div class="row" style="gap:6px"><span class="legend-line dashed"></span><span>Общая / глобальная связь</span></div>
+            </div>
+            ${allServers.length > 0 ? html`
+              <div class="stack small" style="gap:3px; border-top:1px solid var(--border); padding-top:6px">
+                <span class="muted">Цвета связей серверов:</span>
+                ${allServers.map((s, idx) => html`<div class="row" key=${s.id} style="gap:6px">
+                  <span style=${`display:inline-block; width:10px; height:10px; border-radius:50%; background:${getServerColor(idx)}`}></span>
+                  <span>${s.name}</span>
+                </div>`)}
+              </div>
+            ` : null}
+          </div>
+        ` : null}
+      </div>` : null}
+
+      <!-- Инспектор выбранного узла -->
+      ${inspectorData && selectedId ? html`
+        <div class="graph-inspector card stack"
+             style=${inspectorData.style}
+             onClick=${(e) => e.stopPropagation()}>
+          <div class="row" style="align-items:flex-start">
+            <div class="grow">
+              <span class="badge ${inspectorData.node.type === 'server' ? 'ok' : 'info'}">
+                ${inspectorData.node.type === 'server' ? 'Сервер' : (inspectorData.node.type === 'operation' ? 'Операция' : (inspectorData.node.type === 'alert_rule' ? 'Правило алерта' : 'Реакция'))}
+              </span>
+              <h4 style="margin:4px 0 0; font-size:0.9375rem">${inspectorData.node.label}</h4>
+              <div class="muted small mono">${inspectorData.node.sub}</div>
+            </div>
+            <button type="button" class="sym-btn" style="width:24px;height:24px" onClick=${() => { setSelectedId(null); setInspectorData(null); }}>×</button>
+          </div>
+
+          ${inspectorData.node.type === "server" ? html`
+            <div class="muted small">
+              Статус: <b>${inspectorData.node.data.status_label || (inspectorData.node.data.offline ? "offline" : (inspectorData.node.data.anomaly ? "аномалия" : "ok"))}</b>
+              ${inspectorData.node.data.active_alerts_count > 0 ? html`<br />Активных алертов: <b>${inspectorData.node.data.active_alerts_count}</b>` : null}
+            </div>
+            <button class="btn btn-sm btn-primary" onClick=${() => {
+              window.dispatchEvent(new CustomEvent("melecho:open-server", { detail: { id: inspectorData.node.data.id } }));
+            }}>Открыть сервер</button>
+          ` : null}
+
+          ${inspectorData.node.type === "operation" ? html`
+            <div class="muted small">
+              Категория: <b>${inspectorData.node.data.category}</b> · Источник: <b>${inspectorData.node.data.source}</b>
+              <br />Привязка: <b>${inspectorData.node.data.is_global ? "все серверы" : (inspectorData.node.data.is_unbound ? "не привязана" : `${inspectorData.node.data.server_ids?.length || 0} серверов`)}</b>
+            </div>
+            ${inspectorData.node.data.source === "user" ? html`
+              <button class="btn btn-sm btn-primary" onClick=${() => {
+                const clean = inspectorData.node.data.id.startsWith("user:") ? inspectorData.node.data.id.slice(5) : inspectorData.node.data.id;
+                openGraphModal({ type: "edit_op", oid: clean });
+              }}>Правка операции</button>
+            ` : null}
+          ` : null}
+
+          ${inspectorData.node.type === "alert_rule" ? html`
+            <div class="muted small">
+              Важность: <b>${inspectorData.node.data.severity}</b> · Включено: <b>${inspectorData.node.data.enabled ? "да" : "нет"}</b>
+              ${inspectorData.node.data.active_alerts_count > 0 ? html`<br />Активных алертов: <b>${inspectorData.node.data.active_alerts_count}</b>` : null}
+            </div>
+            <div class="row">
+              <button class="btn btn-sm btn-primary" onClick=${() => openGraphModal({ type: "view_rule", id: inspectorData.node.data.id })}>
+                Подробнее
+              </button>
+              <button class="btn btn-sm btn-ghost" onClick=${() => openGraphModal({ type: "edit_rule", id: inspectorData.node.data.id, initial: alertRuleToEditorInitial(inspectorData.node.data) })}>
+                Правка
+              </button>
+            </div>
+          ` : null}
+
+          ${inspectorData.node.type === "reaction_rule" ? html`
+            <div class="muted small">
+              Политика: <b>${inspectorData.node.data.action_policy}</b> · Sudo: <b>${inspectorData.node.data.sudo_mode}</b>
+              <br />Статистика: ✅ ${inspectorData.node.data.stats?.ok || 0} · ❌ ${inspectorData.node.data.stats?.fail || 0}
+            </div>
+            <button class="btn btn-sm btn-primary" onClick=${() => openGraphModal({ type: "edit_rx", id: inspectorData.node.data.id })}>
+              Правка реакции
+            </button>
+          ` : null}
+        </div>
+      ` : null}
+
+      <!-- Контекстное меню ПКМ -->
+      ${contextMenu ? html`
+        <div class="graph-context-menu"
+             style=${`left: ${contextMenu.x}px; top: ${contextMenu.y}px;`}
+             onClick=${(e) => e.stopPropagation()}
+             onContextMenu=${(e) => e.preventDefault()}>
+          ${contextMenu.items.map((it, idx) => {
+            if (it.sep) return html`<div class="menu-sep" key=${idx}></div>`;
+            return html`<button type="button" class="menu-item" key=${idx} onClick=${() => {
+              setContextMenu(null);
+              it.action && it.action();
+            }}>${it.label}</button>`;
+          })}
+        </div>
+      ` : null}
+    </div>
+
+    <!-- Модалки создания / редактирования сущностей с графа -->
+    ${modalState?.type === "new_op" ? html`
+      <${UserOpEditor}
+        mode="create"
+        onClose=${() => setModalState(null)}
+        onSaved=${async () => { setModalState(null); await loadGraph(); onRefreshStatus && onRefreshStatus(); }} />
+    ` : null}
+
+    ${modalState?.type === "edit_op" ? html`
+      <${UserOpEditor}
+        mode="edit"
+        oid=${modalState.oid}
+        onClose=${() => setModalState(null)}
+        onSaved=${async () => { setModalState(null); await loadGraph(); onRefreshStatus && onRefreshStatus(); }} />
+    ` : null}
+
+    ${modalState?.type === "new_rule" ? html`
+      <${AlertRuleEditor}
+        onSubmit=${async (body) => {
+          await api("/api/v1/alert-rules", { method: "POST", body: JSON.stringify(body) });
+          setModalState(null);
+          await loadGraph();
+          onRefreshStatus && onRefreshStatus();
+        }}
+        onClose=${() => setModalState(null)} />
+    ` : null}
+
+    ${modalState?.type === "view_rule" ? html`
+      <${AlertRuleDetailModal}
+        rid=${modalState.id}
+        onClose=${() => setModalState(null)}
+        onEdit=${(r) => setModalState({ type: "edit_rule", id: r.id, initial: alertRuleToEditorInitial(r) })}
+        onReloadList=${loadGraph} />
+    ` : null}
+
+    ${modalState?.type === "edit_rule" ? html`
+      <${AlertRuleEditor}
+        initial=${modalState.initial}
+        onSubmit=${async (body) => {
+          await api("/api/v1/alert-rules/" + modalState.id, { method: "PATCH", body: JSON.stringify(body) });
+          setModalState(null);
+          await loadGraph();
+          onRefreshStatus && onRefreshStatus();
+        }}
+        onClose=${() => setModalState(null)} />
+    ` : null}
+
+    ${modalState?.type === "new_rx" ? html`
+      <${ReactionRuleEditor}
+        onClose=${() => setModalState(null)}
+        onSaved=${async () => { setModalState(null); await loadGraph(); onRefreshStatus && onRefreshStatus(); }} />
+    ` : null}
+
+    ${modalState?.type === "edit_rx" ? html`
+      <${ReactionRuleEditor}
+        initial=${reactionRuleToEditorInitial((data?.reaction_rules || []).find((x) => x.id === modalState.id))}
+        onClose=${() => setModalState(null)}
+        onSaved=${async () => { setModalState(null); await loadGraph(); onRefreshStatus && onRefreshStatus(); }} />
+    ` : null}
+  </div>`;
+}
 
 function AutomationView({ autoState, pendingCount, onOpenPending, onRefreshStatus, initialRuleRid, onRuleDetailClosed }) {
   const [sub, setSub] = useState("reactions");
@@ -8516,12 +11583,16 @@ function AutomationView({ autoState, pendingCount, onOpenPending, onRefreshStatu
       <button class=${sub === "reactions" ? "on" : ""} onClick=${() => setSub("reactions")}>Реакции</button>
       <button class=${sub === "operations" ? "on" : ""} onClick=${() => setSub("operations")}>Операции</button>
       <button class=${sub === "alert_rules" ? "on" : ""} onClick=${() => setSub("alert_rules")}>Правила</button>
+      <button class=${sub === "graph" ? "on" : ""} onClick=${() => setSub("graph")}>Граф</button>
     </div>
     ${sub === "reactions" ? html`<${ReactionsView} />` : null}
     ${sub === "operations" ? html`<${UserOpsView} />` : null}
     ${sub === "alert_rules" ? html`<${AlertRulesView}
         initialDetailRid=${initialRuleRid}
         onDetailClosed=${onRuleDetailClosed} />` : null}
+    ${sub === "graph" ? html`<div class="stack" style="height: calc(100vh - 210px); min-height: 480px;">
+        <${AutomationGraphView} onRefreshStatus=${onRefreshStatus} />
+      </div>` : null}
   </div>`;
 }
 function SettingsView() {
@@ -8535,6 +11606,17 @@ function SettingsView() {
   // сохраняется по кнопке. Синхронизируется из s.* по useEffect.
   const [netDraft, setNetDraft] = useState({ host: "", port: 53 });
   const [netBusy, setNetBusy] = useState(false);
+  const [ctxDraft, setCtxDraft] = useState({ max_messages: 20, max_chars: 32000, cross_mode: true });
+  const [ctxBusy, setCtxBusy] = useState(false);
+  const [detDraft, setDetDraft] = useState({
+    z_threshold: 3.0,
+    ignore_drops: true,
+    abs_cpu: 90,
+    abs_ram: 90,
+    abs_disk: 90,
+    abs_load_1m_per_cpu: 1.5,
+  });
+  const [detBusy, setDetBusy] = useState(false);
   const [netErr, setNetErr] = useState("");
   const [updateStatus, setUpdateStatus] = useState(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -8604,6 +11686,73 @@ function SettingsView() {
       port: s.internet_check_port || 53,
     });
   }, [s && s.internet_check_host, s && s.internet_check_port]);
+
+  useEffect(() => {
+    if (!s) return;
+    setCtxDraft({
+      max_messages: s.llm_context_max_messages ?? 20,
+      max_chars: s.llm_context_max_chars ?? 32000,
+      cross_mode: s.llm_context_cross_mode !== false,
+    });
+    setDetDraft({
+      z_threshold: Number(s.detector_z_threshold) || 3.0,
+      ignore_drops: s.detector_ignore_drops !== false,
+      abs_cpu: Number(s.detector_abs_cpu) || 90,
+      abs_ram: Number(s.detector_abs_ram) || 90,
+      abs_disk: Number(s.detector_abs_disk) || 90,
+      abs_load_1m_per_cpu: Number(s.detector_abs_load_1m_per_cpu) || 1.5,
+    });
+  }, [
+    s && s.llm_context_max_messages, s && s.llm_context_max_chars, s && s.llm_context_cross_mode,
+    s && s.detector_z_threshold, s && s.detector_ignore_drops, s && s.detector_abs_cpu,
+    s && s.detector_abs_ram, s && s.detector_abs_disk, s && s.detector_abs_load_1m_per_cpu
+  ]);
+
+  async function saveDetectorSettings(patch) {
+    setDetBusy(true);
+    try {
+      const payload = patch || {
+        detector_z_threshold: Number(detDraft.z_threshold) || 3.0,
+        detector_ignore_drops: !!detDraft.ignore_drops,
+        detector_abs_cpu: Number(detDraft.abs_cpu) || 90,
+        detector_abs_ram: Number(detDraft.abs_ram) || 90,
+        detector_abs_disk: Number(detDraft.abs_disk) || 90,
+        detector_abs_load_1m_per_cpu: Number(detDraft.abs_load_1m_per_cpu) || 1.5,
+      };
+      const r = await api("/api/v1/settings", {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      setS(r);
+      showToast("Настройки детектора аномалий сохранены", "ok");
+    } catch (ex) {
+      showToast("Ошибка: " + ex.message, "error");
+    } finally {
+      setDetBusy(false);
+    }
+  }
+
+  async function saveCtx(override) {
+    setCtxBusy(true);
+    try {
+      const payload = override || {
+        llm_context_max_messages: Math.max(0, Number(ctxDraft.max_messages) || 0),
+        llm_context_max_chars: Math.max(0, Number(ctxDraft.max_chars) || 0),
+        llm_context_cross_mode: !!ctxDraft.cross_mode,
+      };
+      const r = await api("/api/v1/settings", {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      setS(r);
+      window.dispatchEvent(new Event("melecho:refresh-llm-profiles"));
+      showToast("Настройки контекста сохранены", "ok");
+    } catch (ex) {
+      showToast("Ошибка: " + ex.message, "error");
+    } finally {
+      setCtxBusy(false);
+    }
+  }
 
   async function refreshUpdateStatus() {
     try {
@@ -8744,6 +11893,54 @@ function SettingsView() {
 
     <${LLMProfilesSection} />
 
+    <div class="card stack">
+      <h3>Контекст LLM</h3>
+      <p class="muted">
+        Управление историей диалога, передаваемой модели. Значение <span class="mono">0</span> отключает ограничение.
+      </p>
+      <label class="check check--onoff">
+        <input type="checkbox" checked=${!!ctxDraft.cross_mode}
+               disabled=${ctxBusy}
+               onChange=${(e) => {
+                 const next = e.target.checked;
+                 setCtxDraft({ ...ctxDraft, cross_mode: next });
+                 saveCtx({ llm_context_cross_mode: next });
+               }} />
+        <span>${ctxDraft.cross_mode ? "сквозной контекст между режимами (chat, /alert, /operation, /reaction)" : "режимы изолированы друг от друга"}</span>
+      </label>
+      <div class="row" style="align-items: flex-end;">
+        <div style="flex: 1; min-width: 140px;">
+          <label>Макс. сообщений ${Number(ctxDraft.max_messages) === 0 ? "(без ограничений)" : ""}</label>
+          <input type="number" min="0" max="500"
+                 value=${ctxDraft.max_messages}
+                 disabled=${ctxBusy}
+                 onInput=${(e) => setCtxDraft({ ...ctxDraft, max_messages: e.target.value })} />
+        </div>
+        <div style="flex: 1; min-width: 160px;">
+          <label>Макс. символов ${Number(ctxDraft.max_chars) === 0 ? "(без ограничений)" : ""}</label>
+          <input type="number" min="0" max="500000" step="1000"
+                 value=${ctxDraft.max_chars}
+                 disabled=${ctxBusy}
+                 onInput=${(e) => setCtxDraft({ ...ctxDraft, max_chars: e.target.value })} />
+        </div>
+        <button type="button" class="btn btn-sm btn-ghost"
+                disabled=${ctxBusy}
+                title="Установить 0 для обоих лимитов"
+                onClick=${() => {
+                  const unlim = { ...ctxDraft, max_messages: 0, max_chars: 0 };
+                  setCtxDraft(unlim);
+                  saveCtx({ llm_context_max_messages: 0, llm_context_max_chars: 0 });
+                }}>
+          Снять ограничения
+        </button>
+        <button type="button" class="btn btn-sm btn-primary"
+                disabled=${ctxBusy}
+                onClick=${() => saveCtx()}>
+          ${ctxBusy ? "Сохранение…" : "Сохранить"}
+        </button>
+      </div>
+    </div>
+
     <${SudoUnlockSection} />
 
     ${updateStatus
@@ -8845,6 +12042,88 @@ function SettingsView() {
         </button>
       </div>
       ${netErr ? html`<div class="err">${netErr}</div>` : null}
+    </div>
+
+    <div class="card stack">
+      <h3>Детектор аномалий</h3>
+      <p class="muted">
+        Статистическая детекция отклонений от нормы по скользящему экспоненциальному среднему (EWMA + Z-score) и абсолютные пороги.
+      </p>
+
+      <div class="form-sub">
+        <label>Чувствительность к аномалиям (Z-score порог)</label>
+        <div class="preset-pills">
+          ${[
+            [2.5, "Высокая 2.5σ"],
+            [3.0, "Стандартная 3.0σ"],
+            [4.5, "Умеренная 4.5σ"],
+            [6.0, "Низкая 6.0σ"],
+          ].map(([val, lbl]) => html`<button type="button" key=${val}
+              class=${"preset-pill" + (Math.abs(detDraft.z_threshold - val) < 0.05 ? " on" : "")}
+              disabled=${detBusy}
+              onClick=${() => {
+                const next = { ...detDraft, z_threshold: val };
+                setDetDraft(next);
+                saveDetectorSettings({ detector_z_threshold: val });
+              }}>${lbl}</button>`)}
+        </div>
+        <div class="row" style="align-items:center; gap:8px; margin-top:4px">
+          <input type="number" step="0.1" min="1.0" max="20.0" style="max-width:160px"
+                 value=${detDraft.z_threshold}
+                 disabled=${detBusy}
+                 onInput=${(e) => setDetDraft({ ...detDraft, z_threshold: e.target.value })} />
+          <span class="muted small">σ (стандартных отклонений от baseline)</span>
+        </div>
+      </div>
+
+      <label class="check check--onoff" style="margin-top:6px">
+        <input type="checkbox" checked=${!!detDraft.ignore_drops}
+               disabled=${detBusy}
+               onChange=${(e) => {
+                 const next = e.target.checked;
+                 setDetDraft({ ...detDraft, ignore_drops: next });
+                 saveDetectorSettings({ detector_ignore_drops: next });
+               }} />
+        <span>Игнорировать падения метрик (аномалией считается только рост нагрузки)</span>
+      </label>
+
+      <div class="form-sub" style="margin-top:8px">
+        <label>Абсолютные пороги срабатывания (OR с Z-score)</label>
+        <div class="row" style="flex-wrap:wrap; gap:12px">
+          <div style="flex:1; min-width:120px">
+            <label>CPU, %</label>
+            <input type="number" min="1" max="100" value=${detDraft.abs_cpu}
+                   disabled=${detBusy}
+                   onInput=${(e) => setDetDraft({ ...detDraft, abs_cpu: e.target.value })} />
+          </div>
+          <div style="flex:1; min-width:120px">
+            <label>RAM, %</label>
+            <input type="number" min="1" max="100" value=${detDraft.abs_ram}
+                   disabled=${detBusy}
+                   onInput=${(e) => setDetDraft({ ...detDraft, abs_ram: e.target.value })} />
+          </div>
+          <div style="flex:1; min-width:120px">
+            <label>Диск, %</label>
+            <input type="number" min="1" max="100" value=${detDraft.abs_disk}
+                   disabled=${detBusy}
+                   onInput=${(e) => setDetDraft({ ...detDraft, abs_disk: e.target.value })} />
+          </div>
+          <div style="flex:1; min-width:140px">
+            <label>Load 1m на ядро</label>
+            <input type="number" step="0.1" min="0.1" max="50" value=${detDraft.abs_load_1m_per_cpu}
+                   disabled=${detBusy}
+                   onInput=${(e) => setDetDraft({ ...detDraft, abs_load_1m_per_cpu: e.target.value })} />
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:4px">
+        <button type="button" class="btn btn-sm btn-primary"
+                disabled=${detBusy}
+                onClick=${() => saveDetectorSettings()}>
+          ${detBusy ? "Сохранение…" : "Сохранить настройки детектора"}
+        </button>
+      </div>
     </div>
 
     <${RetentionSection} />
@@ -9120,9 +12399,6 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
     setEditing({ ...editing, servers: v });
   }
 
-  // При смене типа сбрасываем condition к дефолтному для этого типа —
-  // иначе в новом condition_json окажутся ключи от старого. servers
-  // инициализируем один раз (не сбрасываем, если уже что-то выбрано).
   function setKind(k) {
     const defaults = {
       metric_threshold:  { metric: "cpu", value_gte: 90 },
@@ -9137,7 +12413,6 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
     setEditing(next);
   }
 
-  // Собирает condition_json из cond с валидацией обязательных полей.
   function buildCondition() {
     if (kind === "metric_threshold") {
       if (!cond.metric) throw new Error("укажите метрику");
@@ -9170,18 +12445,18 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
       if (cond.z_min != null && cond.z_min !== "") out.z_min = Number(cond.z_min);
       if (cond.z_max != null && cond.z_max !== "") out.z_max = Number(cond.z_max);
       if (out.z_min == null && out.z_max == null) {
-        throw new Error("укажите хотя бы один порог (z_min или z_max)");
+        throw new Error("укажите хотя бы один порог (от или до)");
       }
       return out;
     }
     if (kind === "metric_stale") {
       const sec = Number(cond.no_data_sec);
-      if (!Number.isFinite(sec) || sec <= 0) throw new Error("no_data_sec: положительное число");
+      if (!Number.isFinite(sec) || sec <= 0) throw new Error("время отсутствия данных: положительное число");
       return { no_data_sec: sec };
     }
     if (kind === "manual_op_failed") {
       const v = Number(cond.exit_ne ?? 0);
-      if (!Number.isFinite(v)) throw new Error("exit_ne: число");
+      if (!Number.isFinite(v)) throw new Error("ожидаемый код выхода: число");
       return { exit_ne: v };
     }
     if (kind === "reaction_failed") {
@@ -9216,21 +12491,17 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
     if (kind === "operation_check") {
       const iv = Number(editing.interval_sec) || 300;
       if (!Number.isFinite(iv) || iv < 60 || iv > 86400) {
-        throw new Error("interval_sec: 60..86400");
+        throw new Error("интервал проверки: 60..86400 сек");
       }
       body.interval_sec = iv;
       const s = editing.servers || { all: true };
       if (s.all) {
         body.servers_json = { all: true };
-        // server_id не заполняем — глобальное правило.
         body.server_id = null;
       } else {
         const ids = Array.isArray(s.ids) ? s.ids : [];
         if (ids.length === 0) throw new Error("выберите хотя бы один сервер");
         body.servers_json = { ids };
-        // Денормализация: для single-server пишем server_id тоже — так
-        // правило находится быстрее при списке в UI и fingerprint
-        // совпадает со старыми checks. Для multi — null.
         body.server_id = ids.length === 1 ? ids[0] : null;
       }
     }
@@ -9284,14 +12555,43 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
   }
 
   const headTitle = title || (isEdit ? "Правка правила алерта" : "Новое правило алерта");
-
-  // Текущий operation_id может отсутствовать в ops (операция удалена).
-  // Показываем fallback-option, чтобы пользователь видел «битое» значение.
   const currentOpId = (cond.operation_id || "").trim();
-  const opInList = ops.some((o) => o.id === currentOpId);
+  const selectedOp = ops.find((o) => o.id === currentOpId) || null;
+  const opInList = !!selectedOp;
   const serversState = editing.servers || { all: true };
   const serversAll = !!serversState.all;
   const serversIds = serversAll ? [] : (serversState.ids || []);
+
+  // Удобный разбор expected для operation_check
+  let expObj = {};
+  let expJsonErr = false;
+  if (kindIsOp) {
+    try {
+      const parsed = JSON.parse(cond.expected_str || '{"exit": 0}');
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) expObj = parsed;
+      else expJsonErr = true;
+    } catch { expJsonErr = true; }
+  }
+  function updateExpected(patch) {
+    const next = { ...expObj, ...patch };
+    if (next.exit === "" || next.exit == null) delete next.exit;
+    else next.exit = Number(next.exit);
+    if (!next.stdout_regex) delete next.stdout_regex;
+    setCond({ expected_str: JSON.stringify(next, null, 2) });
+  }
+
+  // Удобный разбор auto_resolve_json ({"below": N}) для metric_threshold
+  let arObj = null;
+  let arJsonErr = false;
+  if (editing.auto_resolve_json_str && editing.auto_resolve_json_str.trim()) {
+    try {
+      const parsed = JSON.parse(editing.auto_resolve_json_str);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) arObj = parsed;
+      else arJsonErr = true;
+    } catch { arJsonErr = true; }
+  }
+  const thresholdOpKey = ["value_gte", "value_gt", "value_lte", "value_lt"].find((k) => cond[k] != null) || "value_gte";
+  const thresholdVal = cond[thresholdOpKey] ?? 90;
 
   return html`<${Modal} title=${headTitle} onClose=${onClose}
     footer=${html`<div class="row">
@@ -9314,13 +12614,14 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
         <span>${editing.enabled ? "включена" : "выключена"}</span>
       </label>
     </div>
-    <input value=${editing.name}
+    <input placeholder="например: Высокая загрузка CPU"
+           value=${editing.name}
            onInput=${(e) => setEditing({ ...editing, name: e.target.value })} />
 
     <div class="form-section">
       <div class="form-section-title">
         Что отслеживаем
-        <${InfoHint} text="Тип условия определяет, при каком событии создаётся алерт. Менять его у существующего правила нельзя — создайте новое." />
+        <${InfoHint} text="Тип условия определяет механизм проверки. Менять его у уже созданного правила нельзя." />
       </div>
       <${Radio}
         value=${kind}
@@ -9331,12 +12632,12 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
           hint: "— " + k.hint,
         }))} />
       ${isEdit
-        ? html`<span class="muted small">тип условия менять нельзя</span>`
+        ? html`<span class="muted small">тип условия зафиксирован при создании</span>`
         : null}
     </div>
 
     <div class="form-section">
-      <div class="form-section-title">Параметры условия</div>
+      <div class="form-section-title">Условие срабатывания</div>
 
       ${kind === "metric_threshold" ? html`
         <div class="row">
@@ -9344,55 +12645,46 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
             <label>Метрика</label>
             <select value=${cond.metric || "cpu"}
                     onChange=${(e) => setCond({ metric: e.target.value })}>
-              <option value="cpu">CPU</option>
-              <option value="ram">RAM</option>
-              <option value="disk">Диск</option>
-              <option value="load_1m">Load 1m</option>
+              <option value="cpu">CPU (%)</option>
+              <option value="ram">RAM (%)</option>
+              <option value="disk">Диск (%)</option>
+              <option value="load_1m">Load 1m (на 1 ядро)</option>
             </select>
           </div>
           <div style="flex:1">
             <label>Условие</label>
-            <select value=${
-              ["value_gte","value_gt","value_lte","value_lt"].find((k) => cond[k] != null) || "value_gte"
-            }
+            <select value=${thresholdOpKey}
                     onChange=${(e) => {
-                      const prevOp = ["value_gte","value_gt","value_lte","value_lt"].find((k) => cond[k] != null);
-                      const prevVal = prevOp ? cond[prevOp] : 90;
+                      const prevVal = thresholdVal;
                       const next = { ...cond };
                       for (const k of ["value_gte","value_gt","value_lte","value_lt"]) delete next[k];
                       next[e.target.value] = prevVal;
                       setEditing({ ...editing, cond: next });
                     }}>
-              <option value="value_gte"><span class="op-sym">≥</span></option>
-              <option value="value_gt"><span class="op-sym">${">"}</span></option>
-              <option value="value_lte"><span class="op-sym">≤</span></option>
-              <option value="value_lt"><span class="op-sym">${"<"}</span></option>
+              <option value="value_gte"><span class="op-sym">≥</span> (не ниже)</option>
+              <option value="value_gt"><span class="op-sym">${">"}</span> (строго выше)</option>
+              <option value="value_lte"><span class="op-sym">≤</span> (не выше)</option>
+              <option value="value_lt"><span class="op-sym">${"<"}</span> (строго ниже)</option>
             </select>
           </div>
           <div style="flex:1">
-            <label>Значение</label>
-            <input type="number" value=${
-              (() => {
-                const k = ["value_gte","value_gt","value_lte","value_lt"].find((k) => cond[k] != null);
-                return k ? cond[k] : 90;
-              })()
-            }
-                   onInput=${(e) => {
-                     const k = ["value_gte","value_gt","value_lte","value_lt"].find((k) => cond[k] != null) || "value_gte";
-                     setCond({ [k]: e.target.value });
-                   }} />
+            <label>Порог</label>
+            <input type="number" step="any" value=${thresholdVal}
+                   onInput=${(e) => setCond({ [thresholdOpKey]: e.target.value })} />
           </div>
         </div>
-        <span class="muted small">
-          Для Load 1m значение трактуется per-cpu: реальный порог = nproc × значение.
-        </span>
+        ${(cond.metric || "cpu") === "load_1m"
+          ? html`<span class="muted small">
+              Значение задаётся на 1 ядро CPU: реальный порог = <span class="mono">nproc × значение</span>.
+            </span>`
+          : null}
       ` : null}
 
       ${kindIsOp ? html`
         <div class="form-sub">
-          <label>Операция</label>
+          <label>Операция для проверки</label>
           <select value=${currentOpId}
-                  onChange=${(e) => setCond({ operation_id: e.target.value })}>
+                  onChange=${(e) => setCond({ operation_id: e.target.value, params_str: "{}" })}>
             <option value="">— выбрать операцию —</option>
             ${ops.map((o) => html`<option value=${o.id} key=${o.id}>${o.name} (${o.id})</option>`)}
             ${currentOpId && !opInList
@@ -9400,35 +12692,52 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
               : null}
           </select>
         </div>
+        <${OperationParamsFields}
+          op=${selectedOp}
+          paramsStr=${cond.params_str || "{}"}
+          onChangeStr=${(v) => setCond({ params_str: v })}
+          servers=${servers} />
         <div class="form-sub">
-          <label>Параметры операции (JSON)
-            <${InfoHint} text="Значения аргументов операции. У системных операций параметров нет — оставьте {}." />
+          <label>
+            Критерий успеха (иначе создаётся алерт)
+            <${InfoHint} text="Проверка считается пройденной (ok), если код возврата и вывод совпадают с ожидаемыми." />
           </label>
-          <textarea class="mono llm-rule-cond" rows="3"
-                    value=${cond.params_str || "{}"}
-                    onInput=${(e) => setCond({ params_str: e.target.value })}></textarea>
-        </div>
-        <div class="form-sub">
-          <label>Ожидаемый результат (JSON)
-            <${InfoHint} text='Условие успеха. {"exit": 0} — только код возврата. Можно добавить {"exit": 0, "stdout_regex": "active"} для проверки stdout.' />
-          </label>
-          <textarea class="mono llm-rule-cond" rows="3"
-                    value=${cond.expected_str || '{\n  "exit": 0\n}'}
-                    onInput=${(e) => setCond({ expected_str: e.target.value })}></textarea>
+          ${expJsonErr
+            ? html`<textarea class="mono llm-rule-cond" rows="3" value=${cond.expected_str || '{"exit": 0}'}
+                        onInput=${(e) => setCond({ expected_str: e.target.value })}></textarea>`
+            : html`<div class="row">
+                <div style="flex:0 0 140px">
+                  <label>Ожидаемый exit-код</label>
+                  <input type="number" value=${expObj.exit ?? 0}
+                         onInput=${(e) => updateExpected({ exit: e.target.value })} />
+                </div>
+                <div class="grow">
+                  <label>Regex в stdout (опционально)</label>
+                  <input class="mono" placeholder="например active"
+                         value=${expObj.stdout_regex || ""}
+                         onInput=${(e) => updateExpected({ stdout_regex: e.target.value })} />
+                </div>
+              </div>
+              <details>
+                <summary class="muted small">Критерий успеха как JSON</summary>
+                <textarea class="mono llm-rule-cond" rows="3" style="margin-top:6px"
+                          value=${cond.expected_str || '{\n  "exit": 0\n}'}
+                          onInput=${(e) => setCond({ expected_str: e.target.value })}></textarea>
+              </details>`}
         </div>
         <div class="row">
           <div style="flex:0 0 160px">
-            <label>Интервал, сек</label>
+            <label>Интервал запуска, сек</label>
             <input type="number" min="60" max="86400"
                    value=${editing.interval_sec}
                    onInput=${(e) => setEditing({ ...editing, interval_sec: Number(e.target.value) })} />
           </div>
           <span class="muted small" style="align-self:flex-end; padding-bottom:10px">
-            Как часто запускать операцию. 60..86400.
+            ${fmtSecHint(editing.interval_sec)} (допустимо 60..86400 сек)
           </span>
         </div>
         <div class="form-sub">
-          <label>Серверы</label>
+          <label>На каких серверах запускать</label>
           <${Radio}
             value=${serversAll ? "all" : "specific"}
             onChange=${(v) => updateServers(
@@ -9452,42 +12761,44 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
       ${kind === "metric_zscore" ? html`
         <div class="row">
           <div style="flex:1">
-            <label>z_min (нижняя граница, опционально)</label>
+            <label>Отклонение от (z_min, σ)</label>
             <input type="number" step="0.1" value=${cond.z_min ?? ""}
                    onInput=${(e) => setCond({ z_min: e.target.value })} />
           </div>
           <div style="flex:1">
-            <label>z_max (верхняя граница, опционально)</label>
+            <label>До (z_max, опционально)</label>
             <input type="number" step="0.1" value=${cond.z_max ?? ""}
                    onInput=${(e) => setCond({ z_max: e.target.value })} />
           </div>
         </div>
         <span class="muted small">
-          Алерт создаётся, если |z| ≥ z_min. Если задан z_max — только пока z ≤ z_max
-          (используется для разведения warning и critical).
+          Срабатывает при |z| ≥ z_min. Обычно warning: 3.0..4.5, critical: ≥ 4.5.
         </span>
       ` : null}
 
       ${kind === "metric_stale" ? html`
-        <label>Нет метрик N секунд</label>
-        <input type="number" min="30" value=${cond.no_data_sec || 300}
-               onInput=${(e) => setCond({ no_data_sec: e.target.value })} />
-        <span class="muted small">300 = 5 мин, 1800 = 30 мин.</span>
+        <label>Нет метрик дольше, сек</label>
+        <div class="row">
+          <input type="number" min="30" style="max-width:180px"
+                 value=${cond.no_data_sec || 300}
+                 onInput=${(e) => setCond({ no_data_sec: e.target.value })} />
+          <span class="muted small">${fmtSecHint(cond.no_data_sec || 300)} (300 с = 5 мин, 1800 с = 30 мин)</span>
+        </div>
       ` : null}
 
       ${kind === "manual_op_failed" ? html`
-        <label>exit_code ≠</label>
-        <input type="number" value=${cond.exit_ne ?? 0}
+        <label>Считать ошибкой, если код выхода не равен</label>
+        <input type="number" style="max-width:180px" value=${cond.exit_ne ?? 0}
                onInput=${(e) => setCond({ exit_ne: e.target.value })} />
-        <span class="muted small">Обычно 0: алерт, если операция завершилась ненулевым кодом.</span>
+        <span class="muted small">По умолчанию 0: алерт при любом ненулевом exit-коде ручной операции.</span>
       ` : null}
 
       ${kind === "reaction_failed" ? html`
-        <label>Статусы реакции</label>
+        <label>При каких статусах реакции создавать алерт</label>
         <${MultiSelect}
           options=${[
-            { value: "failed", label: "failed" },
-            { value: "timeout", label: "timeout" },
+            { value: "failed", label: "failed (ошибка)" },
+            { value: "timeout", label: "timeout (таймаут)" },
           ]}
           selected=${Array.isArray(cond.status_in) ? cond.status_in : []}
           onChange=${(s) => setCond({ status_in: s })}
@@ -9496,11 +12807,11 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
     </div>
 
     <div class="form-section">
-      <div class="form-section-title">Реакция</div>
+      <div class="form-section-title">Параметры алерта</div>
 
       <div class="row">
         <div style="flex:1">
-          <label>Severity</label>
+          <label>Важность (Severity)</label>
           <select value=${editing.severity}
                   onChange=${(e) => setEditing({ ...editing, severity: e.target.value })}>
             <option value="info">info</option>
@@ -9511,7 +12822,7 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
         ${kindIsOp
           ? null
           : html`<div style="flex:1">
-              <label>Сервер</label>
+              <label>Область (Сервер)</label>
               <select value=${editing.server_id == null ? "" : String(editing.server_id)}
                       onChange=${(e) => setEditing({
                         ...editing,
@@ -9523,24 +12834,60 @@ function AlertRuleEditor({ initial, title, onSubmit, onClose }) {
                 </option>`)}
               </select>
             </div>`}
-        <div style="flex:0 0 140px">
-          <label>Cooldown, сек</label>
+        <div style="flex:0 0 150px">
+          <label>
+            Пауза (Cooldown), сек
+            <${InfoHint} text="Как часто можно повторять/эмитить события по этому правилу." />
+          </label>
           <input type="number" min="0" max="86400" value=${editing.cooldown_sec}
                  onInput=${(e) => setEditing({ ...editing, cooldown_sec: Number(e.target.value) })} />
+          <div class="muted small">${fmtSecHint(editing.cooldown_sec)}</div>
         </div>
       </div>
 
-      ${(kind === "metric_threshold" || kind === "metric_zscore" || kind === "metric_stale")
+      ${kind === "metric_threshold"
         ? html`<div class="form-sub">
-            <label>
-              Auto-resolve (JSON или пусто)
-              <${InfoHint} text='Условие автоматического закрытия алерта. Для threshold: {"below": 90}. Пустое поле = правило не будет сбрасываться автоматически.' />
+            <label class="check">
+              <input type="checkbox"
+                     checked=${!arJsonErr && arObj != null && arObj.below != null}
+                     onChange=${(e) => {
+                       if (e.target.checked) {
+                         const defVal = Number(thresholdVal) || 90;
+                         setEditing({ ...editing, auto_resolve_json_str: JSON.stringify({ below: defVal }) });
+                       } else {
+                         setEditing({ ...editing, auto_resolve_json_str: "" });
+                       }
+                     }} />
+              <span>Закрывать алерт автоматически, когда значение вернётся в норму</span>
             </label>
-            <textarea class="mono llm-rule-cond" rows="2"
+            ${!arJsonErr && arObj != null && arObj.below != null
+              ? html`<div class="row">
+                  <span class="muted small">Закрывать, если значение ниже:</span>
+                  <input type="number" step="any" style="max-width:120px; height:34px"
+                         value=${arObj.below}
+                         onInput=${(e) => {
+                           const v = e.target.value;
+                           const next = { ...arObj, below: v === "" ? "" : Number(v) };
+                           setEditing({ ...editing, auto_resolve_json_str: JSON.stringify(next) });
+                         }} />
+                </div>`
+              : null}
+            <details>
+              <summary class="muted small">Auto-resolve как JSON</summary>
+              <textarea class="mono llm-rule-cond" rows="2" style="margin-top:6px"
+                        placeholder='{"below": 90}'
+                        value=${editing.auto_resolve_json_str}
+                        onInput=${(e) => setEditing({ ...editing, auto_resolve_json_str: e.target.value })}></textarea>
+            </details>
+          </div>`
+        : (kind === "metric_zscore" || kind === "metric_stale")
+        ? html`<details>
+            <summary class="muted small">Дополнительно: auto-resolve JSON (для встроенных правил работает автоматически)</summary>
+            <textarea class="mono llm-rule-cond" rows="2" style="margin-top:6px"
                       placeholder='{"below": 90}'
                       value=${editing.auto_resolve_json_str}
                       onInput=${(e) => setEditing({ ...editing, auto_resolve_json_str: e.target.value })}></textarea>
-          </div>`
+          </details>`
         : null}
 
     </div>
@@ -11088,6 +14435,13 @@ function AppShell() {
         setPendingRuleRid(rid);
       }
     };
+    const onOpenServerFromEv = (ev) => {
+      const sidVal = ev && ev.detail && ev.detail.id;
+      if (typeof sidVal === "number" && sidVal > 0) {
+        setView("dash");
+        setSid(sidVal);
+      }
+    };
     const onApplyRulePatch = (ev) => {
       const p = ev && ev.detail;
       if (!p || typeof p.rule_id !== "number" || !p.patch) return;
@@ -11145,6 +14499,7 @@ function AppShell() {
     window.addEventListener("melecho:toast", onToast);
     window.addEventListener("melecho:llm-open-alert", onOpenAlert);
     window.addEventListener("melecho:llm-open-rule", onOpenRule);
+    window.addEventListener("melecho:open-server", onOpenServerFromEv);
     window.addEventListener("melecho:llm-apply-rule-patch", onApplyRulePatch);
     return () => {
       clearInterval(light);
@@ -11157,6 +14512,7 @@ function AppShell() {
       window.removeEventListener("melecho:toast", onToast);
       window.removeEventListener("melecho:llm-open-alert", onOpenAlert);
       window.removeEventListener("melecho:llm-open-rule", onOpenRule);
+    window.removeEventListener("melecho:open-server", onOpenServerFromEv);
       window.removeEventListener("melecho:llm-apply-rule-patch", onApplyRulePatch);
     };
   }, []);
@@ -11463,7 +14819,7 @@ function AppShell() {
           ].filter(Boolean).join("\n");
           window.dispatchEvent(new CustomEvent("melecho:llm-ask", { detail: { text } }));
         }} />` : null}
-    ${sid ? html`<${ServerView} id=${sid} internetOffline=${!!status?.internet_offline} onBack=${() => setSid(null)} />` : null}
+    ${sid ? html`<${ServerView} id=${sid} llmEnabled=${!!status?.llm_enabled} internetOffline=${!!status?.internet_offline} onBack=${() => setSid(null)} />` : null}
     ${view === "automation" ? html`<${AutomationView}
         autoState=${autoState}
         pendingCount=${pendingReactions}

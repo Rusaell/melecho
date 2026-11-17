@@ -161,25 +161,39 @@ def floor_5m(ts: str) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run_downsample(conn, now: datetime | None = None) -> int:
+def run_downsample(conn, now: datetime | None = None, *, full_scan: bool = False) -> int:
     """Backlog raw 30s → 5m. Returns number of windows written."""
     now = now or datetime.now(timezone.utc)
     written = 0
     servers = [r["id"] for r in conn.execute("SELECT id FROM servers").fetchall()]
     for sid in servers:
-        existing = {
-            r["timestamp_utc"]
-            for r in conn.execute(
-                "SELECT timestamp_utc FROM metrics_history WHERE server_id=? AND resolution='5m'",
-                (sid,),
-            )
-        }
-        rows = conn.execute(
-            """SELECT * FROM metrics_history
-               WHERE server_id=? AND resolution='30s'
-               ORDER BY timestamp_utc""",
+        last_5m_row = conn.execute(
+            "SELECT MAX(timestamp_utc) AS m FROM metrics_history WHERE server_id=? AND resolution='5m'",
             (sid,),
-        ).fetchall()
+        ).fetchone()
+        last_5m = last_5m_row["m"] if last_5m_row else None
+        if full_scan or not last_5m:
+            existing = {
+                r["timestamp_utc"]
+                for r in conn.execute(
+                    "SELECT timestamp_utc FROM metrics_history WHERE server_id=? AND resolution='5m'",
+                    (sid,),
+                )
+            }
+            rows = conn.execute(
+                """SELECT * FROM metrics_history
+                   WHERE server_id=? AND resolution='30s'
+                   ORDER BY timestamp_utc""",
+                (sid,),
+            ).fetchall()
+        else:
+            existing = {last_5m}
+            rows = conn.execute(
+                """SELECT * FROM metrics_history
+                   WHERE server_id=? AND resolution='30s' AND timestamp_utc >= ?
+                   ORDER BY timestamp_utc""",
+                (sid, last_5m),
+            ).fetchall()
         buckets: dict[str, list[dict]] = defaultdict(list)
         for r in rows:
             key = floor_5m(r["timestamp_utc"])

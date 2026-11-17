@@ -34,6 +34,7 @@ from melecho.crypto import (
     aad_cred,
     aad_llm_profile,
     aad_passphrase,
+    aad_ssh_key_file,
     decrypt_secret,
     encrypt_secret,
     generate_audit_key,
@@ -421,7 +422,12 @@ class Runtime:
         from melecho.reactions import ReactionEngine
         self.reactions = ReactionEngine(self)
         self.detector = Detector(cfg)
+        self._apply_detector_settings()
         self.ssh = SSHManager()
+        self._ssh_sem = asyncio.Semaphore(max(1, int(getattr(cfg, "max_parallel_ssh", 10) or 10)))
+        self._internet_check_lock = asyncio.Lock()
+        self._stream_jobs: dict[str, dict] = {}
+        self._stream_tasks: dict[str, asyncio.Task] = {}
         self.dek: bytes | None = None
         self.audit_key: bytes | None = None
         self.bootstrap: str | None = None
@@ -494,6 +500,19 @@ class Runtime:
         Общие поля (events, rate, _bg_tasks, _shutdown_event, ...)
         НЕ трогаем — они живут весь процесс.
         """
+        # 0. Остановить живые потоковые операции.
+        jobs = getattr(self, "_stream_jobs", None) or {}
+        for jid in list(jobs.keys()):
+            try:
+                await self.stop_stream_op(jid)
+            except Exception:
+                pass
+        tasks = getattr(self, "_stream_tasks", None) or {}
+        for t in list(tasks.values()):
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
         # 1. SSH: закрыть все живые сессии этого профиля.
         ssh = getattr(self, "ssh", None)
         if ssh is not None:
@@ -514,7 +533,7 @@ class Runtime:
             # поля (http_port, bind, ...) для переноса на новый профиль.
             # self.cfg всегда указывает на конфиг активного профиля —
             # это и есть «источник процессных параметров».
-            "db", "alerts", "reactions", "catalog", "detector", "ssh",
+            "db", "alerts", "reactions", "catalog", "detector", "ssh", "_ssh_sem", "_internet_check_lock", "_stream_jobs", "_stream_tasks",
             "dek", "audit_key", "bootstrap", "sessions", "sudo",
             "paths", "prev_cpu", "prev_net", "llm", "collect_errors",
             "_collected_servers", "_retry_delay", "_next_collect",
@@ -679,9 +698,10 @@ class Runtime:
         self.require_dek()
         if not isinstance(password, str) or len(password) < 12:
             raise AppError("E_PASSWORD", "пароль архива не короче 12 символов", status=400)
+        src_dir = self.cfg.data_dir or self.cfg.db_path.parent
         try:
             return await asyncio.to_thread(
-                _export, self.cfg.data_dir, self.dek, password,
+                _export, src_dir, self.dek, password,
             )
         except ValueError as e:
             raise AppError("E_PARAM", str(e), status=400) from e
@@ -855,8 +875,6 @@ class Runtime:
                     continue
                 if not self._effective_updates_check_on_start():
                     continue
-                if _upd.detect_install_kind() != "git":
-                    continue
                 if not _upd.should_check(self.cfg.updates_check_interval_hours):
                     continue
                 await self._do_update_check()
@@ -871,7 +889,7 @@ class Runtime:
         from melecho import __version__ as _ver
         self._update_checking = True
         try:
-            tag = _upd.fetch_latest_version(self.cfg.updates_github_repo, 2.0)
+            tag = await asyncio.to_thread(_upd.fetch_latest_version, self.cfg.updates_github_repo, 2.0)
             _upd.touch_cache()
             self._update_last_check_at = now_z()
             self._update_error = None
@@ -1151,6 +1169,19 @@ class Runtime:
         now = time.monotonic()
         if not force and now < self._internet_cache_until:
             return self._internet_cache_result
+        lock = getattr(self, "_internet_check_lock", None)
+        if lock is not None:
+            await lock.acquire()
+        try:
+            now = time.monotonic()
+            if not force and now < self._internet_cache_until:
+                return self._internet_cache_result
+            return await self._internet_handshake_locked(force, now)
+        finally:
+            if lock is not None and lock.locked():
+                lock.release()
+
+    async def _internet_handshake_locked(self, force: bool, now: float) -> bool:
         host = self._effective_internet_check_host()
         port = self._effective_internet_check_port()
         timeout = self.cfg.internet_check_timeout_sec
@@ -1697,7 +1728,18 @@ class Runtime:
             raise AppError("E_LIMIT", "лимит серверов", status=400)
         secret = (body.get("credential") or body.get("password") or "").encode("utf-8")
         passphrase = (body.get("passphrase") or "") or None
-        key_path = os.path.expanduser((body.get("key_path") or "").strip())
+        raw_kp = (body.get("key_path") or "").strip()
+        if raw_kp.startswith("profile:keys/"):
+            p_enc = self._resolve_profile_key_path(raw_kp)
+            if not p_enc.is_file():
+                raise AppError("E_KEY", f"ключ профиля не найден: {raw_kp}", status=400)
+            key_path = raw_kp
+        else:
+            key_path = os.path.expanduser(raw_kp)
+            # Если файл ключа указан — он должен существовать. Это не даёт
+            # опечатке в пути «молча» превратиться в password-only.
+            if key_path and not Path(key_path).is_file():
+                raise AppError("E_KEY", f"файл ключа не найден: {key_path}", status=400)
         # Правило: должен быть хотя бы один способ аутентификации — ключ
         # или пароль. connect_real сам выберет приоритет, если есть оба
         # (publickey → keyboard-interactive → password). auth_type в
@@ -1708,10 +1750,6 @@ class Runtime:
                 "укажите файл ключа или пароль пользователя",
                 status=400,
             )
-        # Если файл ключа указан — он должен существовать. Это не даёт
-        # опечатке в пути «молча» превратиться в password-only.
-        if key_path and not Path(key_path).is_file():
-            raise AppError("E_KEY", f"файл ключа не найден: {key_path}", status=400)
 
         # A2.1: hostkey_mode = legacy | later | confirmed
         hostkey_mode = (body.get("hostkey_mode") or "legacy").strip()
@@ -1819,6 +1857,63 @@ class Runtime:
         sid, alias = await self.db.mutate(fn)
         return self.public_server(self.db.conn.execute("SELECT * FROM servers WHERE id=?", (sid,)).fetchone())
 
+    def _apply_detector_settings(self) -> None:
+        if not hasattr(self, "detector") or self.detector is None:
+            return
+        z_th_raw = self.db.get_setting("detector_z_threshold")
+        ig_raw = self.db.get_setting("detector_ignore_drops")
+        c_raw = self.db.get_setting("detector_abs_cpu")
+        r_raw = self.db.get_setting("detector_abs_ram")
+        d_raw = self.db.get_setting("detector_abs_disk")
+        l_raw = self.db.get_setting("detector_abs_load_1m_per_cpu")
+
+        z_th = float(z_th_raw) if z_th_raw is not None else float(self.cfg.z_threshold)
+        ig = (ig_raw == "1") if ig_raw is not None else bool(getattr(self.cfg, "detector_ignore_drops", True))
+        abs_c = float(c_raw) if c_raw is not None else float(self.cfg.abs_cpu)
+        abs_r = float(r_raw) if r_raw is not None else float(self.cfg.abs_ram)
+        abs_d = float(d_raw) if d_raw is not None else float(self.cfg.abs_disk)
+        abs_l = float(l_raw) if l_raw is not None else float(getattr(self.cfg, "abs_load_1m_per_cpu", 1.5))
+
+        self.detector.apply_tuning(
+            z_threshold=z_th,
+            ignore_drops=ig,
+            abs_cpu=abs_c,
+            abs_ram=abs_r,
+            abs_disk=abs_d,
+            abs_load_1m_per_cpu=abs_l,
+        )
+
+    def _server_interval_sec(self, row) -> int:
+        default_iv = max(5, int(getattr(self.cfg, "metrics_interval_sec", 30) or 30))
+        if row is not None and "metrics_interval_sec" in row.keys():
+            raw = row["metrics_interval_sec"]
+            if raw is not None:
+                try:
+                    return max(5, min(300, int(raw)))
+                except (TypeError, ValueError):
+                    pass
+        return default_iv
+
+    def _server_retention_days(self, row) -> tuple[int, int]:
+        try:
+            g_raw = int(self.db.get_setting("retention.metrics_raw_days") or 3)
+        except (TypeError, ValueError):
+            g_raw = 3
+        try:
+            g_agg = int(self.db.get_setting("retention.metrics_agg_days") or 30)
+        except (TypeError, ValueError):
+            g_agg = 30
+        eff_raw = g_raw
+        eff_agg = g_agg
+        if row is not None:
+            if "retention_raw_days" in row.keys() and row["retention_raw_days"] is not None:
+                v = int(row["retention_raw_days"])
+                eff_raw = 0 if v == 0 else max(1, min(3650, v))
+            if "retention_agg_days" in row.keys() and row["retention_agg_days"] is not None:
+                v = int(row["retention_agg_days"])
+                eff_agg = 0 if v == 0 else max(1, min(3650, v))
+        return eff_raw, eff_agg
+
     def public_server(self, row) -> dict:
         if row is None:
             raise AppError("E_NOT_FOUND", "сервер не найден", status=404)
@@ -1845,11 +1940,44 @@ class Runtime:
         # «недоступен»). Раньше заполнялось только в dashboard(); теперь
         # и здесь — UI-бейдж используется и на детальной странице сервера.
         d["collect_error"] = self.collect_errors.get(row["id"])
-        # anomaly — есть ли активная аномалия по любой метрике сервера.
-        # Detector держит состояние в памяти; после рестарта сбрасывается
-        # (replay из БД частично восстанавливает).
+        # anomaly — есть ли активная аномалия по любой метрике сервера,
+        # и anomalies — конкретные причины из detector.state (работают
+        # даже при выключенном LLM и отключённых Z-score правилах алертов).
         st = self.detector.state.get(row["id"]) or {}
-        d["anomaly"] = any(v.anomaly for v in st.values())
+        anomalies_list = []
+        for m, v in st.items():
+            if not v.anomaly:
+                continue
+            abs_thr = (
+                self.detector._load_threshold(row["id"])
+                if m == "load_1m"
+                else self.detector.abs_thr.get(m)
+            )
+            by_z = (v.last_z >= self.detector.z_threshold) if self.detector.ignore_drops else (abs(v.last_z) >= self.detector.z_threshold)
+            by_abs = abs_thr is not None and v.last_x is not None and v.last_x >= abs_thr
+            reason = "both" if (by_z and by_abs) else ("threshold" if by_abs else "zscore")
+            anomalies_list.append({
+                "metric": m,
+                "label": self._metric_label(m),
+                "value": round(v.last_x, 2) if v.last_x is not None else None,
+                "ewma": round(v.s, 2) if v.s is not None else None,
+                "z_score": round(v.last_z, 2),
+                "z_threshold": self.detector.z_threshold,
+                "abs_threshold": round(abs_thr, 2) if abs_thr is not None else None,
+                "reason": reason,
+            })
+        d["anomaly"] = bool(anomalies_list)
+        d["anomalies"] = anomalies_list
+        raw_iv = row["metrics_interval_sec"] if "metrics_interval_sec" in row.keys() else None
+        raw_ret = row["retention_raw_days"] if "retention_raw_days" in row.keys() else None
+        agg_ret = row["retention_agg_days"] if "retention_agg_days" in row.keys() else None
+        eff_raw_ret, eff_agg_ret = self._server_retention_days(row)
+        d["metrics_interval_sec"] = raw_iv
+        d["effective_metrics_interval_sec"] = self._server_interval_sec(row)
+        d["retention_raw_days"] = raw_ret
+        d["effective_retention_raw_days"] = eff_raw_ret
+        d["retention_agg_days"] = agg_ret
+        d["effective_retention_agg_days"] = eff_agg_ret
         return d
 
     def get_server(self, sid: int):
@@ -1885,6 +2013,37 @@ class Runtime:
                     (1 if il else 0, sid),
                 )
                 changed.append("is_local")
+            if "metrics_interval_sec" in body:
+                raw_iv = body["metrics_interval_sec"]
+                if raw_iv is None or raw_iv == "":
+                    conn.execute("UPDATE servers SET metrics_interval_sec=NULL WHERE id=?", (sid,))
+                elif isinstance(raw_iv, bool):
+                    raise AppError("E_PARAM", "metrics_interval_sec: целое 5..300 или null", status=400)
+                else:
+                    try:
+                        iv = int(raw_iv)
+                    except (TypeError, ValueError) as e:
+                        raise AppError("E_PARAM", "metrics_interval_sec: целое 5..300 или null", status=400) from e
+                    if iv < 5 or iv > 300:
+                        raise AppError("E_PARAM", "metrics_interval_sec: допустимо 5..300 сек", status=400)
+                    conn.execute("UPDATE servers SET metrics_interval_sec=? WHERE id=?", (iv, sid))
+                changed.append("metrics_interval_sec")
+            for col_name in ("retention_raw_days", "retention_agg_days"):
+                if col_name in body:
+                    raw_d = body[col_name]
+                    if raw_d is None or raw_d == "":
+                        conn.execute(f"UPDATE servers SET {col_name}=NULL WHERE id=?", (sid,))
+                    elif isinstance(raw_d, bool):
+                        raise AppError("E_PARAM", f"{col_name}: целое (0 = вечно, 1..3650) или null", status=400)
+                    else:
+                        try:
+                            dv = int(raw_d)
+                        except (TypeError, ValueError) as e:
+                            raise AppError("E_PARAM", f"{col_name}: целое (0 = вечно, 1..3650) или null", status=400) from e
+                        if dv < 0 or dv > 3650:
+                            raise AppError("E_PARAM", f"{col_name}: допустимо 0..3650 дней", status=400)
+                        conn.execute(f"UPDATE servers SET {col_name}=? WHERE id=?", (dv, sid))
+                    changed.append(col_name)
             if "user" in body and body.get("user") is not None:
                 conn.execute(
                     "UPDATE servers SET user=? WHERE id=?",
@@ -1919,9 +2078,16 @@ class Runtime:
                     changed.append("credential_cleared")
             # key_path: None = не трогать; "" = очистить; иначе — валидный путь.
             if "key_path" in body and body.get("key_path") is not None:
-                kp = os.path.expanduser(str(body.get("key_path") or "").strip())
-                if kp and not Path(kp).is_file():
-                    raise AppError("E_KEY", f"файл ключа не найден: {kp}", status=400)
+                raw_kp = str(body.get("key_path") or "").strip()
+                if raw_kp.startswith("profile:keys/"):
+                    p_enc = self._resolve_profile_key_path(raw_kp)
+                    if not p_enc.is_file():
+                        raise AppError("E_KEY", f"ключ профиля не найден: {raw_kp}", status=400)
+                    kp = raw_kp
+                else:
+                    kp = os.path.expanduser(raw_kp)
+                    if kp and not Path(kp).is_file():
+                        raise AppError("E_KEY", f"файл ключа не найден: {kp}", status=400)
                 conn.execute("UPDATE servers SET key_path=? WHERE id=?", (kp or None, sid))
                 changed.append("key_path")
             # passphrase: пустая строка = явная очистка.
@@ -1963,10 +2129,20 @@ class Runtime:
             )
 
         await self.db.mutate(fn)
-        # сбрасываем SSH-сессию — креды могли поменяться
-        await self.ssh.drop(sid)
-        self.paths.invalidate(sid)
-        return self.public_server(self.get_server(sid))
+        # Если поменяли только метрики/имя/is_local — можно не рвать SSH без нужды,
+        # но при смене кредов обязательно дропаем.
+        if any(k in body for k in ("user", "auth_type", "credential", "key_path", "passphrase")):
+            await self.ssh.drop(sid)
+            self.paths.invalidate(sid)
+        updated_row = self.get_server(sid)
+        if "metrics_interval_sec" in body:
+            eff_iv = self._server_interval_sec(updated_row)
+            self.detector.set_interval(sid, eff_iv)
+            self._next_collect[sid] = min(
+                self._next_collect.get(sid, 0.0),
+                time.monotonic() + eff_iv,
+            )
+        return self.public_server(updated_row)
 
     async def delete_server(self, sid: int) -> dict:
         row = self.get_server(sid)
@@ -2040,14 +2216,177 @@ class Runtime:
     # большой файл (или подсунут симлинк на /dev/urandom).
     MAX_KEY_FILE_BYTES = 64 * 1024
 
+    _PROFILE_KEY_PREFIX = "profile:keys/"
+    _PROFILE_KEY_FILE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+    def _profile_keys_dir(self) -> Path:
+        base = self.cfg.data_dir or self.cfg.db_path.parent
+        return Path(base) / "keys"
+
+    def _resolve_profile_key_path(self, ref: str) -> Path:
+        if not ref.startswith(self._PROFILE_KEY_PREFIX):
+            raise AppError("E_KEY", "некорректная ссылка на ключ профиля", status=400)
+        fname = ref[len(self._PROFILE_KEY_PREFIX):]
+        if not fname.endswith(".enc") or "/" in fname or "\\" in fname or ".." in fname:
+            raise AppError("E_KEY", "некорректное имя файла ключа профиля", status=400)
+        if not self._PROFILE_KEY_FILE_RE.match(fname):
+            raise AppError("E_KEY", "недопустимые символы в имени файла ключа", status=400)
+        kdir = self._profile_keys_dir().resolve()
+        target = (kdir / fname).resolve()
+        if target.parent != kdir:
+            raise AppError("E_KEY", "недопустимый путь к ключу профиля", status=400)
+        return target
+
+    def ssh_keys_list(self) -> dict:
+        """Возвращает список зашифрованных ключей профиля и локальных файлов в ~/.ssh (без чтения содержимого)."""
+        profile_keys = []
+        kdir = self._profile_keys_dir()
+        if kdir.is_dir():
+            for p in sorted(kdir.iterdir()):
+                if not p.is_file() or not p.name.endswith(".enc"):
+                    continue
+                if not self._PROFILE_KEY_FILE_RE.match(p.name):
+                    continue
+                profile_keys.append({
+                    "name": p.name[:-4],
+                    "ref": f"{self._PROFILE_KEY_PREFIX}{p.name}",
+                    "size": p.stat().st_size,
+                })
+
+        local_keys = []
+        ssh_dir = Path.home() / ".ssh"
+        skip_names = {"known_hosts", "known_hosts.old", "config", "authorized_keys", "authorized_keys2", "environment", "rc"}
+        if ssh_dir.is_dir():
+            try:
+                entries = sorted(ssh_dir.iterdir())
+            except OSError:
+                entries = []
+            for p in entries:
+                if not p.is_file():
+                    continue
+                if p.name.startswith(".") or p.name.endswith(".pub") or p.name in skip_names:
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size == 0 or st.st_size > self.MAX_KEY_FILE_BYTES:
+                    continue
+                local_keys.append({
+                    "name": p.name,
+                    "path": str(p),
+                })
+
+        return {"profile_keys": profile_keys, "local_keys": local_keys}
+
+    async def ssh_keys_upload(self, filename: str, raw_bytes: bytes) -> dict:
+        """Шифрует приватный SSH-ключ DEK и сохраняет в profiles/<slug>/keys/<name>.enc (0600)."""
+        dek = self.require_dek()
+        if not raw_bytes:
+            raise AppError("E_KEY", "файл ключа пуст", status=400)
+        if len(raw_bytes) > self.MAX_KEY_FILE_BYTES:
+            raise AppError("E_KEY", f"файл ключа слишком большой (максимум {self.MAX_KEY_FILE_BYTES} байт)", status=400)
+
+        head_text = raw_bytes[:512].lstrip()
+        if head_text.startswith((b"ssh-ed25519 ", b"ssh-rsa ", b"ecdsa-sha2-", b"ssh-dss ")) or b"BEGIN PUBLIC KEY" in head_text or b"BEGIN SSH2 PUBLIC KEY" in head_text:
+            raise AppError("E_KEY", "вы загрузили публичный ключ (.pub) — выберите приватный ключ", status=400)
+        if b"PRIVATE KEY" not in raw_bytes and b"BEGIN " not in raw_bytes:
+            raise AppError("E_KEY", "файл не похож на приватный SSH-ключ (нет заголовка BEGIN ... PRIVATE KEY)", status=400)
+
+        base_name = Path(filename or "ssh_key").name
+        stem = re.sub(r"[^A-Za-z0-9._-]", "_", base_name).strip("._-") or "ssh_key"
+        stem = stem[:80]
+
+        kdir = self._profile_keys_dir()
+        kdir.mkdir(parents=True, exist_ok=True)
+        os.chmod(kdir, 0o700)
+
+        cand = stem
+        for i in range(2, 1000):
+            if not (kdir / f"{cand}.enc").exists():
+                break
+            cand = f"{stem}-{i}"
+        else:
+            raise AppError("E_KEY", "не удалось подобрать уникальное имя ключа", status=400)
+
+        enc_path = kdir / f"{cand}.enc"
+        nonce, ct = encrypt_secret(dek, raw_bytes, aad_ssh_key_file(cand))
+        payload = json.dumps({"v": 1, "name": cand, "nonce": nonce, "ct": ct}, ensure_ascii=False)
+        tmp_path = kdir / f".{cand}.enc.tmp"
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, enc_path)
+        os.chmod(enc_path, 0o600)
+
+        await self.audit({
+            "action": "ssh_key.upload",
+            "actor": "admin",
+            "command": None,
+            "duration_ms": 0,
+            "interrupted": False,
+            "operation_id": None,
+            "result_hash": None,
+            "result_meta": {"name": cand},
+            "server_id": None,
+            "sudo_used": False,
+            "timestamp_utc": now_z(),
+        })
+        return {"name": cand, "ref": f"{self._PROFILE_KEY_PREFIX}{cand}.enc"}
+
+    async def ssh_keys_delete(self, name: str) -> dict:
+        self.require_dek()
+        clean = (name or "").strip()
+        if clean.endswith(".enc"):
+            clean = clean[:-4]
+        ref = f"{self._PROFILE_KEY_PREFIX}{clean}.enc"
+        p = self._resolve_profile_key_path(ref)
+        if not p.is_file():
+            raise AppError("E_NOT_FOUND", f"ключ {clean!r} не найден", status=404)
+        used = self.db.conn.execute(
+            "SELECT id, name FROM servers WHERE key_path=?", (ref,)
+        ).fetchall()
+        if used:
+            names = ", ".join(f"{r['name']} (#{r['id']})" for r in used)
+            raise AppError("E_CONFLICT", f"ключ используется серверами: {names}", status=409)
+        p.unlink()
+        await self.audit({
+            "action": "ssh_key.delete",
+            "actor": "admin",
+            "command": None,
+            "duration_ms": 0,
+            "interrupted": False,
+            "operation_id": None,
+            "result_hash": None,
+            "result_meta": {"name": clean},
+            "server_id": None,
+            "sudo_used": False,
+            "timestamp_utc": now_z(),
+        })
+        return {"ok": True}
+
     def _key_bytes(self, row) -> bytes | None:
         try:
             path = row["key_path"] or ""
         except (KeyError, IndexError):
             path = ""
-        path = os.path.expanduser(str(path).strip())
-        if not path:
+        raw_path = str(path).strip()
+        if not raw_path:
             return None
+        if raw_path.startswith(self._PROFILE_KEY_PREFIX):
+            dek = self.require_dek()
+            p_enc = self._resolve_profile_key_path(raw_path)
+            if not p_enc.is_file():
+                raise AppError("E_KEY", f"ключ профиля не найден: {raw_path}", status=400)
+            try:
+                obj = json.loads(p_enc.read_text(encoding="utf-8"))
+                return decrypt_secret(
+                    dek, str(obj["nonce"]), str(obj["ct"]), aad_ssh_key_file(str(obj["name"]))
+                )
+            except AppError:
+                raise
+            except Exception as e:
+                raise AppError("E_KEY", f"не удалось расшифровать ключ профиля: {e}", status=400) from e
+        path = os.path.expanduser(raw_path)
         p = Path(path)
         try:
             st = p.stat()
@@ -2805,7 +3144,7 @@ class Runtime:
         now_mono = time.monotonic()
         stale_keys = [
             k for k, t0 in self.detector._z_ok_since.items()
-            if now_mono - t0 >= 300
+            if k[0] == sid and now_mono - t0 >= 300
         ]
         for (svid, metric) in stale_keys:
             self.detector._z_ok_since.pop((svid, metric), None)
@@ -2822,7 +3161,7 @@ class Runtime:
                         reason=f"z-score < 1.5 в течение 5 мин (метрика {metric})",
                     )
 
-        candidates = self.detector.drain_candidates()
+        candidates = self.detector.drain_candidates(sid)
         if not candidates:
             return
         # Матчинг: z >= 4.5 → critical, 3.0 <= z < 4.5 → warning.
@@ -2832,7 +3171,7 @@ class Runtime:
             if c["kind"] != "anomaly":
                 continue
             z = c["z_score"]
-            rule = rule_crit if z >= 4.5 else rule_warn
+            rule = rule_crit if abs(z) >= 4.5 else rule_warn
             if rule is None:
                 continue
             metric = c["metric"]
@@ -3261,6 +3600,24 @@ class Runtime:
             out["cooldown_sec"] = cd
         if not partial or "enabled" in body:
             out["enabled"] = 1 if body.get("enabled", True) else 0
+        if out.get("condition_kind") == "operation_check":
+            try:
+                _cj_obj = json.loads(out.get("condition_json") or "{}")
+            except Exception:
+                _cj_obj = {}
+            _op_id_chk = (_cj_obj.get("operation_id") or "").strip() if isinstance(_cj_obj, dict) else ""
+            if _op_id_chk:
+                try:
+                    _op_obj = self.catalog.get(_op_id_chk)
+                    if (_op_obj.get("flags") or {}).get("streaming"):
+                        raise AppError(
+                            "E_PARAM",
+                            "потоковую (streaming) операцию нельзя использовать в периодических проверках",
+                            status=400,
+                        )
+                except AppError as _e:
+                    if _e.code == "E_PARAM":
+                        raise
         # operation_check-специфичные поля. Валидируются всегда, если
         # присутствуют в body; при kind != operation_check игнорируются
         # на этапе записи (alert_rule_create смотрит на condition_kind).
@@ -4238,6 +4595,7 @@ class Runtime:
                ORDER BY timestamp_utc DESC LIMIT 1""",
             (sid, ts),
         ).fetchone()
+        self.detector.set_interval(sid, self._server_interval_sec(row))
         self.detector.ingest_raw_point(sid, point, dict(prev_pt) if prev_pt else None)
         await self._flush_detector_alerts(sid)
         # SSE: новая точка метрик. Клиенты (Dashboard, ServerView)
@@ -4251,9 +4609,10 @@ class Runtime:
         return point
 
     def _replay_detector_from_db(self) -> None:
-        rows = self.db.conn.execute("SELECT id, nproc FROM servers").fetchall()
+        rows = self.db.conn.execute("SELECT id, nproc, metrics_interval_sec FROM servers").fetchall()
         for r in rows:
             sid = r["id"]
+            self.detector.set_interval(sid, self._server_interval_sec(r))
             if r["nproc"]:
                 self.detector.set_nproc(sid, int(r["nproc"]))
             pts = self.db.conn.execute(
@@ -4347,6 +4706,12 @@ class Runtime:
 
     async def execute_op(self, oid: str, sid: int, params: dict, use_sudo: bool | None, confirm: bool) -> dict:
         op = self.catalog.get(oid)
+        if op["flags"].get("streaming"):
+            raise AppError(
+                "E_PARAM",
+                "потоковая (streaming) операция запускается только в интерактивном режиме",
+                status=400,
+            )
         if op["flags"].get("requires_confirmation") and not confirm:
             raise AppError("E_CONFIRM", "нужно подтверждение плана", status=400)
         plan = await self.plan_op(oid, sid, params, use_sudo)
@@ -4468,6 +4833,278 @@ class Runtime:
             }
         )
         return {"ok": True, "duration_ms": duration, "sudo_used": sudo_used, "steps": results, "result_hash": rh}
+
+    # ---------- streaming operations (Пункт 4) ----------
+
+    async def start_stream_op(
+        self, oid: str, sid: int, params: dict, use_sudo: bool | None, confirm: bool
+    ) -> dict:
+        op = self.catalog.get(oid)
+        if not op["flags"].get("streaming"):
+            raise AppError("E_PARAM", "операция не является потоковой (flags.streaming)", status=400)
+        if op["flags"].get("requires_confirmation") and not confirm:
+            raise AppError("E_CONFIRM", "нужно подтверждение плана", status=400)
+
+        plan = await self.plan_op(oid, sid, params, use_sudo)
+        row = self.get_server(sid)
+        shell = await self._ensure_shell(sid)
+        env_abs = self.cfg.env_path
+        sudo_abs = self.paths.get(sid, "sudo") or "/usr/bin/sudo"
+
+        # Выполняем preconditions (если есть) штатно через run_step до старта стрима.
+        for st in op.get("preconditions") or []:
+            raw = substitute_argv(st["command"], plan["params"])
+            wants_pre = step_wants_sudo(raw)
+            inner_pre = drop_sudo_prefix(raw) if wants_pre else raw
+            if inner_pre:
+                cached = self.paths.get(sid, inner_pre[0])
+                if cached:
+                    inner_pre = [cached, *inner_pre[1:]]
+            argv_pre = wrap_locale(inner_pre, env_abs, sudo_abs, "n" if wants_pre else None)
+            r_pre = await run_step(shell, argv_pre, self.cfg.step_timeout_sec, None, self.cfg.step_output_bytes)
+            if r_pre.sudo_code == "E_SUDO_REQUIRED":
+                pw = self.sudo_pw(sid)
+                if not pw:
+                    raise AppError("E_SUDO_REQUIRED", f"нужен пароль sudo для {row['llm_alias']}", status=401)
+                argv_s = wrap_locale(inner_pre, env_abs, sudo_abs, "S")
+                r_pre = await run_step(
+                    shell, argv_s, self.cfg.step_timeout_sec,
+                    pw.encode("utf-8") + b"\n", self.cfg.step_output_bytes,
+                )
+            if r_pre.sudo_code and r_pre.sudo_code != "E_SUDO_REQUIRED":
+                raise AppError(r_pre.sudo_code, r_pre.stderr.strip()[:200] or r_pre.sudo_code, status=400)
+            exp = st.get("expect_exit", 0)
+            if exp is not None and r_pre.exit_code != exp:
+                raise AppError("E_STEP", f"precondition завершился с кодом {r_pre.exit_code}", status=400)
+
+        st_main = op["steps"][0]
+        raw = substitute_argv(st_main["command"], plan["params"])
+        wants = step_wants_sudo(raw) or (plan["use_sudo"] and op["flags"].get("escalatable"))
+        inner = drop_sudo_prefix(raw) if step_wants_sudo(raw) else raw
+        if inner:
+            cached = self.paths.get(sid, inner[0])
+            if cached:
+                inner = [cached, *inner[1:]]
+
+        inp = None
+        sudo_used = False
+        mode = None
+        if wants:
+            pw = self.sudo_pw(sid)
+            if pw:
+                mode = "S"
+                inp = pw.encode("utf-8") + b"\n"
+                sudo_used = True
+            else:
+                # Проверяем, пускает ли sudo -n без пароля, до открытия SSE.
+                probe_argv = wrap_locale(["/bin/true"], env_abs, sudo_abs, "n")
+                r_probe = await run_step(shell, probe_argv, 15, None, 4096)
+                if r_probe.sudo_code == "E_SUDO_REQUIRED":
+                    raise AppError("E_SUDO_REQUIRED", f"нужен пароль sudo для {row['llm_alias']}", status=401)
+                if r_probe.sudo_code:
+                    raise AppError(r_probe.sudo_code, r_probe.stderr.strip()[:200] or r_probe.sudo_code, status=400)
+                mode = "n"
+                sudo_used = True
+
+        argv = wrap_locale(inner, env_abs, sudo_abs, mode)
+        proc = await shell.start_stream_argv(argv, input_bytes=inp)
+        max_dur = int(op.get("max_duration_sec") or min(int(self.cfg.op_timeout_sec or 300), 300))
+        job_id = secrets.token_urlsafe(16)
+        sensitive = any(p.get("sensitive") for p in op.get("params") or [])
+        cmd_audit = "<redacted:secret>" if sensitive else ("<redacted:unit>" if "unit" in plan["params"] else shlex_preview(plan))
+
+        job = {
+            "id": job_id,
+            "oid": oid,
+            "sid": sid,
+            "proc": proc,
+            "cmd_audit": cmd_audit,
+            "sudo_used": sudo_used,
+            "max_duration_sec": max_dur,
+            "t0": time.monotonic(),
+            "chunks": [],
+            "cond": asyncio.Condition(),
+            "done": False,
+            "exit_code": None,
+            "interrupted": False,
+            "truncated": False,
+            "duration_ms": 0,
+            "stdout_parts": [],
+            "stderr_parts": [],
+            "total_bytes": 0,
+        }
+        self._prune_stream_jobs()
+        self._stream_jobs[job_id] = job
+        self._stream_tasks[job_id] = asyncio.create_task(
+            self._run_stream_job(job),
+            name=f"melecho.op_stream.{job_id}",
+        )
+        return {"job_id": job_id, "max_duration_sec": max_dur}
+
+    async def _run_stream_job(self, job: dict) -> None:
+        proc = job["proc"]
+        limit_bytes = int(self.cfg.step_output_bytes or 1048576)
+        max_dur = float(job["max_duration_sec"])
+
+        async def _pump(stream_name: str, reader_fn):
+            while True:
+                txt = await reader_fn(4096)
+                if not txt:
+                    break
+                b_len = len(txt.encode("utf-8", "replace"))
+                async with job["cond"]:
+                    if job["total_bytes"] + b_len > limit_bytes:
+                        remain = max(0, limit_bytes - job["total_bytes"])
+                        if remain > 0:
+                            cut = txt.encode("utf-8", "replace")[:remain].decode("utf-8", "ignore")
+                            if cut:
+                                job["chunks"].append({"type": "chunk", "stream": stream_name, "text": cut})
+                                if stream_name == "stdout":
+                                    job["stdout_parts"].append(cut)
+                                else:
+                                    job["stderr_parts"].append(cut)
+                        job["total_bytes"] = limit_bytes
+                        job["truncated"] = True
+                        job["interrupted"] = True
+                        job["cond"].notify_all()
+                        await proc.stop()
+                        break
+                    job["total_bytes"] += b_len
+                    job["chunks"].append({"type": "chunk", "stream": stream_name, "text": txt})
+                    if stream_name == "stdout":
+                        job["stdout_parts"].append(txt)
+                    else:
+                        job["stderr_parts"].append(txt)
+                    job["cond"].notify_all()
+
+        t_out = asyncio.create_task(_pump("stdout", proc.read_stdout))
+        t_err = asyncio.create_task(_pump("stderr", proc.read_stderr))
+        try:
+            await asyncio.wait_for(asyncio.gather(t_out, t_err), timeout=max_dur)
+        except asyncio.TimeoutError:
+            job["interrupted"] = True
+            await proc.stop()
+            for t in (t_out, t_err):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(t_out, t_err, return_exceptions=True)
+        except asyncio.CancelledError:
+            job["interrupted"] = True
+            await proc.stop()
+            for t in (t_out, t_err):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(t_out, t_err, return_exceptions=True)
+            raise
+        except Exception:
+            job["interrupted"] = True
+            await proc.stop()
+            for t in (t_out, t_err):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(t_out, t_err, return_exceptions=True)
+
+        exit_code = await proc.wait_exit()
+        duration_ms = int((time.monotonic() - job["t0"]) * 1000)
+        stdout_full = "".join(job["stdout_parts"])
+        stderr_full = "".join(job["stderr_parts"])
+        rh = sha256_text(stdout_full, stderr_full)
+
+        try:
+            await self.audit({
+                "action": "execute",
+                "actor": "admin",
+                "command": job["cmd_audit"],
+                "duration_ms": duration_ms,
+                "interrupted": bool(job["interrupted"]),
+                "operation_id": job["oid"],
+                "result_hash": rh,
+                "result_meta": {"exit": exit_code, "sudo": job["sudo_used"]} if job["sudo_used"] else {"exit": exit_code},
+                "server_id": job["sid"],
+                "sudo_used": job["sudo_used"],
+                "timestamp_utc": now_z(),
+            })
+        except Exception:
+            log.exception("stream job audit failed job=%s", job["id"])
+
+        async with job["cond"]:
+            job["exit_code"] = exit_code
+            job["duration_ms"] = duration_ms
+            job["finished_mono"] = time.monotonic()
+            job["done"] = True
+            job["cond"].notify_all()
+        self._prune_stream_jobs()
+
+    def _prune_stream_jobs(self, max_keep: int = 10, ttl_sec: float = 300.0) -> None:
+        now = time.monotonic()
+        finished = [
+            (jid, j.get("finished_mono") or 0.0)
+            for jid, j in self._stream_jobs.items()
+            if j.get("done")
+        ]
+        for jid, fin_t in finished:
+            if now - fin_t > ttl_sec:
+                self._stream_jobs.pop(jid, None)
+                self._stream_tasks.pop(jid, None)
+        remaining = [
+            (jid, j.get("finished_mono") or 0.0)
+            for jid, j in self._stream_jobs.items()
+            if j.get("done")
+        ]
+        if len(remaining) > max_keep:
+            remaining.sort(key=lambda x: x[1])
+            for jid, _ in remaining[:-max_keep]:
+                self._stream_jobs.pop(jid, None)
+                self._stream_tasks.pop(jid, None)
+
+    async def stop_stream_op(self, job_id: str) -> dict:
+        job = self._stream_jobs.get(job_id)
+        if job is None:
+            raise AppError("E_NOT_FOUND", "поток операции не найден", status=404)
+        if not job["done"]:
+            job["interrupted"] = True
+            await job["proc"].stop()
+        return {"ok": True}
+
+    def stream_op_events(self, job_id: str):
+        job = self._stream_jobs.get(job_id)
+        if job is None:
+            raise AppError("E_NOT_FOUND", "поток операции не найден", status=404)
+
+        async def _gen():
+            idx = 0
+            try:
+                while True:
+                    if self._shutdown_event.is_set():
+                        await self.stop_stream_op(job_id)
+                        break
+                    async with job["cond"]:
+                        while idx >= len(job["chunks"]) and not job["done"]:
+                            if self._shutdown_event.is_set():
+                                break
+                            try:
+                                await asyncio.wait_for(job["cond"].wait(), timeout=5.0)
+                            except asyncio.TimeoutError:
+                                yield b": ping\n\n"
+                        while idx < len(job["chunks"]):
+                            yield _sse_event(job["chunks"][idx])
+                            idx += 1
+                        if job["done"]:
+                            yield _sse_event({
+                                "type": "done",
+                                "exit": job["exit_code"],
+                                "duration_ms": job["duration_ms"],
+                                "interrupted": job["interrupted"],
+                                "truncated": job["truncated"],
+                                "stdout": "".join(job["stdout_parts"]),
+                                "stderr": "".join(job["stderr_parts"]),
+                            })
+                            break
+            except asyncio.CancelledError:
+                await self.stop_stream_op(job_id)
+                raise
+
+        return _gen()
 
     # ---------- user operations (Should, iter 2) ----------
     #
@@ -4941,6 +5578,153 @@ class Runtime:
                 log.warning("не удалось расшифровать LLM API-ключ")
         return env or None
 
+    # ---------- automation graph (Пункт 6) ----------
+
+    def automation_graph(self) -> dict:
+        """Топология системы для графа связей: серверы, операции, правила, реакции."""
+        # 1. Серверы
+        servers = []
+        for r in self.db.conn.execute(
+            "SELECT id, name, llm_alias, host, port, is_local, last_seen_at, host_key_mismatch_at FROM servers ORDER BY id"
+        ).fetchall():
+            sid = r["id"]
+            ac = self.db.conn.execute(
+                """SELECT COUNT(*) AS c FROM alerts
+                   WHERE server_id=? AND status IN ('open','reacting','pending_confirmation','acknowledged')""",
+                (sid,),
+            ).fetchone()["c"]
+            st = self.detector.state.get(sid) or {}
+            anomaly = any(v.anomaly for v in st.values())
+            offline = sid in self._server_offline
+            kh = self.active_host_key(r["host"], r["port"])
+            has_hk = kh is not None
+            mismatch = bool(r["host_key_mismatch_at"]) if "host_key_mismatch_at" in r.keys() else False
+
+            if mismatch:
+                st_kind = "danger"
+                st_lbl = "host key mismatch"
+            elif not has_hk:
+                st_kind = "warn"
+                st_lbl = "не подтверждён"
+            elif offline:
+                st_kind = "warn"
+                st_lbl = "недоступен"
+            elif anomaly:
+                st_kind = "danger"
+                st_lbl = "аномалия"
+            else:
+                st_kind = "ok"
+                st_lbl = "ok"
+
+            servers.append({
+                "id": sid,
+                "name": r["name"],
+                "llm_alias": r["llm_alias"],
+                "is_local": bool(r["is_local"]),
+                "last_seen_at": r["last_seen_at"],
+                "active_alerts_count": int(ac or 0),
+                "anomaly": anomaly,
+                "offline": offline,
+                "hostkey": has_hk,
+                "host_key_mismatch": mismatch,
+                "status_kind": st_kind,
+                "status_label": st_lbl,
+            })
+
+        # 2. Операции
+        ops = []
+        for op in self.catalog.list():
+            oid = op["id"]
+            links_data = self.links_get(oid) if oid.startswith("user:") else {
+                "operation_id": oid, "is_global": True, "server_ids": [], "is_unbound": False,
+            }
+            ops.append({
+                "id": oid,
+                "name": op["name"],
+                "category": op.get("category") or "other",
+                "source": op.get("source", "system"),
+                "valid": op.get("valid", True),
+                "flags": op.get("flags") or {},
+                "display": op.get("display"),
+                "is_global": bool(links_data.get("is_global")),
+                "is_unbound": bool(links_data.get("is_unbound")),
+                "server_ids": list(links_data.get("server_ids") or []),
+            })
+
+        # 3. Правила алертов
+        alert_rules = []
+        for r in self.db.conn.execute("SELECT * FROM alert_rules ORDER BY id").fetchall():
+            rid = r["id"]
+            ac = self.db.conn.execute(
+                """SELECT COUNT(*) AS c FROM alerts
+                   WHERE rule_id=? AND status IN ('open','reacting','pending_confirmation','acknowledged')""",
+                (rid,),
+            ).fetchone()["c"]
+            cj = {}
+            try:
+                cj = json.loads(r["condition_json"] or "{}")
+            except Exception:
+                pass
+            sj = {}
+            try:
+                sj = json.loads(r["servers_json"] or "{}")
+            except Exception:
+                pass
+            op_target = cj.get("operation_id") if r["condition_kind"] == "operation_check" else None
+            alert_rules.append({
+                "id": rid,
+                "name": r["name"],
+                "condition_kind": r["condition_kind"],
+                "severity": r["severity"],
+                "enabled": bool(r["enabled"]),
+                "builtin": bool(r["builtin"]),
+                "server_id": r["server_id"],
+                "servers_json": sj,
+                "operation_id": op_target,
+                "last_result": r["last_result"],
+                "active_alerts_count": int(ac or 0),
+            })
+
+        # 4. Правила реакций
+        reaction_rules = []
+        for r in self.db.conn.execute("SELECT * FROM reaction_rules ORDER BY id").fetchall():
+            rid = r["id"]
+            mj = {}
+            try:
+                mj = json.loads(r["match_json"] or "{}")
+            except Exception:
+                pass
+            stat = self.db.conn.execute(
+                """SELECT
+                     SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok,
+                     SUM(CASE WHEN status IN ('failed','timeout') THEN 1 ELSE 0 END) AS fail,
+                     SUM(CASE WHEN status='pending_confirmation' THEN 1 ELSE 0 END) AS pending
+                   FROM reactions WHERE rule_id=?""",
+                (rid,),
+            ).fetchone()
+            reaction_rules.append({
+                "id": rid,
+                "name": r["name"],
+                "enabled": bool(r["enabled"]),
+                "operation_id": r["operation_id"],
+                "action_policy": r["action_policy"],
+                "sudo_mode": r["sudo_mode"],
+                "run_on_server": r["run_on_server"],
+                "match": mj,
+                "stats": {
+                    "ok": int(stat["ok"] or 0),
+                    "fail": int(stat["fail"] or 0),
+                    "pending": int(stat["pending"] or 0),
+                },
+            })
+
+        return {
+            "servers": servers,
+            "operations": ops,
+            "alert_rules": alert_rules,
+            "reaction_rules": reaction_rules,
+        }
+
     # ---------- emergency stop (глобальный kill switch) ----------
 
     def emergency_state(self) -> dict:
@@ -5084,48 +5868,67 @@ class Runtime:
     # превратит SSE-эндпоинт в мусор).
     _RESERVED_BODY_KEYS = frozenset({"model", "messages", "stream", "max_tokens"})
 
-    # Максимумы для истории suggest-стримов. Числа выбраны так, чтобы
-    # prompt оставался в разумных рамках: 6 сообщений × 2000 символов =
-    # 12000 символов — обычно в разы меньше, потому что реальные описания
-    # 100-500 символов, а ответы ассистента короткие.
-    _HISTORY_MAX_MESSAGES = 6
-    _HISTORY_MAX_CHARS_PER_MSG = 2000
     _HISTORY_ROLES = ("user", "assistant")
+    _OOM_MAX_MESSAGES = 500
+    _OOM_MAX_CHARS = 500_000
+
+    def _llm_context_settings(self) -> dict:
+        def _int_s(key: str, default: int) -> int:
+            raw = self.db.get_setting(key)
+            if raw is None:
+                return default
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                return default
+
+        cross_raw = self.db.get_setting("llm_context_cross_mode")
+        cross_mode = True if cross_raw is None else (cross_raw == "1")
+        return {
+            "llm_context_max_messages": _int_s("llm_context_max_messages", 20),
+            "llm_context_max_chars": _int_s("llm_context_max_chars", 32000),
+            "llm_context_cross_mode": cross_mode,
+        }
 
     def _validate_history(self, raw) -> list[dict] | None:
-        """Валидирует history из body suggest-эндпоинтов.
-
-        Ожидаем: list[{role, content}]. Роли — user|assistant (system
-        отбрасываем: в suggest-промпте system-сообщений быть не должно,
-        там всё в тексте). Пустые/некорректные элементы отбрасываем
-        молча — это UX-подсказка, а не security-вход. Если после чистки
-        ничего не осталось — None.
-
-        Возвращаем копию в исходном порядке; берём ПОСЛЕДНИЕ N сообщений
-        (то есть если пришло больше 6 — оставляем самые свежие)."""
+        """Валидирует history с учётом настроенных лимитов контекста."""
         if not isinstance(raw, list):
             return None
+        ctx = self._llm_context_settings()
+        max_msgs = ctx["llm_context_max_messages"] or self._OOM_MAX_MESSAGES
+        max_chars = ctx["llm_context_max_chars"] or self._OOM_MAX_CHARS
+        max_msgs = min(max_msgs, self._OOM_MAX_MESSAGES)
+        max_chars = min(max_chars, self._OOM_MAX_CHARS)
+
         cleaned: list[dict] = []
         for item in raw:
             if not isinstance(item, dict):
                 continue
             role = item.get("role")
             content = item.get("content")
-            if role not in self._HISTORY_ROLES:
-                continue
-            if not isinstance(content, str):
+            if role not in self._HISTORY_ROLES or not isinstance(content, str):
                 continue
             text = content.strip()
             if not text:
                 continue
-            if len(text) > self._HISTORY_MAX_CHARS_PER_MSG:
-                text = text[: self._HISTORY_MAX_CHARS_PER_MSG] + "…"
             cleaned.append({"role": role, "content": text})
         if not cleaned:
             return None
-        if len(cleaned) > self._HISTORY_MAX_MESSAGES:
-            cleaned = cleaned[-self._HISTORY_MAX_MESSAGES:]
-        return cleaned
+        if len(cleaned) > max_msgs:
+            cleaned = cleaned[-max_msgs:]
+        # Подрезаем с конца по суммарному лимиту символов, сохраняя самые свежие сообщения
+        kept: list[dict] = []
+        total = 0
+        for m in reversed(cleaned):
+            ln = len(m["content"])
+            if total + ln > max_chars:
+                if not kept:
+                    kept.append({"role": m["role"], "content": m["content"][-max_chars:]})
+                break
+            kept.append(m)
+            total += ln
+        kept.reverse()
+        return kept or None
 
     def _validate_extra_params(self, raw) -> dict | None:
         """Валидирует extra_params из UI.
@@ -5380,29 +6183,12 @@ class Runtime:
         self._apply_llm()
         return {"ok": True, "active_id": pid}
 
-    # Максимум сообщений и символов на один чат-запрос. Ставим разумные
-    # границы, чтобы пользователь (или баг фронта) не залил в LLM мегабайты.
     CHAT_MAX_MESSAGES = 32
     CHAT_MAX_CHARS = 16000
     CHAT_ROLES = {"system", "user", "assistant"}
 
     def validate_chat_request(self, body: dict) -> tuple[list[dict], int]:
-        """Полная параметрическая валидация тела POST /llm/chat.
-
-        Вызывается из HTTP-эндпоинта ДО старта StreamingResponse — чтобы
-        неправильный формат возвращался как обычный JSON 400, а не как
-        SSE-событие error уже после отправки 200.
-
-        Возвращает (нормализованные messages, max_tokens).
-
-        Отклоняет:
-        - не-dict тело;
-        - messages не список / пустой / больше CHAT_MAX_MESSAGES;
-        - элемент messages не dict, роль вне {system, user, assistant};
-        - content не непустая строка, длиннее CHAT_MAX_CHARS;
-        - суммарный размер больше CHAT_MAX_CHARS;
-        - max_tokens не число.
-        """
+        """Параметрическая валидация тела POST /llm/chat с учётом настроек контекста."""
         if not isinstance(body, dict):
             raise AppError("E_PARAM", "тело должно быть объектом", status=400)
         messages = body.get("messages")
@@ -5410,9 +6196,17 @@ class Runtime:
             raise AppError("E_PARAM", "messages: ожидается список", status=400)
         if not messages:
             raise AppError("E_PARAM", "messages: пустой список", status=400)
-        if len(messages) > self.CHAT_MAX_MESSAGES:
+
+        ctx = self._llm_context_settings()
+        cfg_msgs = ctx["llm_context_max_messages"]
+        cfg_chars = ctx["llm_context_max_chars"]
+        # Запас +2 на текущее сообщение/system и +16000 символов на текущий ввод пользователя
+        limit_msgs = self._OOM_MAX_MESSAGES if cfg_msgs == 0 else min(self._OOM_MAX_MESSAGES, max(self.CHAT_MAX_MESSAGES, cfg_msgs + 2))
+        limit_chars = self._OOM_MAX_CHARS if cfg_chars == 0 else min(self._OOM_MAX_CHARS, max(self.CHAT_MAX_CHARS, cfg_chars + 16000))
+
+        if len(messages) > limit_msgs:
             raise AppError(
-                "E_PARAM", f"messages: максимум {self.CHAT_MAX_MESSAGES} сообщений", status=400
+                "E_PARAM", f"messages: максимум {limit_msgs} сообщений", status=400
             )
         out: list[dict] = []
         total = 0
@@ -5427,17 +6221,17 @@ class Runtime:
             content = m.get("content")
             if not isinstance(content, str) or not content.strip():
                 raise AppError("E_PARAM", f"messages[{i}].content: непустая строка", status=400)
-            if len(content) > self.CHAT_MAX_CHARS:
+            if len(content) > limit_chars:
                 raise AppError(
                     "E_PARAM",
-                    f"messages[{i}].content: > {self.CHAT_MAX_CHARS} символов",
+                    f"messages[{i}].content: > {limit_chars} символов",
                     status=400,
                 )
             total += len(content)
             out.append({"role": role, "content": content})
-        if total > self.CHAT_MAX_CHARS:
+        if total > limit_chars:
             raise AppError(
-                "E_PARAM", f"суммарный размер сообщений > {self.CHAT_MAX_CHARS} символов", status=400
+                "E_PARAM", f"суммарный размер сообщений > {limit_chars} символов", status=400
             )
         raw_mt = body.get("max_tokens", 400)
         if isinstance(raw_mt, bool):
@@ -5450,7 +6244,7 @@ class Runtime:
         # чтобы дать запас reasoning-моделям (Gemma тратит до 12K токенов
         # на <thought> прежде чем сформировать ответ). Клиент сейчас
         # просит 4000, но если поднимет — не упрёмся в наш лимит.
-        max_tokens = max(8, min(max_tokens, 8000))
+        max_tokens = max(8, min(max_tokens, 32768))
         return out, max_tokens
 
     def _parse_user_op_yaml_safe(self, yaml_text: str) -> tuple[str | None, dict | None, str | None]:
@@ -5954,7 +6748,7 @@ class Runtime:
         saved_timeout = self.llm.timeout
         self.llm.timeout = max(saved_timeout, 600)
         try:
-            text, tin, tout, raw_text = await self.llm.complete(prompt, max_tokens=16000)
+            text, tin, tout, raw_text = await self.llm.complete(prompt, max_tokens=32768)
         finally:
             self.llm.timeout = saved_timeout
 
@@ -6137,7 +6931,7 @@ class Runtime:
         saved_timeout = self.llm.timeout
         self.llm.timeout = max(saved_timeout, 600)
         try:
-            text, tin, tout, raw_text = await self.llm.complete(prompt, max_tokens=16000)
+            text, tin, tout, raw_text = await self.llm.complete(prompt, max_tokens=32768)
         finally:
             self.llm.timeout = saved_timeout
 
@@ -6276,7 +7070,7 @@ class Runtime:
             # При 4000 модель упиралась в лимит ДО того, как закрывала
             # тег reasoning. 16000 — безопасный запас.
             text, tin, tout, raw_text = await self.llm.complete(
-                prompt, max_tokens=16000,
+                prompt, max_tokens=32768,
             )
         finally:
             self.llm.timeout = saved_timeout
@@ -6375,32 +7169,22 @@ class Runtime:
                          prompt_hash, которые добавляет common);
           audit_status — "ok" | "invalid" | "invalid_yaml" — статус для llm_audit.
         """
-        # Если пришла история — вставляем её ПЕРЕД задачей. Маркер
-        # "ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:" есть во всех 4 промптах ровно один раз
-        # (проверено в app/llm.py: build_suggest_operation_prompt,
-        # build_suggest_alert_prompt, build_suggest_reaction_prompt,
-        # build_edit_rule_prompt). Используем rfind на случай, если
-        # пользователь напишет ту же фразу в описании — берём последнее.
-        if history:
-            lines = [
-                "ПРЕДЫДУЩИЙ ДИАЛОГ (контекст задачи; НЕ отвечай отдельно на",
-                "эти сообщения, используй их только чтобы понять текущую",
-                "задачу):",
-            ]
-            for m in history:
-                who = "Пользователь" if m["role"] == "user" else "Ассистент"
-                lines.append(f"{who}: {m['content']}")
-            dialog_block = "\n".join(lines) + "\n\n"
-            marker = "ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:"
-            idx = prompt.rfind(marker)
-            if idx >= 0:
-                prompt = prompt[:idx] + dialog_block + prompt[idx:]
-            else:
-                # На всякий случай: если маркер пропал (кто-то отредактирует
-                # промпты), историю всё равно не теряем — добавляем в конец.
-                prompt = prompt + "\n\n" + dialog_block.rstrip()
+        marker = "ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:"
+        idx = prompt.rfind(marker)
+        if idx >= 0:
+            sys_part = prompt[:idx].strip()
+            user_part = prompt[idx:].strip()
+            messages_to_send = [{"role": "system", "content": sys_part}]
+            if history:
+                messages_to_send.extend(history)
+            messages_to_send.append({"role": "user", "content": user_part})
+        else:
+            messages_to_send = []
+            if history:
+                messages_to_send.extend(history)
+            messages_to_send.append({"role": "user", "content": prompt})
 
-        ph = prompt_hash(prompt)
+        ph = prompt_hash(json.dumps(messages_to_send, ensure_ascii=False))
         provider = self.llm.provider
         model = self.llm.model
 
@@ -6456,56 +7240,96 @@ class Runtime:
 
             saved_timeout = self.llm.timeout
             self.llm.timeout = max(saved_timeout, 600)
+            delays = [1.0, 2.0, 2.0]
+            streamed_any = False
             try:
-                async for chunk in self.llm.stream_messages(
-                    [{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
-                ):
-                    if not chunk:
-                        continue
-                    full_parts.append(chunk)
-                    line_buf += chunk
-                    while "\n" in line_buf:
-                        line, line_buf = line_buf.split("\n", 1)
-                        for ev in _process_line(line, in_line=in_line_emitted):
-                            yield ev
-                        in_line_emitted = False
-                    # Хвост без \n.
-                    #
-                    # in_block=True: ждём \n. Внутри блока нельзя отличить
-                    # частичный ``` от частичного содержимого, а block_body
-                    # должен собираться целиком — иначе первая строка
-                    # YAML-блока («id: ...») утекает как обычный chunk
-                    # и теряется из содержимого блока.
-                    #
-                    # in_block=False:
-                    #   - in_line_emitted: строка уже начала эмититься как
-                    #     chunk (мы отдали её безопасный префикс) — фенс
-                    #     в середине невозможен, продолжаем сразу;
-                    #   - иначе: если начало строки не может быть фенсом,
-                    #     эмитим сразу (снимает «одним куском» для случая,
-                    #     когда провайдер шлёт абзац без \n).
-                    if line_buf and not in_block:
-                        if in_line_emitted:
-                            yield _sse_event({"type": "chunk", "text": line_buf})
-                            line_buf = ""
+                for attempt in range(1, 4):
+                    full_parts = []
+                    line_buf = ""
+                    in_line_emitted = False
+                    in_block = False
+                    block_lang = ""
+                    block_body = []
+                    block_raw = []
+                    block_emitted = False
+                    last_think_ts = 0.0
+                    try:
+                        if hasattr(self.llm, "stream_events"):
+                            src_iter = self.llm.stream_events(messages_to_send, max_tokens=max_tokens)
                         else:
-                            safe = _safe_prefix_len(line_buf)
-                            if safe > 0:
-                                piece = line_buf[:safe]
-                                line_buf = line_buf[safe:]
-                                in_line_emitted = True
-                                yield _sse_event({"type": "chunk", "text": piece})
-            except AppError as e:
-                yield _sse_event({"type": "error", "code": e.code, "message": e.message})
-                return
-            except Exception:
-                log.exception("suggest stream error")
-                yield _sse_event({
-                    "type": "error", "code": "E_INTERNAL",
-                    "message": "внутренняя ошибка стрима",
-                })
-                return
+                            async def _wrap_sug():
+                                async for c in self.llm.stream_messages(messages_to_send, max_tokens=max_tokens):
+                                    yield ("chunk", c)
+                            src_iter = _wrap_sug()
+                        async for kind, chunk in src_iter:
+                            if kind == "thinking":
+                                now_t = time.monotonic()
+                                if not streamed_any and now_t - last_think_ts >= 1.0:
+                                    last_think_ts = now_t
+                                    yield _sse_event({"type": "thinking"})
+                                continue
+                            if kind != "chunk" or not chunk:
+                                continue
+                            streamed_any = True
+                            full_parts.append(chunk)
+                            line_buf += chunk
+                            while "\n" in line_buf:
+                                line, line_buf = line_buf.split("\n", 1)
+                                for ev in _process_line(line, in_line=in_line_emitted):
+                                    yield ev
+                                in_line_emitted = False
+                            if line_buf and not in_block:
+                                if in_line_emitted:
+                                    yield _sse_event({"type": "chunk", "text": line_buf})
+                                    line_buf = ""
+                                else:
+                                    safe = _safe_prefix_len(line_buf)
+                                    if safe > 0:
+                                        piece = line_buf[:safe]
+                                        line_buf = line_buf[safe:]
+                                        in_line_emitted = True
+                                        yield _sse_event({"type": "chunk", "text": piece})
+                        break
+                    except AppError as e:
+                        if not streamed_any and attempt < 3:
+                            delay = delays[attempt - 1]
+                            log.warning(
+                                "suggest stream attempt %d/3 failed (%s), retrying in %.1fs...",
+                                attempt, e.code, delay,
+                            )
+                            yield _sse_event({
+                                "type": "retry",
+                                "attempt": attempt,
+                                "max_attempts": 3,
+                                "delay": delay,
+                                "error": e.message,
+                            })
+                            await asyncio.sleep(delay)
+                            continue
+                        yield _sse_event({"type": "error", "code": e.code, "message": e.message})
+                        return
+                    except Exception as e:
+                        if not streamed_any and attempt < 3:
+                            delay = delays[attempt - 1]
+                            log.warning(
+                                "suggest stream attempt %d/3 unexpected error (%s), retrying in %.1fs...",
+                                attempt, e, delay,
+                            )
+                            yield _sse_event({
+                                "type": "retry",
+                                "attempt": attempt,
+                                "max_attempts": 3,
+                                "delay": delay,
+                                "error": "внутренняя ошибка стрима",
+                            })
+                            await asyncio.sleep(delay)
+                            continue
+                        log.exception("suggest stream error")
+                        yield _sse_event({
+                            "type": "error", "code": "E_INTERNAL",
+                            "message": "внутренняя ошибка стрима",
+                        })
+                        return
             finally:
                 self.llm.timeout = saved_timeout
 
@@ -6618,7 +7442,7 @@ class Runtime:
             prompt=prompt,
             role_label="suggest_user_operation",
             data_category="operation_draft",
-            max_tokens=16000,
+            max_tokens=32768,
             parse_fn=_parse,
             history=self._validate_history(history),
         )
@@ -6753,7 +7577,7 @@ class Runtime:
             prompt=prompt,
             role_label="suggest_alert_rule",
             data_category="alert_rule_draft",
-            max_tokens=16000,
+            max_tokens=32768,
             parse_fn=_parse,
             history=self._validate_history(history),
         )
@@ -6861,7 +7685,7 @@ class Runtime:
             prompt=prompt,
             role_label="suggest_reaction_rule",
             data_category="reaction_rule_draft",
-            max_tokens=16000,
+            max_tokens=32768,
             parse_fn=_parse,
             history=self._validate_history(history),
         )
@@ -7017,8 +7841,59 @@ class Runtime:
                 conn.execute("UPDATE llm_profiles SET last_used_at=? WHERE id=?", (ts, pid))
 
             await self.db.mutate(_mark)
-        async for chunk in self.llm.stream_messages(full_messages, max_tokens=max_tokens):
-            yield chunk
+
+        saved_timeout = self.llm.timeout
+        self.llm.timeout = max(saved_timeout, 180)
+        delays = [1.0, 2.0, 2.0]
+        try:
+            for attempt in range(1, 4):
+                streamed_any = False
+                last_think_ts = 0.0
+                try:
+                    if hasattr(self.llm, "stream_events"):
+                        src_iter = self.llm.stream_events(full_messages, max_tokens=max_tokens)
+                    else:
+                        async def _wrap_chat():
+                            async for c in self.llm.stream_messages(full_messages, max_tokens=max_tokens):
+                                yield ("chunk", c)
+                        src_iter = _wrap_chat()
+                    async for kind, chunk in src_iter:
+                        if kind == "thinking":
+                            now_t = time.monotonic()
+                            if not streamed_any and now_t - last_think_ts >= 1.0:
+                                last_think_ts = now_t
+                                yield {"type": "thinking"}
+                            continue
+                        if kind != "chunk" or not chunk:
+                            continue
+                        streamed_any = True
+                        yield {"type": "chunk", "text": chunk}
+                    if not streamed_any:
+                        raise AppError(
+                            "E_LLM_EMPTY",
+                            "модель вернула пустой ответ (возможно, лимит токенов ушёл на размышления)",
+                            status=502,
+                        )
+                    return
+                except AppError as e:
+                    if not streamed_any and attempt < 3:
+                        delay = delays[attempt - 1]
+                        log.warning(
+                            "chat_stream attempt %d/3 failed (%s), retrying in %.1fs...",
+                            attempt, e.code, delay,
+                        )
+                        yield {
+                            "type": "retry",
+                            "attempt": attempt,
+                            "max_attempts": 3,
+                            "delay": delay,
+                            "error": e.message,
+                        }
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+        finally:
+            self.llm.timeout = saved_timeout
 
     async def list_llm_models(self, body: dict) -> dict:
         """Запрашивает у провайдера список моделей.
@@ -7383,11 +8258,19 @@ class Runtime:
                    ORDER BY timestamp_utc DESC LIMIT 1""",
                 (sid,),
             ).fetchone()
+            spark_cut = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
             spark = self.db.conn.execute(
                 """SELECT timestamp_utc, cpu, ram FROM metrics_history
-                   WHERE server_id=? AND resolution='30s' ORDER BY timestamp_utc DESC LIMIT 30""",
-                (sid,),
+                   WHERE server_id=? AND resolution='30s' AND timestamp_utc >= ?
+                   ORDER BY timestamp_utc DESC LIMIT 180""",
+                (sid, spark_cut),
             ).fetchall()
+            if len(spark) < 2:
+                spark = self.db.conn.execute(
+                    """SELECT timestamp_utc, cpu, ram FROM metrics_history
+                       WHERE server_id=? AND resolution='30s' ORDER BY timestamp_utc DESC LIMIT 30""",
+                    (sid,),
+                ).fetchall()
             spark = list(reversed(spark))
             st = self.detector.state.get(sid) or {}
             anomaly = any(v.anomaly for v in st.values())
@@ -7544,9 +8427,14 @@ class Runtime:
             # (провайдер блокирует исходящий DNS) или нужен свой резолвер.
             "internet_check_host": self._effective_internet_check_host(),
             "internet_check_port": self._effective_internet_check_port(),
-            # Авто-проверка обновлений. Override из settings (UI toggle),
-            # fallback на cfg [updates].
             "updates_check_on_start": self._effective_updates_check_on_start(),
+            "detector_z_threshold": self.detector.z_threshold,
+            "detector_ignore_drops": self.detector.ignore_drops,
+            "detector_abs_cpu": self.detector.abs_thr.get("cpu", 90.0),
+            "detector_abs_ram": self.detector.abs_thr.get("ram", 90.0),
+            "detector_abs_disk": self.detector.abs_thr.get("disk", 90.0),
+            "detector_abs_load_1m_per_cpu": self.detector.per_cpu,
+            **self._llm_context_settings(),
         }
 
     async def settings_patch(self, body: dict) -> dict:
@@ -7572,6 +8460,42 @@ class Runtime:
                 conn.execute(
                     "INSERT INTO settings(key, value) VALUES ('llm_opt_in_logs', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (flag,),
+                )
+            if "llm_context_cross_mode" in body:
+                v = body["llm_context_cross_mode"]
+                if not isinstance(v, bool):
+                    raise AppError("E_PARAM", "llm_context_cross_mode: true|false", status=400)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES ('llm_context_cross_mode', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("1" if v else "0",),
+                )
+            if "llm_context_max_messages" in body:
+                raw_m = body["llm_context_max_messages"]
+                if isinstance(raw_m, bool):
+                    raise AppError("E_PARAM", "llm_context_max_messages: целое число", status=400)
+                try:
+                    mv = int(raw_m)
+                except (TypeError, ValueError):
+                    raise AppError("E_PARAM", "llm_context_max_messages: целое число", status=400)
+                if mv < 0 or mv > 500:
+                    raise AppError("E_PARAM", "llm_context_max_messages: 0..500", status=400)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES ('llm_context_max_messages', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(mv),),
+                )
+            if "llm_context_max_chars" in body:
+                raw_c = body["llm_context_max_chars"]
+                if isinstance(raw_c, bool):
+                    raise AppError("E_PARAM", "llm_context_max_chars: целое число", status=400)
+                try:
+                    cv = int(raw_c)
+                except (TypeError, ValueError):
+                    raise AppError("E_PARAM", "llm_context_max_chars: целое число", status=400)
+                if cv < 0 or cv > 500000:
+                    raise AppError("E_PARAM", "llm_context_max_chars: 0..500000", status=400)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES ('llm_context_max_chars', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(cv),),
                 )
             if body.get("llm_provider"):
                 prov = str(body["llm_provider"]).strip()
@@ -7638,6 +8562,50 @@ class Runtime:
                         )
                 else:
                     raise AppError("E_PARAM", "internet_check_host: строка или null", status=400)
+            if "detector_z_threshold" in body:
+                raw_z = body["detector_z_threshold"]
+                try:
+                    zv = float(raw_z)
+                except (TypeError, ValueError) as e:
+                    raise AppError("E_PARAM", "detector_z_threshold: число", status=400) from e
+                if zv < 1.0 or zv > 20.0:
+                    raise AppError("E_PARAM", "detector_z_threshold: допустимо 1.0..20.0", status=400)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES ('detector_z_threshold', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(zv),),
+                )
+            if "detector_ignore_drops" in body:
+                ig_v = body["detector_ignore_drops"]
+                if not isinstance(ig_v, bool):
+                    raise AppError("E_PARAM", "detector_ignore_drops: true|false", status=400)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES ('detector_ignore_drops', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("1" if ig_v else "0",),
+                )
+            for m_key in ("abs_cpu", "abs_ram", "abs_disk"):
+                full_k = "detector_" + m_key
+                if full_k in body:
+                    try:
+                        pv = float(body[full_k])
+                    except (TypeError, ValueError) as e:
+                        raise AppError("E_PARAM", f"{full_k}: число", status=400) from e
+                    if pv < 1.0 or pv > 100.0:
+                        raise AppError("E_PARAM", f"{full_k}: допустимо 1..100%", status=400)
+                    conn.execute(
+                        "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (full_k, str(pv)),
+                    )
+            if "detector_abs_load_1m_per_cpu" in body:
+                try:
+                    lv = float(body["detector_abs_load_1m_per_cpu"])
+                except (TypeError, ValueError) as e:
+                    raise AppError("E_PARAM", "detector_abs_load_1m_per_cpu: число", status=400) from e
+                if lv < 0.1 or lv > 50.0:
+                    raise AppError("E_PARAM", "detector_abs_load_1m_per_cpu: допустимо 0.1..50.0", status=400)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES ('detector_abs_load_1m_per_cpu', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(lv),),
+                )
             if "internet_check_port" in body:
                 raw_p = body["internet_check_port"]
                 if raw_p is None:
@@ -7660,41 +8628,73 @@ class Runtime:
                     )
 
         await self.db.mutate(fn)
+        self._apply_detector_settings()
         self._apply_llm()
         return self.settings_get()
 
     # ---------- services / allowed units ----------
 
-    async def list_services(self, sid: int, q: str, page: int, per_page: int) -> dict:
+    async def list_services(self, sid: int, q: str, page: int, per_page: int, filt: str = "all") -> dict:
+        if filt not in ("all", "allowed", "active", "failed"):
+            raise AppError("E_PARAM", "filter: all|allowed|active|failed", status=400)
         row = self.get_server(sid)
         shell = await self._ensure_shell(sid)
         r = await shell.run_argv(
             ["/usr/bin/systemctl", "list-units", "--type=service", "--all", "--no-pager", "--plain", "--no-legend"]
         )
         lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
-        units = []
+        allowed = json.loads(row["allowed_units"] or "[]")
+        allowed_set = set(allowed)
+        all_units = []
+        active_cnt = 0
+        failed_cnt = 0
         for ln in lines[:5000]:
-            name = ln.split()[0]
+            parts = ln.split()
+            name = parts[0]
             if not UNIT_RE.match(name):
                 continue
-            if q and q.lower() not in name.lower():
-                continue
-            rest = ln.split()
-            units.append(
+            act = parts[2] if len(parts) > 2 else ""
+            sub = parts[3] if len(parts) > 3 else ""
+            if act == "active":
+                active_cnt += 1
+            if act == "failed" or sub == "failed":
+                failed_cnt += 1
+            all_units.append(
                 {
                     "unit": name,
-                    "load": rest[1] if len(rest) > 1 else "",
-                    "active": rest[2] if len(rest) > 2 else "",
-                    "sub": rest[3] if len(rest) > 3 else "",
+                    "load": parts[1] if len(parts) > 1 else "",
+                    "active": act,
+                    "sub": sub,
+                    "allowed": name in allowed_set,
                 }
             )
+        q_low = (q or "").strip().lower()
+        units = []
+        for u in all_units:
+            if q_low and q_low not in u["unit"].lower():
+                continue
+            if filt == "allowed" and not u["allowed"]:
+                continue
+            if filt == "active" and u["active"] != "active":
+                continue
+            if filt == "failed" and u["active"] != "failed" and u["sub"] != "failed":
+                continue
+            units.append(u)
         per_page = min(max(per_page, 1), 50)
         page = max(page, 1)
         start = (page - 1) * per_page
-        allowed = json.loads(row["allowed_units"] or "[]")
-        for u in units:
-            u["allowed"] = u["unit"] in allowed
-        return {"items": units[start : start + per_page], "total": len(units), "page": page, "per_page": per_page}
+        return {
+            "items": units[start : start + per_page],
+            "total": len(units),
+            "page": page,
+            "per_page": per_page,
+            "counts": {
+                "all": len(all_units),
+                "active": active_cnt,
+                "failed": failed_cnt,
+                "allowed": len(allowed_set),
+            },
+        }
 
     def allowed_units_get(self, sid: int) -> dict:
         row = self.get_server(sid)
@@ -7869,8 +8869,102 @@ class Runtime:
             except Exception:
                 log.exception("internet-poll loop")
 
+    async def _collect_one_bg(self, srv_row) -> None:
+        sid = srv_row["id"]
+        iv = self._server_interval_sec(srv_row)
+        sem = getattr(self, "_ssh_sem", None)
+        if sem is not None:
+            await sem.acquire()
+        try:
+            was_offline = sid in self._server_offline
+            await self.collect_server(sid)
+            self.collect_errors.pop(sid, None)
+            self._retry_delay.pop(sid, None)
+            # Перечитываем интервал — пользователь мог поменять его во время сбора.
+            try:
+                cur_row = self.db.conn.execute(
+                    "SELECT metrics_interval_sec FROM servers WHERE id=?", (sid,)
+                ).fetchone()
+                if cur_row is not None:
+                    iv = self._server_interval_sec(cur_row)
+            except Exception:
+                pass
+            self._next_collect[sid] = time.monotonic() + iv
+            if was_offline:
+                self._server_offline.pop(sid, None)
+                try:
+                    self.detector.reset_server(sid)
+                except Exception:
+                    log.exception("reset_server after offline sid=%s", sid)
+                log.info("collect server=%s: снова online (было offline)", sid)
+        except AppError as e:
+            t_now = time.monotonic()
+            self.collect_errors[sid] = f"{e.code}: {e.message}"
+            if e.code == "E_NO_INTERNET":
+                self.collect_errors.pop(sid, None)
+                self._server_offline.pop(sid, None)
+                self._next_collect[sid] = t_now + iv
+            elif e.code == "E_HOSTKEY":
+                self._next_collect[sid] = t_now + 300.0
+                log.debug("collect server=%s: hostkey не подтверждён", sid)
+            elif e.code == "E_HOSTKEY_MISMATCH":
+                self._next_collect[sid] = t_now + 300.0
+                log.warning(
+                    "collect server=%s: host key mismatch — подключение заблокировано",
+                    sid,
+                )
+            elif e.code in ("E_SSH", "E_SSH_TIMEOUT", "E_SSH_REFUSED",
+                            "E_SSH_UNREACHABLE", "E_SSH_DISCONNECTED",
+                            "E_TIMEOUT"):
+                net_ok = await self._internet_reachable()
+                if not net_ok:
+                    self._set_internet_state(offline=True)
+                    self.collect_errors.pop(sid, None)
+                    self._server_offline.clear()
+                    self._internet_poll_backoff = 0.0
+                    self._internet_poll_next_at = (
+                        time.monotonic() + self.cfg.internet_check_poll_sec_min
+                    )
+                    self.events.publish("net.status", {
+                        "internet_offline": self._internet_offline,
+                        "internet_checking": self._internet_checking,
+                        "next_check_in_sec": self._internet_next_check_in_sec(),
+                    })
+                    self._next_collect[sid] = t_now + iv
+                    log.warning(
+                        "collect server=%s: %s, интернет недоступен — глобальная пауза",
+                        sid, e.code,
+                    )
+                else:
+                    if sid not in self._server_offline:
+                        self._server_offline[sid] = now_z()
+                        log.warning(
+                            "collect server=%s: %s — переведён в offline",
+                            sid, e.code,
+                        )
+                    self.collect_errors[sid] = (
+                        "E_SERVER_OFFLINE: сервер не отвечает — сбор метрик приостановлен"
+                    )
+                    self._next_collect[sid] = t_now + 30.0
+            else:
+                delay = self._retry_delay.get(sid, 5.0)
+                self._retry_delay[sid] = min(60.0, delay * 2)
+                self._next_collect[sid] = t_now + delay
+                log.info("collect server=%s: %s (retry in %ss)", sid, e.code, delay)
+        except Exception as e:  # noqa: BLE001
+            self.collect_errors[sid] = str(e)
+            delay = self._retry_delay.get(sid, 5.0)
+            self._retry_delay[sid] = min(60.0, delay * 2)
+            self._next_collect[sid] = time.monotonic() + delay
+            log.warning("collect server=%s: %s (retry in %ss)", sid, e, delay)
+        finally:
+            if sem is not None:
+                sem.release()
+
     async def poll_loop(self) -> None:
-        while True:
+        collect_tasks: dict[int, asyncio.Task] = {}
+        try:
+          while True:
             try:
                 await asyncio.sleep(1)
                 if self.dek is None:
@@ -7882,7 +8976,7 @@ class Runtime:
                     except Exception:
                         log.exception("seed builtin alerts")
                     try:
-                        n = await self.db.mutate(lambda c: run_downsample(c))
+                        n = await self.db.mutate(lambda c: run_downsample(c, full_scan=True))
                         await self.db.mutate(
                             lambda c: run_all_retention(c, self.db.get_setting)
                         )
@@ -7892,12 +8986,6 @@ class Runtime:
                     self._backlog_done = True
                     self._down_at = now
                     self._retain_at = now
-                # S7+: один раз после unlock — сверка host key до коннектов.
-                # Запускаем как фоновую задачу: probe может ждать таймаут
-                # connect_timeout_sec на каждом недоступном сервере. Inline-await
-                # заблокировал бы весь poll_loop (метрики, реакции, checks)
-                # до окончания последнего probe — на 20 недоступных серверах
-                # это до 5 минут.
                 if not self._hostkey_preflight_done:
                     self._hostkey_preflight_done = True
 
@@ -7908,130 +8996,30 @@ class Runtime:
                             log.exception("hostkey pre-flight failed")
 
                     asyncio.create_task(_preflight_bg())
-                ids = [r["id"] for r in self.db.conn.execute("SELECT id FROM servers").fetchall()]
-                for sid in ids:
+                for sid in list(collect_tasks):
+                    t = collect_tasks[sid]
+                    if t.done():
+                        collect_tasks.pop(sid, None)
+                        try:
+                            t.result()
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            log.exception("collect task sid=%s failed", sid)
+                srv_rows = self.db.conn.execute(
+                    "SELECT id, metrics_interval_sec FROM servers"
+                ).fetchall()
+                for r in srv_rows:
+                    sid = r["id"]
+                    if sid in collect_tasks:
+                        continue
                     due = self._next_collect.get(sid, 0.0)
                     if now < due:
                         continue
-                    try:
-                        was_offline = sid in self._server_offline
-                        await self.collect_server(sid)
-                        self.collect_errors.pop(sid, None)
-                        self._retry_delay.pop(sid, None)
-                        self._next_collect[sid] = now + self.cfg.metrics_interval_sec
-                        if was_offline:
-                            # Сервер вернулся. Снимаем флаг, сбрасываем
-                            # warmup EWMA — за время offline пропущено
-                            # несколько точек, старая статистика невалидна
-                            # (baseline устарел, z-score дал бы ложные
-                            # аномалии на первом же сборе после возврата).
-                            self._server_offline.pop(sid, None)
-                            try:
-                                self.detector.reset_server(sid)
-                            except Exception:
-                                log.exception("reset_server after offline sid=%s", sid)
-                            log.info("collect server=%s: снова online (было offline)", sid)
-                    except AppError as e:
-                        self.collect_errors[sid] = f"{e.code}: {e.message}"
-                        if e.code == "E_NO_INTERNET":
-                            # Глобальный флаг — не долбим серверы. Это НЕ
-                            # ошибка конкретного сервера: UI показывает
-                            # глобальный баннер + «заморозку» карточки через
-                            # status.internet_offline. Сбрасываем возможные
-                            # старые записи (в т.ч. _server_offline —
-                            # при недоступном интернете нельзя судить
-                            # о доступности конкретного сервера).
-                            self.collect_errors.pop(sid, None)
-                            self._server_offline.pop(sid, None)
-                            self._next_collect[sid] = now + self.cfg.metrics_interval_sec
-                        elif e.code == "E_HOSTKEY":
-                            # не транзиентная ошибка — host key подтверждается руками
-                            # в карточке сервера. Проверяем раз в 5 минут, не спамим.
-                            self._next_collect[sid] = now + 300.0
-                            log.debug("collect server=%s: hostkey не подтверждён", sid)
-                        elif e.code == "E_HOSTKEY_MISMATCH":
-                            # S7+: host key не совпал. Не долбим сервер —
-                            # ждём, пока пользователь сверит и ротирует.
-                            self._next_collect[sid] = now + 300.0
-                            log.warning(
-                                "collect server=%s: host key mismatch — подключение заблокировано",
-                                sid,
-                            )
-                        elif e.code in ("E_SSH", "E_SSH_TIMEOUT", "E_SSH_REFUSED",
-                                        "E_SSH_UNREACHABLE", "E_SSH_DISCONNECTED",
-                                        "E_TIMEOUT"):
-                            # Сервер не отвечает. Прежде чем объявлять его
-                            # offline, проверяем, жив ли интернет вообще.
-                            # Кэш 60 сек в _internet_reachable: при 20
-                            # серверах, упавших разом, сделаем один handshake,
-                            # не 20.
-                            net_ok = await self._internet_reachable()
-                            if not net_ok:
-                                # Глобальный случай: интернета нет, все
-                                # серверы «мертвы» одновременно. НЕ пишем
-                                # в collect_errors[sid] — это была бы ложная
-                                # ошибка сервера. UI покажет «заморозку»
-                                # через status.internet_offline.
-                                self._set_internet_state(offline=True)
-                                # Per-server offline тоже сбрасываем:
-                                # мы не знаем, был ли сервер реально
-                                # недоступен до глобального сбоя.
-                                self.collect_errors.pop(sid, None)
-                                self._server_offline.clear()
-                                # Таймер первой авто-проверки.
-                                self._internet_poll_backoff = 0.0
-                                self._internet_poll_next_at = (
-                                    time.monotonic()
-                                    + self.cfg.internet_check_poll_sec_min
-                                )
-                                # Публикуем net.status сразу, чтобы UI
-                                # получил countdown вместе с флагом (иначе
-                                # плашка «следующая проверка» появится
-                                # только через 5 сек, после первого тика
-                                # _internet_poll_loop).
-                                self.events.publish("net.status", {
-                                    "internet_offline": self._internet_offline,
-                                    "internet_checking": self._internet_checking,
-                                    "next_check_in_sec": self._internet_next_check_in_sec(),
-                                })
-                                self._next_collect[sid] = now + self.cfg.metrics_interval_sec
-                                log.warning(
-                                    "collect server=%s: %s, интернет недоступен — "
-                                    "глобальная пауза",
-                                    sid, e.code,
-                                )
-                            else:
-                                # Интернет есть — значит конкретный сервер
-                                # лёг. Per-server offline.
-                                # collect_errors — единый текст E_SERVER_OFFLINE:
-                                # UI показывает статус «недоступен» бейджем,
-                                # а не сырой E_SSH/E_TIMEOUT с диагностикой
-                                # вроде «[Errno 101] Network is unreachable».
-                                if sid not in self._server_offline:
-                                    self._server_offline[sid] = now_z()
-                                    log.warning(
-                                        "collect server=%s: %s — переведён в offline",
-                                        sid, e.code,
-                                    )
-                                self.collect_errors[sid] = (
-                                    "E_SERVER_OFFLINE: сервер не отвечает — "
-                                    "сбор метрик приостановлен"
-                                )
-                                self._next_collect[sid] = now + 30.0
-                        else:
-                            # Не связано с доступностью (креды, парсинг, и т.п.).
-                            # Обычный экспоненциальный backoff.
-                            delay = self._retry_delay.get(sid, 5.0)
-                            self._retry_delay[sid] = min(60.0, delay * 2)
-                            self._next_collect[sid] = now + delay
-                            log.info("collect server=%s: %s (retry in %ss)", sid, e.code, delay)
-                    except Exception as e:  # noqa: BLE001
-                        self.collect_errors[sid] = str(e)
-                        # Неизвестная ошибка — не offline-сигнал, обычный backoff.
-                        delay = self._retry_delay.get(sid, 5.0)
-                        self._retry_delay[sid] = min(60.0, delay * 2)
-                        self._next_collect[sid] = now + delay
-                        log.warning("collect server=%s: %s (retry in %ss)", sid, e, delay)
+                    collect_tasks[sid] = asyncio.create_task(
+                        self._collect_one_bg(r),
+                        name=f"melecho.collect.{sid}",
+                    )
                 # Реакции — раз в 15 секунд.
                 if now - getattr(self, "_reactions_tick_at", 0.0) >= 15.0:
                     try:
@@ -8098,6 +9086,12 @@ class Runtime:
                 raise
             except Exception:
                 log.exception("poll_loop")
+        finally:
+            pending = [t for t in collect_tasks.values() if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def refresh_paths(self, sid: int) -> dict:
         self.get_server(sid)

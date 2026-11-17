@@ -16,3 +16,32 @@ applicability:
 steps:
   - command: "findmnt -J -b -o TARGET,FSTYPE,SIZE,USED,AVAIL"
     expect_exit: 0
+display:
+  type: table
+  format: json
+  items_path: filesystems
+  children_key: children
+  filter_in:
+    fstype: [ext4, xfs, btrfs]
+  other_summary: "прочие точки"
+  columns:
+    - key: target
+      label: Точка
+      format: mono
+    - key: fstype
+      label: ФС
+    - key: size
+      label: Размер
+      format: bytes
+    - key: used
+      label: Занято
+      format: bytes
+    - key: avail
+      label: Свободно
+      format: bytes
+    - key: _pct
+      label: "%"
+      format: percent
+      expr: used/size*100
+      warn_gt: 85
+      danger_gt: 95

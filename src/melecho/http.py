@@ -590,7 +590,6 @@ def create_app(rt: Runtime) -> FastAPI:
         )
 
     @app.get("/api/v1/system/status")
-    @app.get("/api/v1/system/status")
     async def status():
         return rt.status()
 
@@ -707,6 +706,38 @@ def create_app(rt: Runtime) -> FastAPI:
         rt.require_dek()
         return rt.dashboard()
 
+    @app.get("/api/v1/ssh-keys")
+    async def ssh_keys_list():
+        rt.require_dek()
+        return rt.ssh_keys_list()
+
+    @app.post("/api/v1/ssh-keys/upload")
+    async def ssh_keys_upload(request: Request):
+        rt.require_dek()
+        rt.rate.check("ssh_key_upload", 10)
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                if int(cl) > 256 * 1024:
+                    raise AppError("E_PARAM", "слишком большой запрос для файла ключа", status=413)
+            except ValueError as e:
+                raise AppError("E_PARAM", "некорректный Content-Length", status=400) from e
+        try:
+            form = await request.form()
+        except Exception as e:
+            raise AppError("E_PARAM", f"не удалось прочитать multipart: {e}", status=400) from e
+        f = form.get("file")
+        if f is None or not hasattr(f, "read"):
+            raise AppError("E_PARAM", "поле 'file' обязательно", status=400)
+        raw = await f.read(rt.MAX_KEY_FILE_BYTES + 1)
+        fname = getattr(f, "filename", None) or "ssh_key"
+        return await rt.ssh_keys_upload(fname, raw)
+
+    @app.delete("/api/v1/ssh-keys/{name}")
+    async def ssh_keys_delete(name: str):
+        rt.require_dek()
+        return await rt.ssh_keys_delete(name)
+
     @app.get("/api/v1/servers")
     async def servers_list():
         rt.require_dek()
@@ -797,9 +828,15 @@ def create_app(rt: Runtime) -> FastAPI:
         return await rt.allowed_units_put(sid, body.get("allowed_units") or [])
 
     @app.get("/api/v1/servers/{sid}/services")
-    async def services(sid: int, q: str = "", page: int = 1, per_page: int = 50):
+    async def services(
+        sid: int,
+        q: str = "",
+        page: int = 1,
+        per_page: int = 50,
+        filter_mode: str = Query("all", alias="filter"),
+    ):
         rt.require_dek()
-        return await rt.list_services(sid, q, page, per_page)
+        return await rt.list_services(sid, q, page, per_page, filt=filter_mode)
 
     @app.get("/api/v1/servers/{sid}/metrics")
     async def metrics(
@@ -827,9 +864,17 @@ def create_app(rt: Runtime) -> FastAPI:
         return rt.metrics_batch(sid, windows)
 
     @app.get("/api/v1/operations")
-    async def operations():
+    async def operations(server_id: int | None = None):
         rt.require_dek()
-        return {"items": rt.catalog.list()}
+        items = rt.catalog.list()
+        if server_id is not None:
+            rt.get_server(server_id)
+            for it in items:
+                if it.get("valid", True):
+                    it["applicable"] = rt.is_operation_applicable(it["id"], server_id)
+                else:
+                    it["applicable"] = False
+        return {"items": items}
 
     # ---------- user operations (Should, iter 2) ----------
     # user-op id в БД и каталоге — "user:<name>". В URL CRUD передаём
@@ -925,6 +970,48 @@ def create_app(rt: Runtime) -> FastAPI:
     async def whitelist_remove(cmd: str):
         rt.require_dek()
         return await rt.whitelist_remove(cmd)
+
+    @app.get("/api/v1/operations/stream/{job_id}")
+    async def op_stream_events(job_id: str, request: Request):
+        rt.require_dek()
+        gen = rt.stream_op_events(job_id)
+
+        async def _wrapped():
+            try:
+                async for chunk in gen:
+                    if await request.is_disconnected():
+                        await rt.stop_stream_op(job_id)
+                        break
+                    yield chunk
+            except asyncio.CancelledError:
+                await rt.stop_stream_op(job_id)
+                raise
+
+        return StreamingResponse(
+            _wrapped(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/api/v1/operations/stream/{job_id}/stop")
+    async def op_stream_stop(job_id: str):
+        rt.require_dek()
+        return await rt.stop_stream_op(job_id)
+
+    @app.post("/api/v1/operations/{oid}/stream/start")
+    async def op_stream_start(oid: str, request: Request):
+        rt.require_dek()
+        body = await _read_json(request)
+        return await rt.start_stream_op(
+            oid,
+            _require_int(body, "server_id", min=1),
+            body.get("params") or {},
+            body.get("use_sudo"),
+            bool(body.get("confirm")),
+        )
 
     @app.post("/api/v1/operations/{oid}/plan")
     async def op_plan(oid: str, request: Request):
@@ -1308,6 +1395,11 @@ def create_app(rt: Runtime) -> FastAPI:
 
     # ---------- emergency stop ----------
 
+    @app.get("/api/v1/automation/graph")
+    async def automation_graph():
+        rt.require_dek()
+        return rt.automation_graph()
+
     @app.get("/api/v1/automation/state")
     async def automation_state():
         rt.require_dek()
@@ -1466,8 +1558,8 @@ def create_app(rt: Runtime) -> FastAPI:
 
         async def gen():
             try:
-                async for chunk in rt.chat_stream(messages, max_tokens=max_tokens):
-                    yield _sse({"type": "chunk", "text": chunk})
+                async for ev in rt.chat_stream(messages, max_tokens=max_tokens):
+                    yield _sse(ev)
                 yield _sse({"type": "done"})
             except AppError as e:
                 yield _sse({"type": "error", "code": e.code, "message": e.message})

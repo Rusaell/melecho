@@ -19,3 +19,34 @@ steps:
   - command: "ss -tulpn"
     expect_exit: 0
     note: "Без root — неполный список процессов и сокетов."
+display:
+  type: sections
+  sections:
+    - title: "Сетевые интерфейсы и адреса"
+      step: 0
+      type: lines
+      include:
+        - '^\d+:\s+'
+        - '^\s+inet6?\s+'
+      empty_text: "Интерфейсы не найдены."
+    - title: "Открытые порты и сокеты"
+      step: 1
+      type: table
+      format: regex
+      regex: '^(?!Netid\b)(?P<proto>\S+)\s+(?P<state>\S+)\s+\d+\s+\d+\s+(?P<local>\S+)\s+(?P<peer>\S+)(?:\s+(?P<process>\S.*?\S|\S))?\s*$'
+      empty_text: "Слушающих сокетов не найдено."
+      columns:
+        - key: proto
+          label: Протокол
+          format: mono
+        - key: state
+          label: Статус
+        - key: local
+          label: Локальный адрес
+          format: mono
+        - key: peer
+          label: Удалённый адрес
+          format: mono
+        - key: process
+          label: Процесс
+          format: mono

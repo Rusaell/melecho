@@ -178,6 +178,75 @@ def _table_stats(conn, rule: RetentionRule) -> dict:
     return {"rows_total": int(total or 0), "oldest": oldest}
 
 
+def _per_server_metrics_rules(conn, global_days: int, col: str) -> list[tuple[int, int]]:
+    """Возвращает [(server_id, keep_days), ...] с учётом per-server override.
+    keep_days == 0 означает «хранить вечно».
+    """
+    try:
+        rows = conn.execute(f"SELECT id, {col} FROM servers").fetchall()
+    except Exception:
+        return []
+    out: list[tuple[int, int]] = []
+    for r in rows:
+        ov = r[col]
+        if ov is None:
+            days = global_days
+        else:
+            try:
+                v = int(ov)
+            except (TypeError, ValueError):
+                v = global_days
+            days = 0 if v == 0 else _clamp(v, 1, 3650)
+        out.append((r["id"], days))
+    return out
+
+
+def _plan_metrics_would(conn, res: str, col: str, global_days: int, now: datetime) -> int:
+    srv_rules = _per_server_metrics_rules(conn, global_days, col)
+    total = 0
+    for sid, days in srv_rules:
+        if days == 0:
+            continue
+        cut = _cutoff_z(days, now)
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM metrics_history WHERE server_id=? AND resolution=? AND timestamp_utc < ?",
+            (sid, res, cut),
+        ).fetchone()
+        total += int(row["c"]) if row else 0
+    # Осиротевшие строки от удалённых серверов — по глобальному сроку.
+    global_cut = _cutoff_z(global_days, now)
+    orphan = conn.execute(
+        "SELECT COUNT(*) AS c FROM metrics_history "
+        "WHERE resolution=? AND timestamp_utc < ? AND server_id NOT IN (SELECT id FROM servers)",
+        (res, global_cut),
+    ).fetchone()
+    total += int(orphan["c"]) if orphan else 0
+    return total
+
+
+def _run_metrics_retention(conn, res: str, col: str, global_days: int, now: datetime) -> int:
+    srv_rules = _per_server_metrics_rules(conn, global_days, col)
+    deleted = 0
+    for sid, days in srv_rules:
+        if days == 0:
+            continue
+        cut = _cutoff_z(days, now)
+        deleted += _delete_where_in_batches(
+            conn,
+            "metrics_history",
+            "server_id=? AND resolution=? AND timestamp_utc < ?",
+            (sid, res, cut),
+        )
+    global_cut = _cutoff_z(global_days, now)
+    deleted += _delete_where_in_batches(
+        conn,
+        "metrics_history",
+        "resolution=? AND timestamp_utc < ? AND server_id NOT IN (SELECT id FROM servers)",
+        (res, global_cut),
+    )
+    return deleted
+
+
 def plan_retention(conn, get_setting, now: datetime | None = None) -> list[dict]:
     """Dry-run без удаления. Возвращает список правил с текущими
     значениями и количеством строк, которые БЫЛИ БЫ удалены."""
@@ -187,7 +256,17 @@ def plan_retention(conn, get_setting, now: datetime | None = None) -> list[dict]
         keep_days = _read_keep_days(rule, get_setting)
         stats = _table_stats(conn, rule)
         would = 0
-        if not (rule.zero_means_never and keep_days == 0):
+        if rule.key == "retention.metrics_raw_days":
+            try:
+                would = _plan_metrics_would(conn, "30s", "retention_raw_days", keep_days, now)
+            except Exception:
+                would = 0
+        elif rule.key == "retention.metrics_agg_days":
+            try:
+                would = _plan_metrics_would(conn, "5m", "retention_agg_days", keep_days, now)
+            except Exception:
+                would = 0
+        elif not (rule.zero_means_never and keep_days == 0):
             cutoff = _cutoff_z(keep_days, now)
             try:
                 row = conn.execute(
@@ -223,6 +302,22 @@ def run_all_retention(conn, get_setting, now: datetime | None = None) -> dict:
     out: dict[str, int] = {}
     for rule in RULES:
         keep_days = _read_keep_days(rule, get_setting)
+        if rule.key == "retention.metrics_raw_days":
+            try:
+                out[rule.key] = _run_metrics_retention(
+                    conn, "30s", "retention_raw_days", keep_days, now
+                )
+            except Exception:
+                out[rule.key] = -1
+            continue
+        if rule.key == "retention.metrics_agg_days":
+            try:
+                out[rule.key] = _run_metrics_retention(
+                    conn, "5m", "retention_agg_days", keep_days, now
+                )
+            except Exception:
+                out[rule.key] = -1
+            continue
         if rule.zero_means_never and keep_days == 0:
             out[rule.key] = 0
             continue

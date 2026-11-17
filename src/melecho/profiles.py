@@ -181,7 +181,7 @@ def export_profile_bytes(
         conn = sqlite3.connect(str(src_db))
         try:
             # VACUUM INTO копирует схему и данные без WAL-файлов
-            conn.execute(f"VACUUM INTO '{dst_db}'")
+            conn.execute("VACUUM INTO ?", (str(dst_db),))
         finally:
             conn.close()
 
@@ -210,6 +210,11 @@ def export_profile_bytes(
             cat = src_dir / "catalog.d"
             if cat.exists() and any(cat.iterdir()):
                 tar.add(cat, arcname="catalog.d")
+
+            # keys (зашифрованные DEK приватные SSH-ключи профиля)
+            keys_d = src_dir / "keys"
+            if keys_d.exists() and any(keys_d.iterdir()):
+                tar.add(keys_d, arcname="keys")
         
         tar_bytes = tar_buf.getvalue()
 
@@ -260,11 +265,17 @@ def import_profile_bytes(
         # 1. Распаковка tar
         try:
             with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-                # Защита от Path Traversal (CVE-2007-4559)
+                # Защита от Path Traversal, symlinks/hardlinks и спецфайлов
                 for member in tar.getmembers():
-                    if member.name.startswith("/") or ".." in member.name:
+                    p_mem = Path(member.name)
+                    if p_mem.is_absolute() or ".." in p_mem.parts:
                         raise ValueError("недопустимый путь внутри архива")
-                tar.extractall(tmp_dir)
+                    if not (member.isfile() or member.isdir()):
+                        raise ValueError("недопустимый тип файла внутри архива (ссылки и устройства запрещены)")
+                try:
+                    tar.extractall(tmp_dir, filter="data")
+                except TypeError:
+                    tar.extractall(tmp_dir)
         except tarfile.TarError as e:
             raise ValueError(f"архив повреждён: {e}") from e
 
@@ -335,6 +346,14 @@ def import_profile_bytes(
             
             # 8. Удаляем dek.bin (он больше не нужен на диске)
             (dst_dir / "dek.bin").unlink()
+
+            # 9. Восстанавливаем строгие права на папку зашифрованных ключей
+            keys_dst = dst_dir / "keys"
+            if keys_dst.is_dir():
+                os.chmod(keys_dst, 0o700)
+                for kf in keys_dst.iterdir():
+                    if kf.is_file():
+                        os.chmod(kf, 0o600)
             
         except Exception as e:
             # Откат, если что-то пошло не так с БД

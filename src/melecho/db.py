@@ -651,6 +651,27 @@ class Database:
             )
             self.conn.commit()
 
+        # v19: per-server тайминг сбора и сроки хранения метрик + индекс (server_id, resolution, timestamp_utc).
+        # NULL в настройках сервера означает «использовать глобальную настройку».
+        # retention_*_days = 0 означает «хранить вечно» (не удалять автоматически).
+        if current < 19:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(servers)").fetchall()}
+            if "metrics_interval_sec" not in cols:
+                self.conn.execute("ALTER TABLE servers ADD COLUMN metrics_interval_sec INTEGER")
+            if "retention_raw_days" not in cols:
+                self.conn.execute("ALTER TABLE servers ADD COLUMN retention_raw_days INTEGER")
+            if "retention_agg_days" not in cols:
+                self.conn.execute("ALTER TABLE servers ADD COLUMN retention_agg_days INTEGER")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metrics_server_res_ts "
+                "ON metrics_history(server_id, resolution, timestamp_utc)"
+            )
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at, description) VALUES (19, ?, ?)",
+                (_now(), "per-server metrics_interval_sec & retention days + metrics index"),
+            )
+            self.conn.commit()
+
     def _migrate_v16(self) -> None:
         """Пересоздание servers с AUTOINCREMENT + синхронизация alias.
 

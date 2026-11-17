@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import logging
 import re
@@ -87,6 +88,60 @@ class Shell:
         return True
 
 
+class RealStreamProcess:
+    """Живой удалённый SSH-процесс с потоковым чтением и мягкой/жёсткой остановкой."""
+
+    def __init__(self, proc):
+        self.proc = proc
+        self._dec_out = codecs.getincrementaldecoder("utf-8")("replace")
+        self._dec_err = codecs.getincrementaldecoder("utf-8")("replace")
+        self._stopped = False
+
+    async def read_stdout(self, n: int = 4096) -> str:
+        chunk = await self.proc.stdout.read(n)
+        if not chunk:
+            return self._dec_out.decode(b"", final=True)
+        return self._dec_out.decode(chunk, final=False)
+
+    async def read_stderr(self, n: int = 4096) -> str:
+        chunk = await self.proc.stderr.read(n)
+        if not chunk:
+            return self._dec_err.decode(b"", final=True)
+        return self._dec_err.decode(chunk, final=False)
+
+    async def wait_exit(self) -> int:
+        try:
+            await self.proc.wait()
+        except Exception:
+            pass
+        st = self.proc.exit_status if self.proc.exit_status is not None else self.proc.returncode
+        return int(st or 0)
+
+    async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        for sig, wait_sec in (("INT", 1.2), ("TERM", 0.6), ("KILL", 0.3)):
+            try:
+                if sig == "INT":
+                    self.proc.send_signal("INT")
+                elif sig == "TERM":
+                    self.proc.terminate()
+                else:
+                    self.proc.kill()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self.proc.wait_closed(), timeout=wait_sec)
+                return
+            except Exception:
+                continue
+        try:
+            self.proc.close()
+        except Exception:
+            pass
+
+
 class RealShell(Shell):
     def __init__(self, conn):
         self.conn = conn
@@ -97,17 +152,45 @@ class RealShell(Shell):
         except Exception:
             return False
 
+    async def _terminate_proc(self, proc) -> None:
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait_closed(), timeout=0.5)
+            return
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.close()
+        except Exception:
+            pass
+
     async def run(self, command: str, input_bytes: bytes | None = None, timeout: float = 60) -> RunResult:
         import asyncssh
 
+        proc = None
         try:
-            r = await asyncio.wait_for(
-                self.conn.run(command, input=input_bytes, term_type=None, encoding=None),
+            proc = await asyncio.wait_for(
+                self.conn.create_process(command, term_type=None, encoding=None),
                 timeout=timeout,
             )
-        except asyncssh.TimeoutError as e:
-            raise AppError("E_TIMEOUT", "таймаут SSH-команды", status=504) from e
-        except asyncio.TimeoutError as e:
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(input=input_bytes),
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            await self._terminate_proc(proc)
+            raise
+        except (asyncssh.TimeoutError, asyncio.TimeoutError) as e:
+            await self._terminate_proc(proc)
             raise AppError("E_TIMEOUT", "таймаут SSH-команды", status=504) from e
         except asyncssh.misc.ChannelOpenError as e:
             raise AppError("E_SSH_DISCONNECTED", "SSH-соединение закрыто сервером", status=502) from e
@@ -115,10 +198,31 @@ class RealShell(Shell):
             raise AppError("E_SSH_DISCONNECTED", "SSH-соединение потеряно", status=502) from e
         except (ConnectionError, OSError) as e:
             raise AppError("E_SSH_DISCONNECTED", "SSH-соединение потеряно", status=502) from e
-        stdout = (r.stdout or b"").decode("utf-8", "replace")
-        stderr = (r.stderr or b"").decode("utf-8", "replace")
-        code = int(r.exit_status or 0)
+        stdout = (out_b or b"").decode("utf-8", "replace")
+        stderr = (err_b or b"").decode("utf-8", "replace")
+        raw_code = proc.exit_status if proc.exit_status is not None else proc.returncode
+        code = int(raw_code or 0)
         return RunResult(code, stdout, stderr, classify_sudo(stderr, code))
+
+    async def start_stream_argv(self, argv: list[str], input_bytes: bytes | None = None) -> RealStreamProcess:
+        import asyncssh
+
+        # exec заменяет процесс /bin/sh целевой программой — сигналы SIGINT/SIGTERM
+        # прилетают напрямую в неё (например ping), без прослойки оболочки.
+        cmd = shlex.join(["/bin/sh", "-c", "exec " + shlex.join(argv)])
+        try:
+            proc = await self.conn.create_process(cmd, term_type=None, encoding=None)
+            if input_bytes is not None:
+                proc.stdin.write(input_bytes)
+                await proc.stdin.drain()
+                proc.stdin.write_eof()
+        except asyncssh.misc.ChannelOpenError as e:
+            raise AppError("E_SSH_DISCONNECTED", "SSH-соединение закрыто сервером", status=502) from e
+        except asyncssh.misc.ConnectionLost as e:
+            raise AppError("E_SSH_DISCONNECTED", "SSH-соединение потеряно", status=502) from e
+        except (ConnectionError, OSError) as e:
+            raise AppError("E_SSH_DISCONNECTED", "SSH-соединение потеряно", status=502) from e
+        return RealStreamProcess(proc)
 
     async def close(self) -> None:
         try:

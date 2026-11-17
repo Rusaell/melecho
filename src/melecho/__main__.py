@@ -166,7 +166,9 @@ def _launch_detached(args: argparse.Namespace) -> int:
         if not new_url:
             print("Демон не выпустил новый bootstrap за 3с.", file=sys.stderr)
             return 1
-        if not args.no_browser:
+        if args.no_browser:
+            print(new_url, flush=True)
+        else:
             webbrowser.open(new_url)
         return 0
 
@@ -222,6 +224,8 @@ def _run_foreground(args: argparse.Namespace) -> int:
     logging.getLogger("asyncssh").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logging.getLogger("httpcore2").setLevel(logging.WARNING)
 
     # Lock: единственный живой сервер.
     lock_fd = rf.acquire_lock()
@@ -309,6 +313,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
     config = uvicorn.Config(
         app, host=cfg.bind, port=cfg.http_port,
         log_level=cfg.log_level.lower(), workers=1,
+        access_log=(cfg.log_level.upper() == "DEBUG"),
         timeout_graceful_shutdown=2,
     )
     server = uvicorn.Server(config)

@@ -943,6 +943,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   content: "·";
   margin: 0 8px;
   color: var(--fg-subtle);
+  font-weight: 400;
 }
 /* Когда метаданные разбиты на несколько строк по 3 элемента
    (см. AlertRulesFromLLMModal), они оборачиваются в .check-meta-group.
@@ -2020,6 +2021,9 @@ th { color: var(--fg-muted); font-weight: 500; font-size: 0.75rem; text-transfor
   flex: 1 1 auto;
   min-height: 0;
   scrollbar-width: thin;
+}
+.modal-body > * {
+  flex-shrink: 0;
 }
 .modal-foot {
   padding: var(--space-3) var(--space-5) var(--space-5);
@@ -4133,4 +4137,479 @@ select {
   height: 20px;
   padding: 2px 8px;
   font-size: 0.65rem;
+}
+
+/* Уведомление об ошибке LLM (плавающее окно и модалка) */
+.llm-window-error-banner {
+  position: fixed;
+  z-index: 65;
+  box-sizing: border-box;
+  background: color-mix(in oklab, var(--bg-elevated) 70%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid color-mix(in oklab, var(--danger) 50%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-shadow: var(--shadow);
+  animation: toast-in 200ms var(--ease-out);
+}
+.llm-modal-error-banner {
+  position: absolute;
+  top: 10px;
+  left: 16px;
+  right: 16px;
+  z-index: 15;
+  box-sizing: border-box;
+  background: color-mix(in oklab, var(--bg-elevated) 70%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid color-mix(in oklab, var(--danger) 50%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-shadow: var(--shadow);
+  animation: toast-in 200ms var(--ease-out);
+}
+.llm-error-icon {
+  font-size: 1.1rem;
+  color: var(--danger);
+  flex-shrink: 0;
+  line-height: 1;
+}
+.llm-error-text {
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  color: var(--fg);
+  word-break: break-word;
+}
+.llm-error-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.llm-error-retry {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 0.75rem;
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.llm-error-retry:hover {
+  background: color-mix(in oklab, var(--accent) 15%, transparent);
+}
+.llm-error-close {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font-size: 16px;
+  line-height: 1;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.llm-error-close:hover {
+  color: var(--fg);
+  background: var(--bg-subtle);
+}
+.llm-retry-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--warn);
+  font-size: 0.8125rem;
+  font-style: italic;
+}
+
+/* Контекстное меню сообщений LLM (ПКМ в плавающем окне) */
+.llm-context-menu {
+  position: fixed;
+  z-index: 350;
+  min-width: 170px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 4px;
+  animation: fade-in 100ms var(--ease-out);
+}
+.llm-context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8125rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.llm-context-menu-item:hover {
+  background: var(--bg-subtle);
+  color: var(--accent);
+}
+
+/* Модалка большого формата чата — поверх плавающего окна LLM (60) и его баннера (65),
+   но ниже контекстного меню (350) и тостов (400). */
+.modal-back.llm-modal-back {
+  z-index: 70;
+}
+
+/* Вкладка Аудит: перекрашивание обводки блока статуса */
+.audit-status-card.ok {
+  border-color: color-mix(in oklab, var(--ok) 65%, transparent);
+}
+.audit-status-card.warn {
+  border-color: color-mix(in oklab, var(--warn) 65%, transparent);
+}
+.audit-status-card.danger {
+  border-color: color-mix(in oklab, var(--danger) 65%, transparent);
+}
+
+
+/* Вкладка Сервисы: вертикальное выравнивание ячеек */
+.services-table td,
+.services-table th {
+  vertical-align: middle;
+}
+
+/* Пилюли пресетов (тайминг сбора и хранение метрик на сервере) */
+.preset-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.preset-pill {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background var(--motion-quick) var(--ease-out),
+              border-color var(--motion-quick) var(--ease-out),
+              color var(--motion-quick) var(--ease-out);
+}
+.preset-pill:hover {
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+.preset-pill.on {
+  background: color-mix(in oklab, var(--accent) 22%, var(--bg-subtle));
+  border-color: color-mix(in oklab, var(--accent) 55%, transparent);
+  color: var(--fg);
+  font-weight: 600;
+}
+
+/* Подсветка ячеек/значений в декларативном display: */
+.cell-warn {
+  color: var(--warn);
+}
+
+/* Потоковый вывод операции (ping / tail -f и др.) */
+.stream-pre {
+  min-height: 220px;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+
+/* ============================================================
+   Automation Graph View (Холст графа в стиле Obsidian)
+   ============================================================ */
+.graph-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  position: relative;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  overflow: hidden;
+  transition: all 180ms var(--ease-out);
+}
+
+/* Полноэкранный режим */
+.graph-container.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+  border: none;
+}
+
+.graph-toolbar {
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  z-index: 5;
+  flex-shrink: 0;
+}
+.graph-search-input {
+  width: 150px;
+  height: 32px;
+  font-size: 0.8125rem;
+}
+
+/* Мультивыбор серверов в тулбаре */
+.graph-server-picker-wrap {
+  position: relative;
+}
+.graph-server-picker-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 60;
+  min-width: 210px;
+  max-width: 280px;
+  padding: 8px;
+  box-shadow: var(--shadow);
+}
+
+/* Кнопки создания (отдельный визуальный акцент) */
+.btn-graph-action {
+  background: color-mix(in oklab, var(--accent) 15%, var(--bg-subtle));
+  border: 1px dashed color-mix(in oklab, var(--accent) 55%, transparent);
+  color: var(--fg);
+  font-weight: 600;
+}
+.btn-graph-action:hover {
+  background: color-mix(in oklab, var(--accent) 26%, var(--bg-subtle));
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.graph-canvas-wrap {
+  flex: 1 1 0;
+  min-height: 0;
+  position: relative;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.graph-canvas-wrap:active {
+  cursor: grabbing;
+}
+.graph-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Узлы */
+.graph-node-group {
+  cursor: pointer;
+  transition: opacity 160ms var(--ease-out);
+}
+.graph-node-group.dimmed-soft {
+  opacity: 0.45;
+}
+.graph-node-group.dimmed-strong {
+  opacity: 0.12;
+}
+
+.graph-node-rect {
+  fill: var(--bg-elevated);
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+  transition: stroke 160ms, stroke-width 160ms, fill 160ms;
+}
+.graph-node-group:hover .graph-node-rect,
+.graph-node-group.selected .graph-node-rect {
+  stroke: var(--accent) !important;
+  stroke-width: 2.4;
+}
+
+/* Сервер (увеличенный размер) */
+.graph-node-rect.server {
+  stroke-width: 2.2;
+}
+.graph-node-rect.server.ok     { stroke: color-mix(in oklab, var(--ok) 85%, transparent); }
+.graph-node-rect.server.warn   { stroke: color-mix(in oklab, var(--warn) 85%, transparent); }
+.graph-node-rect.server.danger { stroke: color-mix(in oklab, var(--danger) 90%, transparent); }
+
+.status-dot.ok     { fill: var(--ok); }
+.status-dot.warn   { fill: var(--warn); }
+.status-dot.danger { fill: var(--danger); }
+
+/* Операции */
+.graph-node-rect.operation.user   { stroke: color-mix(in oklab, var(--accent) 70%, transparent); }
+.graph-node-rect.operation.system { stroke: var(--border-strong); }
+
+/* Правила алертов */
+.graph-node-rect.rule.critical { stroke: color-mix(in oklab, var(--danger) 60%, transparent); }
+.graph-node-rect.rule.warning  { stroke: color-mix(in oklab, var(--warn) 60%, transparent); }
+.graph-node-rect.rule.info     { stroke: color-mix(in oklab, var(--info) 60%, transparent); }
+.graph-node-rect.rule.rule-disabled,
+.graph-node-rect.reaction.reaction-disabled {
+  stroke-dasharray: 4,4;
+  opacity: 0.75;
+}
+
+/* Реакции */
+.graph-node-rect.reaction {
+  stroke: color-mix(in oklab, #b794f6 60%, var(--border-strong));
+}
+
+.node-title {
+  fill: var(--fg);
+  font-size: 11px;
+  font-weight: 600;
+  pointer-events: none;
+}
+.node-title.server {
+  font-size: 12.5px;
+  font-weight: 700;
+}
+.node-sub {
+  fill: var(--fg-muted);
+  font-size: 9.5px;
+  font-family: var(--font-mono);
+  pointer-events: none;
+}
+.node-policy-text {
+  fill: var(--fg);
+  font-size: 8.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+.node-badge-text {
+  fill: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+/* Плавающий инспектор узла */
+.graph-inspector {
+  position: absolute;
+  width: 270px;
+  z-index: 25;
+  box-shadow: var(--shadow);
+  background: color-mix(in oklab, var(--bg-elevated) 90%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border-strong);
+  padding: 12px;
+  animation: graph-inspector-in 160ms var(--ease-out);
+}
+@keyframes graph-inspector-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* Контекстное меню ПКМ */
+.graph-context-menu {
+  position: fixed;
+  z-index: 90;
+  min-width: 180px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 4px;
+  animation: fade-in 100ms var(--ease-out);
+}
+.graph-context-menu .menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.8125rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.graph-context-menu .menu-item:hover {
+  background: var(--bg-subtle);
+  color: var(--accent);
+}
+.graph-context-menu .menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+
+/* Модалки графа — всегда выше карточки инспектора (z-index 25) */
+.graph-container .modal-back {
+  z-index: 60;
+}
+.graph-container.fullscreen .modal-back {
+  z-index: 550;
+}
+
+/* Легенда графа в правом верхнем углу */
+.graph-legend-wrap {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.graph-legend-btn {
+  background: color-mix(in oklab, var(--bg-elevated) 85%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border-strong);
+}
+.graph-legend-card {
+  width: 245px;
+  padding: 10px 12px;
+  box-shadow: var(--shadow);
+  background: color-mix(in oklab, var(--bg-elevated) 92%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border-strong);
+  animation: fade-in 120ms var(--ease-out);
+}
+.legend-shape {
+  display: inline-block;
+  width: 14px;
+  height: 10px;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg-elevated);
+  flex-shrink: 0;
+}
+.legend-shape.srv  { border-radius: 3px; border-color: var(--ok); }
+.legend-shape.op   { border-radius: 999px; border-color: var(--accent); }
+.legend-shape.rule { border-radius: 2px; border-left: 3px solid var(--warn); }
+.legend-shape.rx   { border-radius: 2px; border-color: #b794f6; }
+.legend-line {
+  display: inline-block;
+  width: 16px;
+  height: 0;
+  border-top: 2px solid var(--fg-muted);
+  flex-shrink: 0;
+}
+.legend-line.dashed {
+  border-top-style: dashed;
 }

@@ -81,6 +81,11 @@ AAD_LLM = b"melecho-llm-key-v1"  # legacy: один ключ в settings
 AAD_PROFILE_EXPORT = b"melecho-profile-export-v1"
 
 
+def aad_ssh_key_file(key_name: str) -> bytes:
+    """AAD для приватного SSH-ключа, зашифрованного в profiles/<slug>/keys/."""
+    return f"melecho-ssh-key-file-v1|{key_name}".encode("utf-8")
+
+
 def aad_llm_profile(profile_id: int, version: int) -> bytes:
     """AAD для ключа конкретного LLM-профиля.
 

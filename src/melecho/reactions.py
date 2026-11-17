@@ -131,6 +131,12 @@ class ReactionEngine:
 
         op_id = (body.get("operation_id") or "").strip()
         op = self.catalog.get(op_id)
+        if (op.get("flags") or {}).get("streaming"):
+            raise AppError(
+                "E_PARAM",
+                "потоковую (streaming) операцию нельзя использовать в реакциях",
+                status=400,
+            )
 
         match = body.get("match") or {}
         if not isinstance(match, dict):
@@ -273,67 +279,69 @@ class ReactionEngine:
         return self._public_rule(self.get_rule(rid))
 
     async def update_rule(self, rid: int, body: dict) -> dict:
-        self.get_rule(rid)
-        sets: list[str] = []
-        args: list = []
+        row = self.get_rule(rid)
+        if not body:
+            return self._public_rule(row)
 
-        if "name" in body:
-            name = (body.get("name") or "").strip()
-            if not name or len(name) > 200:
-                raise AppError("E_PARAM", "name: 1..200 символов", status=400)
-            sets.append("name=?")
-            args.append(name)
-        if "enabled" in body:
-            sets.append("enabled=?")
-            args.append(1 if body.get("enabled") else 0)
-        if "sudo_mode" in body:
-            sm = (body.get("sudo_mode") or "").strip()
-            if sm not in ("never", "auto", "confirm"):
-                raise AppError("E_PARAM", "sudo_mode: never|auto|confirm", status=400)
-            sets.append("sudo_mode=?")
-            args.append(sm)
-        if "action_policy" in body:
-            ap = (body.get("action_policy") or "").strip()
-            if ap not in ("auto", "confirm"):
-                raise AppError("E_PARAM", "action_policy: auto|confirm", status=400)
-            sets.append("action_policy=?")
-            args.append(ap)
-        if "cooldown_sec" in body:
-            try:
-                v = int(body["cooldown_sec"])
-            except (TypeError, ValueError):
-                raise AppError("E_PARAM", "cooldown_sec: целое", status=400)
-            if v < 0 or v > 86400:
-                raise AppError("E_PARAM", "cooldown_sec: 0..86400", status=400)
-            sets.append("cooldown_sec=?")
-            args.append(v)
-        if "max_attempts_per_alert" in body:
-            try:
-                v = int(body["max_attempts_per_alert"])
-            except (TypeError, ValueError):
-                raise AppError("E_PARAM", "max_attempts_per_alert: целое", status=400)
-            if v < 1 or v > 20:
-                raise AppError("E_PARAM", "max_attempts_per_alert: 1..20", status=400)
-            sets.append("max_attempts_per_alert=?")
-            args.append(v)
-        if "max_depth" in body:
-            try:
-                v = int(body["max_depth"])
-            except (TypeError, ValueError):
-                raise AppError("E_PARAM", "max_depth: целое", status=400)
-            if v < 1 or v > 10:
-                raise AppError("E_PARAM", "max_depth: 1..10", status=400)
-            sets.append("max_depth=?")
-            args.append(v)
+        # Быстрый путь для кнопки Включить/Отключить (работает даже если операция удалена).
+        if set(body.keys()) <= {"enabled"}:
+            ts = now_z()
+            en = 1 if body["enabled"] else 0
 
-        if not sets:
+            def fn_toggle(conn):
+                conn.execute(
+                    "UPDATE reaction_rules SET enabled=?, updated_at=? WHERE id=?",
+                    (en, ts, rid),
+                )
+
+            await self.db.mutate(fn_toggle)
             return self._public_rule(self.get_rule(rid))
-        sets.append("updated_at=?")
-        args.append(now_z())
-        args.append(rid)
+
+        try:
+            cur_match = json.loads(row["match_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            cur_match = {}
+        try:
+            cur_params = json.loads(row["params_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            cur_params = {}
+
+        merged = {
+            "name": body["name"] if "name" in body else row["name"],
+            "match": body["match"] if "match" in body else cur_match,
+            "operation_id": body["operation_id"] if "operation_id" in body else row["operation_id"],
+            "params": body["params"] if "params" in body else cur_params,
+            "run_on_server": body["run_on_server"] if "run_on_server" in body else row["run_on_server"],
+            "sudo_mode": body["sudo_mode"] if "sudo_mode" in body else row["sudo_mode"],
+            "action_policy": body["action_policy"] if "action_policy" in body else row["action_policy"],
+            "cooldown_sec": body["cooldown_sec"] if "cooldown_sec" in body else row["cooldown_sec"],
+            "max_attempts_per_alert": (
+                body["max_attempts_per_alert"]
+                if "max_attempts_per_alert" in body
+                else row["max_attempts_per_alert"]
+            ),
+            "max_depth": body["max_depth"] if "max_depth" in body else row["max_depth"],
+            "enabled": body["enabled"] if "enabled" in body else bool(row["enabled"]),
+        }
+        fields = self.validate_rule_body(merged)
+        ts = now_z()
 
         def fn(conn):
-            conn.execute("UPDATE reaction_rules SET " + ", ".join(sets) + " WHERE id=?", args)
+            conn.execute(
+                """UPDATE reaction_rules SET
+                     name=?, enabled=?, match_json=?, operation_id=?, params_json=?,
+                     run_on_server=?, sudo_mode=?, action_policy=?, cooldown_sec=?,
+                     max_attempts_per_alert=?, max_depth=?, updated_at=?
+                   WHERE id=?""",
+                (
+                    fields["name"], fields["enabled"], fields["match_json"],
+                    fields["operation_id"], fields["params_json"],
+                    fields["run_on_server"], fields["sudo_mode"],
+                    fields["action_policy"], fields["cooldown_sec"],
+                    fields["max_attempts_per_alert"], fields["max_depth"],
+                    ts, rid,
+                ),
+            )
 
         await self.db.mutate(fn)
         return self._public_rule(self.get_rule(rid))

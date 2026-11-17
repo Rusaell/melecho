@@ -20,3 +20,24 @@ steps:
   - command: "apt list --upgradable"
     expect_exit: 0
     ignore_stderr: true
+display:
+  type: table
+  format: regex
+  step: 1
+  title: "Доступные обновления пакетов"
+  regex: '^(?P<pkg>[^/\s]+)/(?P<repo>\S+)\s+(?P<new_ver>\S+)\s+(?P<arch>\S+)\s+\[upgradable from:\s*(?P<cur_ver>[^\]]+)\]$'
+  empty_text: "Все пакеты актуальны — доступных обновлений нет."
+  columns:
+    - key: pkg
+      label: Пакет
+      format: mono
+    - key: new_ver
+      label: Новая версия
+      format: mono
+    - key: cur_ver
+      label: Текущая
+      format: mono
+    - key: arch
+      label: Арх.
+    - key: repo
+      label: Репозиторий

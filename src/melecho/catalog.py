@@ -59,7 +59,140 @@ def _flags(raw: dict) -> dict:
         "expect_disconnect": bool(raw.get("expect_disconnect", False)),
         "escalatable": bool(raw.get("escalatable", False)),
         "state_changing": bool(raw.get("state_changing", False)),
+        "streaming": bool(raw.get("streaming", False)),
     }
+
+
+def _compile_display_regex(pat: str, ctx: str) -> None:
+    if not isinstance(pat, str) or not pat:
+        raise ValueError(f"{ctx}: regex должен быть непустой строкой")
+    if len(pat) > 500:
+        raise ValueError(f"{ctx}: regex слишком длинный (>500)")
+    # Поддерживаем оба синтаксиса именованных групп: Python (?P<name>) и JS (?<name>)
+    py_pat = re.sub(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>", r"(?P<\1>", pat)
+    try:
+        re.compile(py_pat, re.MULTILINE)
+    except re.error as e:
+        raise ValueError(f"{ctx}: некорректный regex ({e})") from e
+
+
+def _normalize_display(raw, *, _depth: int = 0) -> dict | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("display: должен быть mapping (объектом)")
+    dtype = raw.get("type")
+    allowed_types = ("kv", "lines", "table") if _depth > 0 else ("kv", "lines", "table", "sections")
+    if dtype not in allowed_types:
+        raise ValueError(f"display.type: ожидается {' | '.join(allowed_types)}")
+
+    out: dict = {"type": dtype}
+    if raw.get("title") is not None:
+        out["title"] = str(raw["title"])[:200]
+    if raw.get("empty_text") is not None:
+        out["empty_text"] = str(raw["empty_text"])[:300]
+    if raw.get("step") is not None:
+        try:
+            out["step"] = int(raw["step"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("display.step: должно быть целым") from e
+
+    if dtype == "sections":
+        secs = raw.get("sections")
+        if not isinstance(secs, list) or not (1 <= len(secs) <= 10):
+            raise ValueError("display.sections: нужен список от 1 до 10 секций")
+        out["sections"] = [_normalize_display(sec, _depth=1) for sec in secs]
+        return out
+
+    if dtype == "lines":
+        inc = raw.get("include")
+        exc = raw.get("exclude")
+        inc_list = [inc] if isinstance(inc, str) else (list(inc) if isinstance(inc, list) else [])
+        exc_list = [exc] if isinstance(exc, str) else (list(exc) if isinstance(exc, list) else [])
+        if not inc_list and not exc_list:
+            raise ValueError("display (lines): укажите include или exclude")
+        for pat in inc_list:
+            _compile_display_regex(pat, "display.include")
+        for pat in exc_list:
+            _compile_display_regex(pat, "display.exclude")
+        out["include"] = inc_list
+        out["exclude"] = exc_list
+        return out
+
+    fmt = raw.get("format") or ("regex" if dtype == "kv" else "json")
+    if fmt not in ("regex", "json"):
+        raise ValueError("display.format: ожидается regex | json")
+    out["format"] = fmt
+
+    if dtype == "kv":
+        fields = raw.get("fields")
+        if not isinstance(fields, list) or not (1 <= len(fields) <= 25):
+            raise ValueError("display.fields: нужен список от 1 до 25 полей")
+        norm_fields = []
+        for idx, f in enumerate(fields):
+            if not isinstance(f, dict):
+                raise ValueError(f"display.fields[{idx}]: должен быть объектом")
+            lbl = str(f.get("label") or f.get("key") or f"Поле {idx + 1}")
+            item: dict = {"label": lbl}
+            if fmt == "regex":
+                rx = f.get("regex")
+                _compile_display_regex(rx, f"display.fields[{idx}].regex")
+                item["regex"] = rx
+                if f.get("group") is not None:
+                    item["group"] = int(f["group"])
+            else:
+                key = f.get("key")
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError(f"display.fields[{idx}].key: обязателен для format=json")
+                item["key"] = key.strip()
+            for opt in ("format", "ok_if", "warn_if", "danger_if"):
+                if f.get(opt) is not None:
+                    val = str(f[opt])
+                    if opt.endswith("_if"):
+                        _compile_display_regex(val, f"display.fields[{idx}].{opt}")
+                    item[opt] = val
+            norm_fields.append(item)
+        out["fields"] = norm_fields
+        return out
+
+    # dtype == "table"
+    cols = raw.get("columns")
+    if not isinstance(cols, list) or not (1 <= len(cols) <= 20):
+        raise ValueError("display.columns: нужен список от 1 до 20 колонок")
+    norm_cols = []
+    for idx, c in enumerate(cols):
+        if not isinstance(c, dict):
+            raise ValueError(f"display.columns[{idx}]: должен быть объектом")
+        key = c.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"display.columns[{idx}].key: обязателен")
+        item = {"key": key.strip(), "label": str(c.get("label") or key)}
+        for opt in ("format", "expr", "warn_gt", "danger_gt"):
+            if c.get(opt) is not None:
+                item[opt] = c[opt]
+        norm_cols.append(item)
+    out["columns"] = norm_cols
+
+    if fmt == "regex":
+        rx = raw.get("regex")
+        _compile_display_regex(rx, "display.regex")
+        out["regex"] = rx
+        if raw.get("skip_lines") is not None:
+            out["skip_lines"] = max(0, int(raw["skip_lines"]))
+    else:
+        if raw.get("items_path") is not None:
+            out["items_path"] = str(raw["items_path"])
+        if raw.get("children_key") is not None:
+            out["children_key"] = str(raw["children_key"])
+        if isinstance(raw.get("filter_in"), dict):
+            out["filter_in"] = {
+                str(k): [str(x) for x in v]
+                for k, v in raw["filter_in"].items()
+                if isinstance(v, list)
+            }
+        if raw.get("other_summary") is not None:
+            out["other_summary"] = str(raw["other_summary"])
+    return out
 
 
 def _validate_unit(name: str) -> None:
@@ -295,13 +428,30 @@ class Catalog:
                 _check_template(st["command"], self.allowed_commands)
         for c in (raw.get("applicability") or {}).get("check_command") or []:
             _check_head(c, self.allowed_commands, ctx="check_command: ")
+        flags = _flags(raw.get("flags"))
+        max_dur = raw.get("max_duration_sec")
+        if max_dur is not None:
+            try:
+                max_dur = int(max_dur)
+            except (TypeError, ValueError) as e:
+                raise ValueError("max_duration_sec: целое 5..3600") from e
+            if max_dur < 5 or max_dur > 3600:
+                raise ValueError("max_duration_sec: допустимо 5..3600 сек")
+        if flags.get("streaming"):
+            if len(steps) != 1:
+                raise ValueError("для streaming-операции допускается ровно 1 шаг в steps")
+            if raw.get("postconditions"):
+                raise ValueError("streaming-операция не поддерживает postconditions")
+        display = _normalize_display(raw.get("display"))
         return {
             "id": oid,
             "name": raw.get("name") or oid,
             "category": raw.get("category") or "other",
             "version": raw.get("version") or 1,
             "params": raw.get("params") or [],
-            "flags": _flags(raw.get("flags")),
+            "flags": flags,
+            "max_duration_sec": max_dur,
+            "display": display,
             "applicability": raw.get("applicability") or {},
             "preconditions": raw.get("preconditions") or [],
             "steps": steps,
@@ -329,6 +479,8 @@ class Catalog:
             "category": op.get("category"),
             "params": op.get("params") or [],
             "flags": op.get("flags") or {},
+            "max_duration_sec": op.get("max_duration_sec"),
+            "display": op.get("display"),
             "valid": op.get("valid", True),
             "error": op.get("error"),
             "source": op.get("source", "system"),

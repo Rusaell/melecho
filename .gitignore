@@ -32,3 +32,7 @@ audit.key
 /dev-docs/
 /tests/
 /scripts/
+
+# Локальные SSH-ключи для Docker Compose
+ssh/
+*.tar

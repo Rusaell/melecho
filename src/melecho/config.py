@@ -253,6 +253,12 @@ class AppConfig:
     min_warmup_residuals: int = 30
     z_window: int = 60
     z_threshold: float = 3.0
+    detector_ignore_drops: bool = True
+    min_sigma_cpu: float = 1.0
+    min_sigma_ram: float = 0.5
+    min_sigma_disk: float = 0.5
+    min_sigma_load: float = 0.05
+    min_sigma_net: float = 10240.0
     abs_cpu: float = 90
     abs_ram: float = 90
     abs_disk: float = 90
@@ -438,6 +444,12 @@ def load_config(
         min_warmup_residuals=int(det.get("min_warmup_residuals", 30)),
         z_window=int(det.get("z_window", 60)),
         z_threshold=float(det.get("z_threshold", 3.0)),
+        detector_ignore_drops=bool(det.get("ignore_drops", True)),
+        min_sigma_cpu=float(det.get("min_sigma_cpu", 1.0)),
+        min_sigma_ram=float(det.get("min_sigma_ram", 0.5)),
+        min_sigma_disk=float(det.get("min_sigma_disk", 0.5)),
+        min_sigma_load=float(det.get("min_sigma_load", 0.05)),
+        min_sigma_net=float(det.get("min_sigma_net", 10240.0)),
         abs_cpu=float(det.get("abs_cpu", 90)),
         abs_ram=float(det.get("abs_ram", 90)),
         abs_disk=float(det.get("abs_disk", 90)),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -9,6 +10,11 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from melecho.errors import AppError
+
+try:
+    import httpx2 as httpx
+except ImportError:
+    import httpx
 
 log = logging.getLogger("melecho")
 
@@ -83,41 +89,23 @@ def build_anomaly_prompt(alias: str, metric: str, payload: dict, catalog_ids: li
 
 
 def build_chat_system_prompt(allowed_commands: list[str]) -> str:
-    """System prompt для общего чата LLM.
-
-    В отличие от прежнего статичного текста (он жил в app.js и ничего не
-    знал о панели), этот промпт собирается на каждый запрос и включает
-    АКТУАЛЬНЫЙ whitelist команд. Поэтому когда пользователь добавил
-    команду в whitelist и спрашивает «а доступна ли теперь wg?» — модель
-    видит её в списке и отвечает по существу, а не «у меня нет доступа».
-
-    Тон — помощник админа, отвечает по-русски, не выполняет команды
-    (это делает каталог операций), не генерирует скрипты.
-    """
+    """System prompt для общего чата LLM."""
     cmds = ", ".join(sorted(allowed_commands)) if allowed_commands else "(список пуст)"
     return (
         "Ты — ассистент системного администратора в локальной панели Melecho.\n"
-        "Отвечай по-русски, кратко и по делу.\n"
+        "Отвечай по-русски, кратко и по делу, обычным текстом.\n"
         "\n"
-        "Ты работаешь в контексте локальной панели управления Linux-серверами\n"
-        "через SSH. В панели есть:\n"
-        "  - серверы (метрики, логи, systemd-сервисы);\n"
-        "  - операции из YAML-каталога (параметризованные argv);\n"
-        "  - алерты и проверки;\n"
-        "  - реакции на алерты.\n"
+        "Контекст панели (SSH без агента на серверах): серверы (метрики, логи, systemd),\n"
+        "операции из YAML-каталога (параметризованные argv), алерты, проверки и реакции.\n"
         "\n"
-        "Разрешённые команды для пользовательских операций (argv[0]):\n"
-        f"{cmds}\n"
+        f"Разрешённые команды (argv[0]): {cmds}\n"
         "\n"
-        "Если пользователь спрашивает про команду, которой нет в списке —\n"
-        "скажи прямо, что её нужно сначала добавить в белый список (вкладка\n"
-        "Автоматизация → Операции → Белый список команд).\n"
-        "\n"
-        "Не предлагай выполнять команды и не генерируй shell-скрипты.\n"
-        "Если тебе не хватает данных — скажи об этом одной фразой.\n"
-        "Для создания новой операции пользователь пишет команду\n"
-        "/operation <описание> — это отдельный режим, там ты получишь\n"
-        "расширенную инструкцию. В обычном чате ты просто консультируешь."
+        "Правила:\n"
+        "- Команду вне списка нужно сначала добавить в белый список (Автоматизация → Операции → Белый список команд).\n"
+        "- Не предлагай выполнять shell-команды напрямую и не генерируй shell-скрипты.\n"
+        "- Если не хватает данных — скажи одной фразой.\n"
+        "- Для генерации артефактов есть команды /operation, /alert, /reaction. Даже если в истории выше\n"
+        "  были YAML/JSON из этих режимов, учитывай их как контекст, но в обычном чате отвечай текстом."
     )
 
 
@@ -652,6 +640,11 @@ def build_suggest_operation_prompt(description: str, allowed_commands: list[str]
         "- Параметр ставится ОТДЕЛЬНЫМ argv: journalctl -n {lines},\n"
         "  НЕ -n{lines} и НЕ --since={since}\n"
         "- id: только [a-z][a-z0-9_]*, начинается с буквы\n"
+        "- Опционально: секция display в YAML, если нужно отформатировать вывод\n"
+        "  (type: kv с format: regex и fields:[{label, regex}]; либо type: lines\n"
+        "  с include: '...'; либо type: table с format: json|regex и columns)\n"
+        "- Для команд, которые без флагов работают бесконечно (ping, tail -f),\n"
+        "  либо ставь конечный флаг (ping -c 4), либо укажи flags.streaming: true\n"
         "\n"
         "ФОРМАТ ОТВЕТА (ровно так, ничего лишнего):\n"
         "\n"
@@ -960,7 +953,7 @@ class OpenAICompatLLM:
         в тех случаях, когда весь ответ ушёл в reasoning и text пуст.
         """
         assert_no_secrets(prompt)
-        import httpx
+        pass
 
         body = {
             "model": self.model,
@@ -974,27 +967,43 @@ class OpenAICompatLLM:
         # «Проверить связь» в UI покажет ошибку провайдера).
         if self.extra_params:
             body.update(self.extra_params)
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                r = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self._headers(),
-                    json=body,
-                )
-        except httpx.TimeoutException as e:
-            raise AppError("E_LLM_TIMEOUT", "таймаут запроса к LLM-провайдеру", status=504) from e
-        except httpx.RequestError as e:
-            log.warning("LLM request failed: %s", type(e).__name__)
-            raise AppError("E_LLM_NETWORK", "не удалось связаться с LLM-провайдером", status=502) from e
-
-        if r.status_code >= 400:
-            err_msg = _extract_provider_error(r)
-            log.warning("LLM provider returned HTTP %s%s", r.status_code, (" — " + err_msg) if err_msg else "")
-            raise AppError(
-                "E_LLM_PROVIDER",
-                f"LLM-провайдер ответил HTTP {r.status_code}" + (f": {err_msg}" if err_msg else ""),
-                status=502,
-            )
+        delays = [1.0, 2.0, 2.0]
+        r = None
+        for attempt in range(1, 4):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    r = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=self._headers(),
+                        json=body,
+                    )
+                if r.status_code >= 400:
+                    err_msg = _extract_provider_error(r)
+                    log.warning(
+                        "LLM provider returned HTTP %s%s (attempt %d/3)",
+                        r.status_code, (" — " + err_msg) if err_msg else "", attempt,
+                    )
+                    if attempt < 3 and r.status_code in (429, 500, 502, 503, 504):
+                        await asyncio.sleep(delays[attempt - 1])
+                        continue
+                    raise AppError(
+                        "E_LLM_PROVIDER",
+                        f"LLM-провайдер ответил HTTP {r.status_code}" + (f": {err_msg}" if err_msg else ""),
+                        status=502,
+                    )
+                break
+            except httpx.TimeoutException as e:
+                log.warning("LLM request timeout (attempt %d/3)", attempt)
+                if attempt < 3:
+                    await asyncio.sleep(delays[attempt - 1])
+                    continue
+                raise AppError("E_LLM_TIMEOUT", "таймаут запроса к LLM-провайдеру", status=504) from e
+            except httpx.RequestError as e:
+                log.warning("LLM request failed: %s (attempt %d/3)", type(e).__name__, attempt)
+                if attempt < 3:
+                    await asyncio.sleep(delays[attempt - 1])
+                    continue
+                raise AppError("E_LLM_NETWORK", "не удалось связаться с LLM-провайдером", status=502) from e
 
         try:
             data = r.json()
@@ -1024,15 +1033,14 @@ class OpenAICompatLLM:
             raw_text,
         )
 
-    async def stream_messages(self, messages: list[dict], max_tokens: int = 400):
-        """Стримит ответ по списку сообщений [{role, content}].
+    async def stream_events(self, messages: list[dict], max_tokens: int = 400):
+        """Стримит события ('thinking', None) и ('chunk', str) по списку сообщений.
 
-        Фильтрует reasoning-блоки (<thought>...</thought> и аналоги) по мере
-        стрима, чтобы они не долетали до UI. Открывающий/закрывающий тег
-        может прийти в разных чанках — поэтому держим маленький буфер-хвост.
+        Фильтрует reasoning-блоки (<thought>...</thought> и аналоги) и поля
+        delta.reasoning_content / delta.reasoning по мере стрима.
         """
         assert_no_secrets(json.dumps(messages, ensure_ascii=False))
-        import httpx
+        pass
 
         body = {
             "model": self.model,
@@ -1044,15 +1052,12 @@ class OpenAICompatLLM:
         if self.extra_params:
             body.update(self.extra_params)
 
-        # State machine для вырезания reasoning-блоков.
-        # Отслеживаем до 4 тегов; обычно используется один.
         open_tags = {f"<{t}>": f"</{t}>" for t in _REASONING_TAGS}
         max_open_len = max(len(k) for k in open_tags)
         buf = ""
-        skip_until: str | None = None  # закрывающий тег, которого ждём
+        skip_until: str | None = None
 
         def process(chunk: str) -> str:
-            """Возвращает текст, который можно отдать наружу."""
             nonlocal buf, skip_until
             buf += chunk
             out: list[str] = []
@@ -1060,8 +1065,6 @@ class OpenAICompatLLM:
                 if skip_until is not None:
                     idx = buf.find(skip_until)
                     if idx == -1:
-                        # Оставляем хвост длиной (len(skip_until) - 1), чтобы
-                        # поймать тег, разрезанный чанком.
                         keep = len(skip_until) - 1
                         if keep > 0:
                             buf = buf[-keep:] if len(buf) > keep else buf
@@ -1073,7 +1076,6 @@ class OpenAICompatLLM:
                     buf = buf[idx + len(skip_until):]
                     skip_until = None
                 else:
-                    # Ищем ближайший открывающий тег в буфере.
                     best_idx = -1
                     best_tag = None
                     for tag in open_tags:
@@ -1082,7 +1084,6 @@ class OpenAICompatLLM:
                             best_idx = i
                             best_tag = tag
                     if best_idx == -1:
-                        # Тега нет. Возможно, часть тега в хвосте.
                         keep = max_open_len - 1
                         if keep > 0 and len(buf) > keep:
                             out.append(buf[: len(buf) - keep])
@@ -1117,9 +1118,8 @@ class OpenAICompatLLM:
                             continue
                         payload = line[5:].strip()
                         if payload == "[DONE]":
-                            # flush остаток буфера, если он не внутри reasoning
                             if skip_until is None and buf:
-                                yield buf
+                                yield ("chunk", buf)
                             return
                         try:
                             data = json.loads(payload)
@@ -1128,18 +1128,35 @@ class OpenAICompatLLM:
                         choices = data.get("choices") or []
                         if not choices:
                             continue
+                        finish_reason = choices[0].get("finish_reason")
+                        if finish_reason == "length":
+                            log.warning("LLM stream truncated: finish_reason=length (model=%s)", self.model)
                         delta = choices[0].get("delta") or {}
+                        r_chunk = delta.get("reasoning_content") or delta.get("reasoning")
                         chunk = delta.get("content")
+                        if r_chunk and not chunk:
+                            yield ("thinking", None)
                         if not chunk:
                             continue
                         visible = process(chunk)
                         if visible:
-                            yield visible
+                            yield ("chunk", visible)
+                        elif skip_until is not None:
+                            yield ("thinking", None)
+                    # Flush хвоста буфера, если провайдер закрыл поток без data: [DONE]
+                    if skip_until is None and buf:
+                        yield ("chunk", buf)
         except httpx.TimeoutException as e:
             raise AppError("E_LLM_TIMEOUT", "таймаут LLM-стрима", status=504) from e
         except httpx.RequestError as e:
             log.warning("LLM chat stream failed: %s", type(e).__name__)
             raise AppError("E_LLM_NETWORK", "не удалось связаться с LLM-провайдером", status=502) from e
+
+    async def stream_messages(self, messages: list[dict], max_tokens: int = 400):
+        """Совместимая обёртка над stream_events: отдаёт только текстовые чанки."""
+        async for kind, val in self.stream_events(messages, max_tokens=max_tokens):
+            if kind == "chunk" and val:
+                yield val
 
     async def stream(self, prompt: str, max_tokens: int = 400):
         """Отдаёт текстовые чанки по мере поступления (SSE format `data: {json}`).
@@ -1147,7 +1164,7 @@ class OpenAICompatLLM:
         Используется эндпоинтом /api/v1/llm/chat для интерактивного окна.
         """
         assert_no_secrets(prompt)
-        import httpx
+        pass
 
         body = {
             "model": self.model,
@@ -1202,7 +1219,7 @@ class OpenAICompatLLM:
         """GET {base_url}/models — стандартный OpenAI-совместимый способ узнать
         доступные модели. Используется UI для автодополнения поля «модель».
         """
-        import httpx
+        pass
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:

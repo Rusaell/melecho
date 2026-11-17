@@ -122,9 +122,12 @@ def fetch_latest_version(repo: str, timeout_sec: float = 2.0) -> str | None:
     """GET GitHub Releases API. Возвращает tag_name или None.
     Любые ошибки → None, не бросает."""
     try:
-        import httpx
+        import httpx2 as httpx
     except ImportError:
-        return None
+        try:
+            import httpx
+        except ImportError:
+            return None
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
         with httpx.Client(timeout=timeout_sec) as client:
@@ -158,7 +161,11 @@ def detect_install_kind() -> str:
         return "appimage"
     if os.environ.get("FLATPAK_ID"):
         return "flatpak"
-    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+    if (
+        os.environ.get("MELECHO_DOCKER") == "1"
+        or Path("/.dockerenv").exists()
+        or Path("/run/.containerenv").exists()
+    ):
         return "docker"
 
     is_pipx = "pipx/venvs/" in sys.prefix.replace("\\", "/")
@@ -215,7 +222,7 @@ def install_hint(kind: str) -> str | None:
         "dev": "git pull && .venv/bin/pip install -e . --upgrade (если есть .git)",
         "flatpak": "flatpak update (см. ваш app-id)",
         "appimage": "Скачайте новую версию AppImage с github.com/Rusaell/melecho/releases",
-        "docker": "docker pull <image> и пересоздайте контейнер",
+        "docker": "docker compose pull && docker compose up -d (или docker compose up -d --build из исходников)",
     }.get(kind)
 
 
