@@ -370,7 +370,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow: visible;
   user-select: none;
 }
 .llm-window.collapsed {
@@ -383,11 +383,13 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   padding: 8px 12px;
   background: var(--bg-subtle);
   border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   cursor: move;
   touch-action: none;
 }
 .llm-window.collapsed .llm-window-head {
   border-bottom: none;
+  border-radius: var(--radius-lg);
 }
 .llm-window-title {
   flex: 1;
@@ -467,18 +469,17 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   position: relative;
 }
 .llm-window-dropdown {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 8px;
-  z-index: 70;
-  min-width: 200px;
-  max-width: min(320px, 90%);
+  position: fixed;
+  z-index: 360;
+  min-width: 170px;
+  max-width: min(280px, calc(100vw - 16px));
+  max-height: min(320px, calc(100vh - 16px));
+  overflow-y: auto;
   background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow);
   padding: 4px 0;
-  overflow: hidden;
 }
 .llm-window-dropdown button {
   display: block;
@@ -495,7 +496,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.llm-window-dropdown button:hover {
+.llm-window-dropdown button:hover:not(:disabled) {
   background: var(--bg-subtle);
 }
 .llm-window-dropdown button.active {
@@ -505,6 +506,28 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
 .llm-window-dropdown button.active::before {
   content: "● ";
   font-size: 0.6rem;
+}
+.llm-dropdown-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+.llm-window-dropdown button.llm-dropdown-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--accent);
+  font-weight: 500;
+}
+.llm-window-dropdown button.llm-dropdown-action:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent) 12%, var(--bg-subtle));
+}
+.llm-dropdown-action-hint {
+  font-size: 0.7rem;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  flex-shrink: 0;
 }
 .llm-window-resize {
   position: absolute;
@@ -526,6 +549,133 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+
+/* Анимированный placeholder для ввода LLM */
+.llm-input-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+.llm-input-wrap textarea {
+  width: 100%;
+}
+.llm-ph-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  align-items: flex-start;
+  padding: 8px 10px;
+  font-size: 0.875rem;
+  line-height: 1.35;
+  font-family: inherit;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.llm-chat-modal-input-area .llm-ph-overlay {
+  padding: 14px 100px 14px 16px;
+  line-height: 1.45;
+}
+.llm-chat-modal.expanded .llm-chat-modal-input-area .llm-ph-overlay {
+  padding: 24px 24px 90px 24px;
+}
+.llm-ph-word {
+  display: inline-block;
+  color: transparent;
+  background-image: linear-gradient(
+    105deg,
+    var(--fg-subtle) 0%,
+    var(--fg-subtle) 36%,
+    color-mix(in oklab, var(--accent) 45%, var(--fg)) 50%,
+    var(--fg-subtle) 64%,
+    var(--fg-subtle) 100%
+  );
+  background-size: 320% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: llm-ph-glow 5.2s ease-in-out infinite;
+}
+
+@keyframes svetyashka-sweep {
+  0%   { background-position: 100% 0; }
+  42%  { background-position: 0% 0; }
+  50%  { background-position: 0% 0; }
+  92%  { background-position: 100% 0; }
+  100% { background-position: 100% 0; }
+}
+@keyframes svetyashka-border {
+  0%, 100% { box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 25%, transparent); }
+  50%      { box-shadow: 0 0 14px color-mix(in oklab, var(--accent) 34%, transparent); }
+}
+
+.sym-btn.sym-btn-send.svetyashka-btn:not(:disabled),
+.llm-send-text.svetyashka-btn:not(:disabled) {
+  background-image: linear-gradient(
+    105deg,
+    var(--accent) 0%,
+    var(--accent) 36%,
+    color-mix(in oklab, var(--accent) 55%, #fff) 50%,
+    var(--accent) 64%,
+    var(--accent) 100%
+  );
+  background-size: 280% 100%;
+  background-position: 100% 0;
+  animation: svetyashka-sweep 3.8s ease-in-out infinite;
+  box-shadow: 0 0 12px color-mix(in oklab, var(--accent) 34%, transparent);
+}
+
+.card.svetyashka-card {
+  border-color: color-mix(in oklab, var(--accent) 65%, transparent);
+  background-image: linear-gradient(
+    105deg,
+    var(--bg-elevated) 0%,
+    var(--bg-elevated) 38%,
+    color-mix(in oklab, var(--accent) 12%, var(--bg-elevated)) 50%,
+    var(--bg-elevated) 62%,
+    var(--bg-elevated) 100%
+  );
+  background-size: 280% 100%;
+  background-position: 100% 0;
+  animation: svetyashka-sweep 2.8s ease-in-out infinite,
+             svetyashka-border 2s ease-in-out infinite;
+}
+.llm-ph-dots {
+  display: inline-flex;
+  color: var(--fg-subtle);
+}
+.llm-ph-dots > span {
+  opacity: 0.7;
+}
+.llm-ph-dots .d1 { animation: llm-dot-1 2.4s ease-in-out infinite; }
+.llm-ph-dots .d2 { animation: llm-dot-2 2.4s ease-in-out infinite; }
+.llm-ph-dots .d3 { animation: llm-dot-3 2.4s ease-in-out infinite; }
+
+@keyframes llm-ph-glow {
+  0%   { background-position: 100% 0; }
+  42%  { background-position: 0% 0; }
+  50%  { background-position: 0% 0; }
+  92%  { background-position: 100% 0; }
+  100% { background-position: 100% 0; }
+}
+@keyframes llm-dot-1 {
+  0%, 22%   { opacity: 0; }
+  25%, 95%  { opacity: 1; }
+  99%, 100% { opacity: 0; }
+}
+@keyframes llm-dot-2 {
+  0%, 47%   { opacity: 0; }
+  50%, 95%  { opacity: 1; }
+  99%, 100% { opacity: 0; }
+}
+@keyframes llm-dot-3 {
+  0%, 72%   { opacity: 0; }
+  75%, 95%  { opacity: 1; }
+  99%, 100% { opacity: 0; }
 }
 
 /* Чат */
@@ -1786,6 +1936,10 @@ input[type="number"]::-webkit-outer-spin-button {
   from { opacity: 0; transform: translate(-50%, -14px); }
   to { opacity: 1; transform: translate(-50%, 0); }
 }
+@keyframes banner-slide-in {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 
 .page { padding: var(--space-5); max-width: 1280px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; gap: var(--space-5); }
 .h2 { margin: 0 0 var(--space-4); font-size: 1.35rem; letter-spacing: -0.03em; font-weight: 600; }
@@ -2507,7 +2661,7 @@ input.server-picker-input {
   border-radius: var(--radius-xs);
   font-size: 0.75rem;
   color: #ead7a4;
-  animation: toast-in 200ms var(--ease-out);
+  animation: banner-slide-in 200ms var(--ease-out);
 }
 
 /* ============================================================
@@ -4154,7 +4308,7 @@ select {
   align-items: center;
   gap: 10px;
   box-shadow: var(--shadow);
-  animation: toast-in 200ms var(--ease-out);
+  animation: banner-slide-in 200ms var(--ease-out);
 }
 .llm-modal-error-banner {
   position: absolute;
@@ -4173,7 +4327,7 @@ select {
   align-items: center;
   gap: 10px;
   box-shadow: var(--shadow);
-  animation: toast-in 200ms var(--ease-out);
+  animation: banner-slide-in 200ms var(--ease-out);
 }
 .llm-error-icon {
   font-size: 1.1rem;
@@ -4229,6 +4383,25 @@ select {
   color: var(--warn);
   font-size: 0.8125rem;
   font-style: italic;
+}
+.llm-thinking-indicator {
+  display: inline-block;
+  font-size: 0.8125rem;
+  font-style: italic;
+  color: transparent;
+  background-image: linear-gradient(
+    105deg,
+    var(--fg-muted) 0%,
+    var(--fg-muted) 35%,
+    var(--accent) 50%,
+    var(--fg-muted) 65%,
+    var(--fg-muted) 100%
+  );
+  background-size: 300% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: llm-ph-glow 3.2s ease-in-out infinite;
 }
 
 /* Контекстное меню сообщений LLM (ПКМ в плавающем окне) */
@@ -4612,4 +4785,274 @@ select {
 }
 .legend-line.dashed {
   border-top-style: dashed;
+}
+
+/* ============================================================
+   Отчёты и печать PDF (@media print)
+   ============================================================ */
+.report-target-card {
+  padding: var(--space-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.report-step-row {
+  padding: 8px 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.report-step-row.dragging {
+  opacity: 0.25;
+  border-style: dashed;
+}
+.report-step-handle {
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  padding: 2px 4px;
+  border-radius: var(--radius-xs);
+  white-space: nowrap;
+}
+.report-step-handle:hover {
+  color: var(--fg);
+  background: var(--bg-subtle);
+}
+.report-step-ghost {
+  position: fixed;
+  z-index: 260;
+  padding: 8px 10px;
+  background: color-mix(in oklab, var(--bg-elevated) 85%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  box-sizing: border-box;
+}
+body.dragging-report-step,
+body.dragging-report-step * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+.report-progress-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.report-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 240ms var(--ease-out);
+}
+.report-print-sheet {
+  display: none;
+}
+
+@media print {
+  html, body {
+    background: #ffffff !important;
+    color: #111111 !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+  }
+  #app > .shell > *:not(.report-print-sheet) {
+    display: none !important;
+  }
+  .shell {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  .report-print-sheet {
+    display: block !important;
+    --bg: #ffffff;
+    --bg-elevated: #f8f9fa;
+    --bg-subtle: #eef1f4;
+    --bg-input: #ffffff;
+    --fg: #111111;
+    --fg-muted: #4b5563;
+    --fg-subtle: #6b7280;
+    --border: #d1d5db;
+    --border-strong: #9ca3af;
+    --accent: #1d4ed8;
+    --ok: #15803d;
+    --warn: #a16207;
+    --danger: #b91c1c;
+    background: #ffffff !important;
+    color: #111111 !important;
+    padding: 12px 16px;
+    font-size: 10.5pt;
+  }
+  .report-print-sheet .card,
+  .report-print-sheet .form-section {
+    background: #ffffff !important;
+    border: 1px solid #d1d5db !important;
+    box-shadow: none !important;
+    break-inside: avoid;
+  }
+  .report-print-sheet .pre {
+    background: #f8f9fa !important;
+    color: #111111 !important;
+    border: 1px solid #d1d5db !important;
+    max-height: none !important;
+    overflow: visible !important;
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+  }
+  .report-print-sheet details > summary {
+    display: none;
+  }
+  .report-print-sheet details {
+    display: block;
+  }
+}
+
+/* ============================================================
+   Markdown-форматирование ответов LLM (VDOM, без innerHTML)
+   ============================================================ */
+.llm-msg.assistant.llm-md {
+  white-space: normal;
+}
+.llm-md-root {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.llm-md-p {
+  margin: 0;
+}
+.llm-md-h {
+  margin: 4px 0 0;
+  font-weight: 650;
+  line-height: 1.3;
+  color: var(--fg);
+}
+.llm-md-h1 { font-size: 1.06rem; }
+.llm-md-h2 { font-size: 0.98rem; }
+.llm-md-h3, .llm-md-h4, .llm-md-h5, .llm-md-h6 {
+  font-size: 0.9rem;
+  color: var(--accent);
+}
+.llm-md-code {
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--bg) 72%, var(--fg) 6%);
+  border: 1px solid var(--border);
+  word-break: break-word;
+}
+.llm-md-codeblock {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  overflow: hidden;
+  margin: 2px 0;
+  max-width: 100%;
+}
+.llm-md-codehead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 8px;
+  background: color-mix(in oklab, var(--bg-elevated) 85%, var(--bg));
+  border-bottom: 1px solid var(--border);
+  font-size: 0.7rem;
+  color: var(--fg-muted);
+  user-select: none;
+}
+.llm-md-copy {
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+}
+.llm-md-copy:hover {
+  color: var(--fg);
+  background: var(--bg-subtle);
+}
+.llm-md-pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre;
+  scrollbar-width: thin;
+}
+.llm-md-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.llm-md-list .llm-md-list {
+  margin-top: 3px;
+}
+.llm-md-quote {
+  margin: 0;
+  padding: 4px 10px;
+  border-left: 3px solid var(--accent);
+  background: color-mix(in oklab, var(--accent) 7%, transparent);
+  color: var(--fg-muted);
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.llm-md-hr {
+  border: 0;
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+.llm-md-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+.llm-md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.llm-md-table th,
+.llm-md-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+.llm-md-table th:last-child,
+.llm-md-table td:last-child {
+  border-right: none;
+}
+.llm-md-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.llm-md-align-center { text-align: center; }
+.llm-md-align-right { text-align: right; }
+.llm-md-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }

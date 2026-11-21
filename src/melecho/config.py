@@ -292,6 +292,7 @@ class AppConfig:
     disk_roles: dict[str, str] = field(default_factory=dict)
     catalog_dir: Path = Path("catalog")
     catalog_user_dir: Path | None = None
+    reports_user_dir: Path | None = None
     static_dir: Path = Path("static")
     catalog_allowed_commands: frozenset[str] = frozenset()
     # Профиль данных, к которому привязана эта конфигурация.
@@ -413,6 +414,8 @@ def load_config(
     else:
         catalog_user_dir = data_dir / "catalog.d"
 
+    reports_user_dir = data_dir / "reports.d"
+
     return AppConfig(
         db_path=db_path,
         audit_key_path=audit_key_path,
@@ -473,6 +476,7 @@ def load_config(
         catalog_allowed_commands=catalog_allowed,
         catalog_dir=catalog_dir,
         catalog_user_dir=catalog_user_dir,
+        reports_user_dir=reports_user_dir,
         static_dir=static_dir,
         profile_slug=profile_slug,
         profile_name=profile_name,

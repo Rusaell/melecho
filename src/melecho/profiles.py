@@ -211,6 +211,11 @@ def export_profile_bytes(
             if cat.exists() and any(cat.iterdir()):
                 tar.add(cat, arcname="catalog.d")
 
+            # reports.d (пользовательские шаблоны отчётов)
+            rep_d = src_dir / "reports.d"
+            if rep_d.exists() and any(rep_d.iterdir()):
+                tar.add(rep_d, arcname="reports.d")
+
             # keys (зашифрованные DEK приватные SSH-ключи профиля)
             keys_d = src_dir / "keys"
             if keys_d.exists() and any(keys_d.iterdir()):

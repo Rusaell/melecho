@@ -1167,6 +1167,21 @@ def create_app(rt: Runtime) -> FastAPI:
             },
         )
 
+    @app.post("/api/v1/llm/suggest-report")
+    async def llm_suggest_report(request: Request):
+        rt.require_dek()
+        rt.rate.check("llm_suggest", 10)
+        body = await _read_json(request)
+        desc = body.get("description") or ""
+        return StreamingResponse(
+            rt.suggest_report_stream(desc, history=body.get("history")),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/api/v1/llm/suggest-operation")
     async def llm_suggest_operation(request: Request):
         """LLM-предложение YAML для user-операции.
@@ -1190,6 +1205,84 @@ def create_app(rt: Runtime) -> FastAPI:
             },
         )
 
+
+    # ---------- reports ----------
+
+    @app.get("/api/v1/reports/templates")
+    async def report_templates_list():
+        rt.require_dek()
+        return rt.report_templates_list()
+
+    @app.post("/api/v1/reports/validate")
+    async def report_template_validate(request: Request):
+        rt.require_dek()
+        body = await _read_json(request)
+        rid = _require_str(body, "id")
+        yaml_text = _require_str(body, "yaml", strip=False)
+        return rt.validate_report_yaml(rid, yaml_text)
+
+    @app.get("/api/v1/reports/templates/{rid}")
+    async def report_template_get(rid: str):
+        rt.require_dek()
+        return rt.report_template_get_yaml(rid)
+
+    @app.post("/api/v1/reports/templates")
+    async def report_template_create(request: Request):
+        rt.require_dek()
+        body = await _read_json(request)
+        rid = _require_str(body, "id")
+        yaml_text = _require_str(body, "yaml", strip=False)
+        return await rt.report_template_create(rid, yaml_text)
+
+    @app.patch("/api/v1/reports/templates/{rid}")
+    async def report_template_update(rid: str, request: Request):
+        rt.require_dek()
+        body = await _read_json(request)
+        yaml_text = _require_str(body, "yaml", strip=False)
+        return await rt.report_template_update(rid, yaml_text)
+
+    @app.delete("/api/v1/reports/templates/{rid}")
+    async def report_template_delete(rid: str):
+        rt.require_dek()
+        return await rt.report_template_delete(rid)
+
+    @app.post("/api/v1/reports/plan")
+    async def report_plan(request: Request):
+        rt.require_dek()
+        body = await _read_json(request)
+        return rt.plan_report(body)
+
+    @app.post("/api/v1/reports/run")
+    async def report_run(request: Request):
+        rt.require_dek()
+        rt.rate.check("report_run", 10)
+        body = await _read_json(request)
+        return await rt.start_report_run(body)
+
+    @app.get("/api/v1/reports/runs")
+    async def report_runs_list():
+        rt.require_dek()
+        return rt.list_report_runs()
+
+    @app.get("/api/v1/reports/runs/{job_id}")
+    async def report_run_get(job_id: str):
+        rt.require_dek()
+        return rt.get_report_run(job_id)
+
+    @app.post("/api/v1/reports/runs/{job_id}/cancel")
+    async def report_run_cancel(job_id: str):
+        rt.require_dek()
+        return await rt.cancel_report_run(job_id)
+
+    @app.get("/api/v1/reports/runs/{job_id}/export")
+    async def report_run_export(job_id: str, format: str = "md", display_mode: str | None = None):
+        rt.require_dek()
+        data, media_type, fname = rt.export_report_run(job_id, format, display_mode)
+        return Response(
+            data,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
 
     # ---------- alerts ----------
 

@@ -71,6 +71,7 @@ from melecho.llm import (
     build_suggest_alert_prompt,
     build_suggest_operation_prompt,
     build_suggest_reaction_prompt,
+    build_suggest_report_prompt,
     extract_yaml_block,
     parse_catalog_ids,
     prompt_hash,
@@ -88,6 +89,15 @@ from melecho.metrics import (
     parse_proc_stat,
     parse_uptime,
     run_downsample,
+)
+from melecho.reports import (
+    DISPLAY_MODES,
+    ReportCatalog,
+    evaluate_display,
+    export_report_csv,
+    export_report_json,
+    export_report_markdown,
+    parse_report_dict,
 )
 from melecho.retention import run_all_retention
 from melecho.ssh import (
@@ -197,7 +207,7 @@ def _sse_event(payload: dict) -> bytes:
 # начинает отвергать все запросы с E_HOST.
 _PROFILE_CFG_FIELDS = frozenset({
     "db_path", "audit_key_path", "data_dir",
-    "catalog_user_dir", "profile_slug", "profile_name",
+    "catalog_user_dir", "reports_user_dir", "profile_slug", "profile_name",
 })
 
 
@@ -426,8 +436,11 @@ class Runtime:
         self.ssh = SSHManager()
         self._ssh_sem = asyncio.Semaphore(max(1, int(getattr(cfg, "max_parallel_ssh", 10) or 10)))
         self._internet_check_lock = asyncio.Lock()
+        self.reports = ReportCatalog(getattr(cfg, "reports_user_dir", None))
         self._stream_jobs: dict[str, dict] = {}
         self._stream_tasks: dict[str, asyncio.Task] = {}
+        self._report_jobs: dict[str, dict] = {}
+        self._report_tasks: dict[str, asyncio.Task] = {}
         self.dek: bytes | None = None
         self.audit_key: bytes | None = None
         self.bootstrap: str | None = None
@@ -513,6 +526,12 @@ class Runtime:
                 t.cancel()
         if tasks:
             await asyncio.gather(*tasks.values(), return_exceptions=True)
+        rtasks = getattr(self, "_report_tasks", None) or {}
+        for t in list(rtasks.values()):
+            if not t.done():
+                t.cancel()
+        if rtasks:
+            await asyncio.gather(*rtasks.values(), return_exceptions=True)
         # 1. SSH: закрыть все живые сессии этого профиля.
         ssh = getattr(self, "ssh", None)
         if ssh is not None:
@@ -533,7 +552,7 @@ class Runtime:
             # поля (http_port, bind, ...) для переноса на новый профиль.
             # self.cfg всегда указывает на конфиг активного профиля —
             # это и есть «источник процессных параметров».
-            "db", "alerts", "reactions", "catalog", "detector", "ssh", "_ssh_sem", "_internet_check_lock", "_stream_jobs", "_stream_tasks",
+            "db", "alerts", "reactions", "catalog", "reports", "detector", "ssh", "_ssh_sem", "_internet_check_lock", "_stream_jobs", "_stream_tasks", "_report_jobs", "_report_tasks",
             "dek", "audit_key", "bootstrap", "sessions", "sudo",
             "paths", "prev_cpu", "prev_net", "llm", "collect_errors",
             "_collected_servers", "_retry_delay", "_next_collect",
@@ -1997,12 +2016,46 @@ class Runtime:
         row = self.get_server(sid)
         name = body.get("name")
         dek = self.dek
+        old_host, old_port = row["host"], row["port"]
+        new_host = _validate_host(body["host"]) if ("host" in body and body.get("host") is not None) else old_host
+        new_port = _validate_port(body["port"]) if ("port" in body and body.get("port") is not None) else old_port
+        host_changed = new_host != old_host
+        port_changed = new_port != old_port
+        new_os = None
+        if "os_family" in body and body.get("os_family") is not None:
+            new_os = str(body["os_family"]).strip()
+            if new_os not in {"debian", "ubuntu"}:
+                raise AppError("E_PARAM", "os_family: debian|ubuntu", status=400)
 
         def fn(conn):
             changed: list[str] = []
             if name:
                 conn.execute("UPDATE servers SET name=? WHERE id=?", (_validate_name(name), sid))
                 changed.append("name")
+            if host_changed or port_changed:
+                dup = conn.execute(
+                    "SELECT id, name FROM servers WHERE host=? AND port=? AND id!=?",
+                    (new_host, new_port, sid),
+                ).fetchone()
+                if dup:
+                    raise AppError(
+                        "E_DUPLICATE",
+                        f"сервер {new_host}:{new_port} уже добавлен как «{dup['name']}» (id={dup['id']}).",
+                        status=400,
+                    )
+                conn.execute("DELETE FROM known_hosts WHERE host=? AND port=?", (old_host, old_port))
+                conn.execute(
+                    "UPDATE servers SET host=?, port=?, host_key_mismatch_at=NULL, host_key_mismatch_fp=NULL WHERE id=?",
+                    (new_host, new_port, sid),
+                )
+                if host_changed:
+                    conn.execute("UPDATE servers SET nproc=NULL WHERE id=?", (sid,))
+                    changed.append("host")
+                if port_changed:
+                    changed.append("port")
+            if new_os is not None and new_os != row["os_family"]:
+                conn.execute("UPDATE servers SET os_family=? WHERE id=?", (new_os, sid))
+                changed.append("os_family")
             # is_local: toggle в Настройках сервера. Принимаем строго bool.
             if "is_local" in body and body.get("is_local") is not None:
                 il = body["is_local"]
@@ -2130,10 +2183,19 @@ class Runtime:
 
         await self.db.mutate(fn)
         # Если поменяли только метрики/имя/is_local — можно не рвать SSH без нужды,
-        # но при смене кредов обязательно дропаем.
-        if any(k in body for k in ("user", "auth_type", "credential", "key_path", "passphrase")):
+        # но при смене host/port/кредов обязательно дропаем и чистим кэши.
+        creds_changed = any(k in body for k in ("user", "auth_type", "credential", "key_path", "passphrase"))
+        if host_changed or port_changed or creds_changed:
             await self.ssh.drop(sid)
             self.paths.invalidate(sid)
+            self.collect_errors.pop(sid, None)
+            self._next_collect.pop(sid, None)
+            self._retry_delay.pop(sid, None)
+            self._server_offline.pop(sid, None)
+        if host_changed or port_changed:
+            self.ssh.clear_pending_host_key(old_host, old_port)
+        if host_changed:
+            self.detector.reset_server(sid)
         updated_row = self.get_server(sid)
         if "metrics_interval_sec" in body:
             eff_iv = self._server_interval_sec(updated_row)
@@ -5106,6 +5168,540 @@ class Runtime:
 
         return _gen()
 
+    # ---------- reports (шаблоны, запуск очередью, экспорт) ----------
+
+    def _reports_dir(self) -> Path:
+        d = getattr(self.cfg, "reports_user_dir", None)
+        if d is None:
+            raise AppError("E_STATE", "каталог отчётов отключён", status=500)
+        return d
+
+    def _report_path(self, rid: str) -> Path:
+        return self._reports_dir() / f"{rid}.yaml"
+
+    def _resolve_report_server_ref(self, ref) -> dict:
+        if isinstance(ref, int) and not isinstance(ref, bool):
+            return dict(self.get_server(ref))
+        s = str(ref or "").strip()
+        if not s:
+            raise AppError("E_PARAM", "пустая ссылка на сервер", status=400)
+        if s.isdigit():
+            return dict(self.get_server(int(s)))
+        row = self.db.conn.execute("SELECT * FROM servers WHERE llm_alias=?", (s,)).fetchone()
+        if row is not None:
+            return dict(row)
+        rows = self.db.conn.execute("SELECT * FROM servers WHERE name=?", (s,)).fetchall()
+        if len(rows) == 1:
+            return dict(rows[0])
+        if len(rows) > 1:
+            raise AppError("E_PARAM", f"несколько серверов с именем {s!r} — укажите llm_alias или id", status=400)
+        raise AppError("E_PARAM", f"сервер {s!r} не найден", status=400)
+
+    def _validate_report_spec(self, raw_spec: dict, *, require_id: bool = True) -> dict:
+        try:
+            spec = parse_report_dict(raw_spec, require_id=require_id)
+        except ValueError as e:
+            raise AppError("E_PARAM", str(e), status=400) from e
+
+        all_servers = [dict(r) for r in self.db.conn.execute("SELECT * FROM servers ORDER BY id").fetchall()]
+        for idx, t in enumerate(spec["targets"]):
+            srv_ref = t["server"]
+            if srv_ref == "all":
+                target_rows = all_servers
+                if not target_rows:
+                    raise AppError("E_PARAM", f"targets[{idx}]: нет ни одного сервера", status=400)
+            else:
+                target_rows = [self._resolve_report_server_ref(srv_ref)]
+
+            for st in t["steps"]:
+                oid = st["operation_id"]
+                op = self.catalog.get(oid)
+                if (op.get("flags") or {}).get("streaming"):
+                    raise AppError("E_PARAM", f"потоковую операцию {oid!r} нельзя использовать в отчёте", status=400)
+                for srow in target_rows:
+                    sid = srow["id"]
+                    if not self.is_operation_applicable(oid, sid):
+                        raise AppError(
+                            "E_OP_NOT_APPLICABLE",
+                            f"операция {oid!r} не привязана к серверу {srow['llm_alias']}",
+                            status=400,
+                        )
+                    units = json.loads(srow.get("allowed_units") or "[]")
+                    bind_params(op, st["params"], units)
+        return spec
+
+    @staticmethod
+    def _fix_llm_report_yaml(yaml_text: str) -> str:
+        """Авто-экранирование top-level name/description, если LLM забыла кавычки при наличии ':'."""
+        out_lines = []
+        for ln in yaml_text.splitlines():
+            m = re.match(r"^(name|description):\s+(.+)$", ln)
+            if m:
+                key, val = m.group(1), m.group(2).strip()
+                if val and val[0] not in ('"', "'", "|", ">", "{", "["):
+                    out_lines.append(f"{key}: {json.dumps(val, ensure_ascii=False)}")
+                    continue
+            out_lines.append(ln)
+        return "\n".join(out_lines) + ("\n" if yaml_text.endswith("\n") else "")
+
+    def _parse_report_yaml_safe(self, yaml_text: str) -> tuple[str | None, dict | None, str | None, str]:
+        if not isinstance(yaml_text, str) or not yaml_text.strip():
+            return None, None, "пустой YAML", yaml_text
+        used_yaml = yaml_text
+        try:
+            raw = yaml.safe_load(used_yaml)
+        except yaml.YAMLError as e:
+            fixed = self._fix_llm_report_yaml(yaml_text)
+            if fixed != yaml_text:
+                try:
+                    raw = yaml.safe_load(fixed)
+                    used_yaml = fixed
+                except yaml.YAMLError:
+                    return None, None, f"YAML не разбирается: {e}", yaml_text
+            else:
+                return None, None, f"YAML не разбирается: {e}", yaml_text
+        if not isinstance(raw, dict):
+            return None, None, "YAML должен быть объектом", used_yaml
+        raw_id = raw.get("id") if isinstance(raw.get("id"), str) else None
+        try:
+            spec = self._validate_report_spec(raw, require_id=True)
+        except AppError as e:
+            return raw_id, None, e.message, used_yaml
+        return raw_id, spec, None, used_yaml
+
+    def report_templates_list(self) -> dict:
+        return {"items": self.reports.list()}
+
+    def report_template_get_yaml(self, rid: str) -> dict:
+        if not ID_RE.match(rid):
+            raise AppError("E_PARAM", f"id {rid!r}: недопустимый формат", status=400)
+        p = self._report_path(rid)
+        if not p.exists():
+            raise AppError("E_NOT_FOUND", f"шаблон отчёта {rid!r} не найден", status=404)
+        raw_text = p.read_text(encoding="utf-8")
+        spec = None
+        err = None
+        try:
+            raw = yaml.safe_load(raw_text) or {}
+            spec = parse_report_dict(raw, require_id=True)
+        except Exception as e:
+            err = str(e)
+        return {"id": rid, "file": p.name, "yaml": raw_text, "spec": spec, "error": err}
+
+    def validate_report_yaml(self, rid: str, yaml_text: str) -> dict:
+        if not isinstance(yaml_text, str) or not yaml_text.strip():
+            return {"valid": False, "error": "введите YAML", "parsed": None}
+        try:
+            raw = yaml.safe_load(yaml_text)
+        except yaml.YAMLError as e:
+            return {"valid": False, "error": f"YAML не разбирается: {e}", "parsed": None}
+        if not isinstance(raw, dict):
+            return {"valid": False, "error": "YAML должен быть mapping", "parsed": None}
+        if rid and raw.get("id") != rid:
+            return {"valid": False, "error": f"id в YAML ({raw.get('id')!r}) не совпадает с id ({rid!r})", "parsed": None}
+        try:
+            spec = self._validate_report_spec(raw, require_id=bool(rid or raw.get("id")))
+        except AppError as e:
+            return {"valid": False, "error": e.message, "parsed": None}
+        return {"valid": True, "error": None, "parsed": spec}
+
+    async def report_template_create(self, rid: str, yaml_text: str) -> dict:
+        self._reports_dir()
+        if not ID_RE.match(rid):
+            raise AppError("E_PARAM", f"id {rid!r}: ожидается ^[a-z][a-z0-9_]{{0,63}}$", status=400)
+        p = self._report_path(rid)
+        if p.exists():
+            raise AppError("E_CONFLICT", f"шаблон отчёта {rid!r} уже существует", status=409)
+        raw_id, spec, err, _ = self._parse_report_yaml_safe(yaml_text)
+        if raw_id != rid:
+            raise AppError("E_PARAM", f"id в YAML ({raw_id!r}) не совпадает с id ({rid!r})", status=400)
+        if err or not spec:
+            raise AppError("E_PARAM", err or "некорректный шаблон отчёта", status=400)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(yaml_text, encoding="utf-8")
+        self.reports.load()
+        await self._audit_user_op("report.template.create", rid, p.name)
+        return self.reports.get(rid)
+
+    async def report_template_update(self, rid: str, yaml_text: str) -> dict:
+        self._reports_dir()
+        if not ID_RE.match(rid):
+            raise AppError("E_PARAM", f"id {rid!r}: недопустимый формат", status=400)
+        p = self._report_path(rid)
+        if not p.exists():
+            raise AppError("E_NOT_FOUND", f"шаблон отчёта {rid!r} не найден", status=404)
+        raw_id, spec, err, _ = self._parse_report_yaml_safe(yaml_text)
+        if raw_id != rid:
+            raise AppError("E_PARAM", f"id в YAML ({raw_id!r}) не совпадает с id ({rid!r})", status=400)
+        if err or not spec:
+            raise AppError("E_PARAM", err or "некорректный шаблон отчёта", status=400)
+        p.write_text(yaml_text, encoding="utf-8")
+        self.reports.load()
+        await self._audit_user_op("report.template.update", rid, p.name)
+        return self.reports.get(rid)
+
+    async def report_template_delete(self, rid: str) -> dict:
+        self._reports_dir()
+        if not ID_RE.match(rid):
+            raise AppError("E_PARAM", f"id {rid!r}: недопустимый формат", status=400)
+        p = self._report_path(rid)
+        if not p.exists():
+            raise AppError("E_NOT_FOUND", f"шаблон отчёта {rid!r} не найден", status=404)
+        p.unlink()
+        self.reports.load()
+        await self._audit_user_op("report.template.delete", rid, p.name)
+        return {"ok": True, "id": rid}
+
+    def _resolve_report_input_spec(self, body: dict) -> dict:
+        tid = (body.get("template_id") or "").strip() if isinstance(body.get("template_id"), str) else ""
+        if tid:
+            raw = self.reports.get(tid)
+            return self._validate_report_spec(raw, require_id=True)
+        if isinstance(body.get("yaml"), str) and body["yaml"].strip():
+            try:
+                raw = yaml.safe_load(body["yaml"])
+            except yaml.YAMLError as e:
+                raise AppError("E_PARAM", f"YAML не разбирается: {e}", status=400) from e
+            return self._validate_report_spec(raw, require_id=False)
+        if isinstance(body.get("spec"), dict):
+            return self._validate_report_spec(body["spec"], require_id=False)
+        raise AppError("E_PARAM", "укажите template_id, spec или yaml отчёта", status=400)
+
+    def _expand_report_targets(self, spec: dict) -> dict:
+        all_servers = [dict(r) for r in self.db.conn.execute("SELECT * FROM servers ORDER BY id").fetchall()]
+        by_sid: dict[int, dict] = {}
+        order_sids: list[int] = []
+        requires_confirmation = False
+        needs_sudo = False
+        total_steps = 0
+
+        for t in spec["targets"]:
+            srows = all_servers if t["server"] == "all" else [self._resolve_report_server_ref(t["server"])]
+            for sr in srows:
+                sid = sr["id"]
+                if sid not in by_sid:
+                    by_sid[sid] = {
+                        "server_id": sid,
+                        "server_name": sr["name"],
+                        "llm_alias": sr["llm_alias"],
+                        "steps": [],
+                    }
+                    order_sids.append(sid)
+                for st in t["steps"]:
+                    oid = st["operation_id"]
+                    op = self.catalog.get(oid)
+                    flags = op.get("flags") or {}
+                    if flags.get("requires_confirmation") or flags.get("state_changing") or flags.get("dangerous"):
+                        requires_confirmation = True
+                    wants_sudo = bool(st.get("use_sudo")) or any(
+                        step_wants_sudo(substitute_argv(x["command"], bind_params(op, st["params"], json.loads(sr.get("allowed_units") or "[]"))))
+                        for x in (op.get("steps") or [])
+                    )
+                    if wants_sudo:
+                        needs_sudo = True
+                    by_sid[sid]["steps"].append({
+                        "operation_id": oid,
+                        "operation_name": op["name"],
+                        "params": dict(st["params"]),
+                        "use_sudo": st.get("use_sudo"),
+                        "escalatable": bool(flags.get("escalatable")),
+                        "state_changing": bool(flags.get("state_changing")),
+                        "dangerous": bool(flags.get("dangerous")),
+                        "has_display": bool(op.get("display")),
+                        "display_spec": op.get("display"),
+                        "status": "pending",
+                        "duration_ms": None,
+                        "sudo_used": False,
+                        "error_code": None,
+                        "error_message": None,
+                        "steps": [],
+                        "display_data": None,
+                    })
+                    total_steps += 1
+
+        return {
+            "servers": [by_sid[sid] for sid in order_sids],
+            "requires_confirmation": requires_confirmation,
+            "needs_sudo": needs_sudo,
+            "sudo_unlocked": bool(self.sudo_get_password()),
+            "total_steps": total_steps,
+        }
+
+    def plan_report(self, body: dict) -> dict:
+        spec = self._resolve_report_input_spec(body)
+        exp = self._expand_report_targets(spec)
+        return {
+            "id": spec["id"],
+            "name": spec["name"],
+            "description": spec["description"],
+            "parallel_servers": spec["parallel_servers"],
+            "display_mode": spec["display_mode"],
+            "requires_confirmation": exp["requires_confirmation"],
+            "needs_sudo": exp["needs_sudo"],
+            "sudo_unlocked": exp["sudo_unlocked"],
+            "total_steps": exp["total_steps"],
+            "servers": [
+                {
+                    "server_id": s["server_id"],
+                    "server_name": s["server_name"],
+                    "llm_alias": s["llm_alias"],
+                    "steps": [
+                        {
+                            "operation_id": st["operation_id"],
+                            "operation_name": st["operation_name"],
+                            "params": st["params"],
+                            "use_sudo": st["use_sudo"],
+                            "state_changing": st["state_changing"],
+                            "dangerous": st["dangerous"],
+                            "has_display": st["has_display"],
+                        }
+                        for st in s["steps"]
+                    ],
+                }
+                for s in exp["servers"]
+            ],
+        }
+
+    def _prune_report_jobs(self, max_keep: int = 20, ttl_sec: float = 7200.0) -> None:
+        now = time.monotonic()
+        finished = [
+            (jid, j.get("finished_mono") or 0.0)
+            for jid, j in self._report_jobs.items()
+            if j.get("status") in ("done", "cancelled")
+        ]
+        for jid, ft in finished:
+            if now - ft > ttl_sec:
+                self._report_jobs.pop(jid, None)
+                self._report_tasks.pop(jid, None)
+        rem = [
+            (jid, j.get("finished_mono") or 0.0)
+            for jid, j in self._report_jobs.items()
+            if j.get("status") in ("done", "cancelled")
+        ]
+        if len(rem) > max_keep:
+            rem.sort(key=lambda x: x[1])
+            for jid, _ in rem[:-max_keep]:
+                self._report_jobs.pop(jid, None)
+                self._report_tasks.pop(jid, None)
+
+    def _public_report_job(self, job: dict, *, include_output: bool = True) -> dict:
+        out_servers = []
+        ok_cnt = 0
+        fail_cnt = 0
+        for srv in job["servers"]:
+            steps_out = []
+            for st in srv["steps"]:
+                if st["status"] == "ok":
+                    ok_cnt += 1
+                elif st["status"] in ("failed", "error"):
+                    fail_cnt += 1
+                item = {
+                    "operation_id": st["operation_id"],
+                    "operation_name": st["operation_name"],
+                    "params": st["params"],
+                    "use_sudo": st["use_sudo"],
+                    "has_display": st["has_display"],
+                    "status": st["status"],
+                    "duration_ms": st["duration_ms"],
+                    "sudo_used": st["sudo_used"],
+                    "error_code": st["error_code"],
+                    "error_message": st["error_message"],
+                }
+                if include_output:
+                    item["display"] = st.get("display_spec")
+                    item["display_data"] = st.get("display_data")
+                    item["steps"] = st.get("steps") or []
+                steps_out.append(item)
+            out_servers.append({
+                "server_id": srv["server_id"],
+                "server_name": srv["server_name"],
+                "llm_alias": srv["llm_alias"],
+                "steps": steps_out,
+            })
+        return {
+            "id": job["id"],
+            "template_id": job.get("template_id"),
+            "name": job["name"],
+            "description": job["description"],
+            "parallel_servers": job["parallel_servers"],
+            "display_mode": job["display_mode"],
+            "status": job["status"],
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
+            "total_steps": job["total_steps"],
+            "completed_steps": job["completed_steps"],
+            "ok_count": ok_cnt,
+            "fail_count": fail_cnt,
+            "servers": out_servers,
+        }
+
+    async def start_report_run(self, body: dict) -> dict:
+        spec = self._resolve_report_input_spec(body)
+        exp = self._expand_report_targets(spec)
+        if exp["requires_confirmation"] and not bool(body.get("confirm")):
+            raise AppError("E_CONFIRM", "отчёт содержит операции, требующие подтверждения", status=400)
+        sudo_pw = body.get("sudo_password")
+        if sudo_pw is not None:
+            if not isinstance(sudo_pw, str):
+                raise AppError("E_PARAM", "sudo_password: строка", status=400)
+            if "\n" in sudo_pw or "\r" in sudo_pw:
+                raise AppError("E_PARAM", "пароль sudo не должен содержать перевод строки", status=400)
+            sudo_pw = sudo_pw or None
+
+        job_id = secrets.token_urlsafe(12)
+        job = {
+            "id": job_id,
+            "template_id": body.get("template_id") if isinstance(body.get("template_id"), str) else None,
+            "name": spec["name"],
+            "description": spec["description"],
+            "parallel_servers": spec["parallel_servers"],
+            "display_mode": spec["display_mode"],
+            "status": "running",
+            "started_at": now_z(),
+            "finished_at": None,
+            "finished_mono": None,
+            "total_steps": exp["total_steps"],
+            "completed_steps": 0,
+            "cancelled": False,
+            "sudo_pw": sudo_pw,
+            "servers": exp["servers"],
+        }
+        self._prune_report_jobs()
+        self._report_jobs[job_id] = job
+        self._report_tasks[job_id] = asyncio.create_task(
+            self._run_report_job(job),
+            name=f"melecho.report.{job_id}",
+        )
+        return self._public_report_job(job, include_output=False)
+
+    async def _run_report_server(self, job: dict, srv_entry: dict) -> None:
+        sid = srv_entry["server_id"]
+        for st in srv_entry["steps"]:
+            if job["cancelled"] or self._shutdown_event.is_set():
+                st["status"] = "cancelled"
+                job["completed_steps"] += 1
+                continue
+            st["status"] = "running"
+            self.events.publish("report.progress", {
+                "job_id": job["id"],
+                "status": job["status"],
+                "completed_steps": job["completed_steps"],
+                "total_steps": job["total_steps"],
+                "server_id": sid,
+                "operation_id": st["operation_id"],
+                "step_status": "running",
+            })
+            t0 = time.monotonic()
+            had_prev_sudo = sid in self.sudo
+            try:
+                block_code = self._is_sid_blocked(sid)
+                if block_code:
+                    msg = (
+                        "нет подключения к интернету"
+                        if block_code == "E_NO_INTERNET"
+                        else "сервер не отвечает"
+                    )
+                    raise AppError(block_code, msg, status=502)
+                if job.get("sudo_pw"):
+                    self.sudo[sid] = (job["sudo_pw"], time.monotonic() + 120)
+                use_sudo = st["use_sudo"] if st["escalatable"] else None
+                if st["escalatable"] and use_sudo is None:
+                    use_sudo = False
+                res = await self.execute_op(st["operation_id"], sid, st["params"], use_sudo, confirm=True)
+                st["status"] = "ok"
+                st["duration_ms"] = res.get("duration_ms")
+                st["sudo_used"] = bool(res.get("sudo_used"))
+                st["steps"] = res.get("steps") or []
+                if st["display_spec"]:
+                    st["display_data"] = evaluate_display(st["display_spec"], st["steps"])
+            except AppError as e:
+                st["status"] = "failed"
+                st["duration_ms"] = int((time.monotonic() - t0) * 1000)
+                st["error_code"] = e.code
+                st["error_message"] = e.message
+            except Exception as e:
+                st["status"] = "error"
+                st["duration_ms"] = int((time.monotonic() - t0) * 1000)
+                st["error_code"] = "E_INTERNAL"
+                st["error_message"] = str(e)[:300]
+            finally:
+                if job.get("sudo_pw") and not had_prev_sudo:
+                    self.sudo.pop(sid, None)
+                job["completed_steps"] += 1
+                self.events.publish("report.progress", {
+                    "job_id": job["id"],
+                    "status": job["status"],
+                    "completed_steps": job["completed_steps"],
+                    "total_steps": job["total_steps"],
+                    "server_id": sid,
+                    "operation_id": st["operation_id"],
+                    "step_status": st["status"],
+                })
+
+    async def _run_report_job(self, job: dict) -> None:
+        try:
+            if job["parallel_servers"]:
+                await asyncio.gather(
+                    *(self._run_report_server(job, s) for s in job["servers"]),
+                    return_exceptions=True,
+                )
+            else:
+                for s in job["servers"]:
+                    await self._run_report_server(job, s)
+        except asyncio.CancelledError:
+            job["cancelled"] = True
+            raise
+        finally:
+            job["sudo_pw"] = None
+            job["finished_at"] = now_z()
+            job["finished_mono"] = time.monotonic()
+            job["status"] = "cancelled" if job["cancelled"] else "done"
+            self.events.publish("report.finished", {
+                "job_id": job["id"],
+                "status": job["status"],
+                "completed_steps": job["completed_steps"],
+                "total_steps": job["total_steps"],
+            })
+
+    def list_report_runs(self) -> dict:
+        items = [
+            self._public_report_job(j, include_output=False)
+            for j in sorted(self._report_jobs.values(), key=lambda x: x["started_at"], reverse=True)
+        ]
+        return {"items": items}
+
+    def get_report_run(self, job_id: str) -> dict:
+        job = self._report_jobs.get(job_id)
+        if job is None:
+            raise AppError("E_NOT_FOUND", "отчёт не найден", status=404)
+        return self._public_report_job(job, include_output=True)
+
+    async def cancel_report_run(self, job_id: str) -> dict:
+        job = self._report_jobs.get(job_id)
+        if job is None:
+            raise AppError("E_NOT_FOUND", "отчёт не найден", status=404)
+        job["cancelled"] = True
+        return {"ok": True}
+
+    def export_report_run(self, job_id: str, fmt: str, display_mode: str | None = None) -> tuple[bytes, str, str]:
+        job = self._report_jobs.get(job_id)
+        if job is None:
+            raise AppError("E_NOT_FOUND", "отчёт не найден", status=404)
+        dmode = display_mode or job.get("display_mode") or "display_and_raw"
+        if dmode not in DISPLAY_MODES:
+            raise AppError("E_PARAM", f"display_mode: {'|'.join(DISPLAY_MODES)}", status=400)
+        from melecho.profiles import _slug_base
+        safe_id = _slug_base(job.get("name") or "") or "report"
+        if safe_id == "profile" and not (job.get("name") or "").strip():
+            safe_id = "report"
+        if fmt == "json":
+            return export_report_json(job, dmode), "application/json; charset=utf-8", f"{safe_id}.json"
+        if fmt == "csv":
+            return export_report_csv(job, dmode), "text/csv; charset=utf-8", f"{safe_id}.csv"
+        if fmt == "md":
+            return export_report_markdown(job, dmode), "text/markdown; charset=utf-8", f"{safe_id}.md"
+        raise AppError("E_PARAM", "format: json|csv|md", status=400)
+
     # ---------- user operations (Should, iter 2) ----------
     #
     # Каталог пользовательских операций — YAML-файлы в catalog_user_dir.
@@ -7393,6 +7989,81 @@ class Runtime:
 
         return _gen()
 
+    def suggest_report_stream(self, description: str, history=None):
+        """SSE-поток: LLM предлагает YAML пакетного отчёта."""
+        if self.llm is None:
+            if not self.llm_enabled():
+                raise AppError("E_LLM_DISABLED", "LLM выключен. Включите в настройках.", status=409)
+            raise AppError(
+                "E_LLM_KEY",
+                "нет активного профиля или ключа — настройте в «Профили LLM»",
+                status=400,
+            )
+        desc = (description or "").strip()
+        if not desc:
+            raise AppError("E_PARAM", "description: непустая строка", status=400)
+        if len(desc) > 16000:
+            raise AppError("E_PARAM", "description: максимум 16000 символов", status=400)
+
+        servers_ctx = [
+            {"id": r["id"], "llm_alias": r["llm_alias"], "name": r["name"]}
+            for r in self.db.conn.execute("SELECT id, llm_alias, name FROM servers ORDER BY id").fetchall()
+        ]
+        ops_ctx = []
+        for op in self.catalog.list():
+            if not op.get("valid"):
+                continue
+            oid = op["id"]
+            app_aliases = None
+            if oid.startswith("user:"):
+                app_aliases = [
+                    s["llm_alias"] for s in servers_ctx
+                    if self.is_operation_applicable(oid, s["id"])
+                ]
+            ops_ctx.append({
+                "id": oid,
+                "name": op.get("name"),
+                "flags": op.get("flags") or {},
+                "params": op.get("params") or [],
+                "has_display": bool(op.get("display")),
+                "applicable_aliases": app_aliases,
+            })
+        existing_tpls = [
+            {"id": t["id"], "name": t.get("name")}
+            for t in self.reports.list() if t.get("valid", True)
+        ]
+
+        prompt = build_suggest_report_prompt(desc, servers_ctx, ops_ctx, existing_tpls)
+        log.info("suggest_report_stream: промпт (%d символов)", len(prompt))
+
+        def _parse(text: str):
+            yaml_text, explanation = extract_yaml_block(text)
+            used_yaml = yaml_text
+            if not yaml_text:
+                raw_id, spec, error = None, None, "модель не вернула YAML-блок"
+                valid = False
+            else:
+                raw_id, spec, error, used_yaml = self._parse_report_yaml_safe(yaml_text)
+                valid = spec is not None and error is None
+            return {
+                "explanation": explanation,
+                "yaml": used_yaml,
+                "id": raw_id,
+                "spec": spec,
+                "valid": valid,
+                "error": error,
+                "raw_response": text[:2000],
+            }, ("ok" if valid else "invalid_yaml")
+
+        return self._suggest_stream_common(
+            prompt=prompt,
+            role_label="suggest_report",
+            data_category="report_draft",
+            max_tokens=32768,
+            parse_fn=_parse,
+            history=self._validate_history(history),
+        )
+
     def suggest_operation_stream(self, description: str, history=None):
         """SSE-поток: LLM предлагает YAML user-операции.
 
@@ -7463,8 +8134,8 @@ class Runtime:
         desc = (description or "").strip()
         if not desc:
             raise AppError("E_PARAM", "description: непустая строка", status=400)
-        if len(desc) > 4000:
-            raise AppError("E_PARAM", "description: максимум 4000 символов", status=400)
+        if len(desc) > 16000:
+            raise AppError("E_PARAM", "description: максимум 16000 символов", status=400)
 
         existing = [
             dict(r) for r in self.db.conn.execute(
@@ -7598,8 +8269,8 @@ class Runtime:
         desc = (description or "").strip()
         if not desc:
             raise AppError("E_PARAM", "description: непустая строка", status=400)
-        if len(desc) > 4000:
-            raise AppError("E_PARAM", "description: максимум 4000 символов", status=400)
+        if len(desc) > 16000:
+            raise AppError("E_PARAM", "description: максимум 16000 символов", status=400)
 
         alert_rules_ctx = [
             {"id": r["id"], "name": r["name"],

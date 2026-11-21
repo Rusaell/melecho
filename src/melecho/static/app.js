@@ -689,6 +689,22 @@ function HostKeySection({ host, port, onChange }) {
     }
   }
 
+  useEffect(() => {
+    setProbeResult(null);
+    setProbeErr("");
+    setManualFp("");
+    setManualOk(false);
+    setChecked(false);
+  }, [host, port]);
+
+  useEffect(() => {
+    setProbeResult(null);
+    setProbeErr("");
+    setManualFp("");
+    setManualOk(false);
+    setChecked(false);
+  }, [host, port]);
+
   const confirmed = !!probeResult && (checked || manualOk);
 
   useEffect(() => {
@@ -711,7 +727,7 @@ function HostKeySection({ host, port, onChange }) {
       Отпечаток подтверждает, что вы подключаетесь именно к нужному серверу.
       Сверьте его с независимым каналом: в терминале на этой машине выполните
     </p>
-    <code class="cmd">ssh-keyscan -t ed25519 ${host || "HOST"} | ssh-keygen -lf -</code>
+    <code class="cmd">ssh-keyscan ${Number(port) && Number(port) !== 22 ? "-p " + Number(port) + " " : ""}-t ed25519 ${host || "HOST"} | ssh-keygen -lf -</code>
     <p class="muted">
       и сравните полученную строку <span class="mono">SHA256:…</span> с предъявленной ниже.
     </p>
@@ -1103,27 +1119,56 @@ function LineChart({ points, field, color, unit, net, yMin, yMax }) {
   </div>`;
 }
 
-function Spark({ values, color }) {
+function Spark({ values, color, glow = false }) {
   const ref = useRef(null);
+  const valuesKey = (values || []).map((v) => (v == null ? "" : v)).join(",");
   useEffect(() => {
     const canvas = ref.current;
     const Chart = window.Chart;
     if (!canvas || !Chart) return undefined;
     canvas.width = Math.max(160, canvas.parentElement.clientWidth || 200);
     canvas.height = 48;
+    const baseColor = color || "#9db4c8";
+    const reduced = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const useGlow = !!(glow && !reduced && values && values.length >= 2);
+    const datasets = [
+      {
+        data: values,
+        borderColor: baseColor,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 1.4,
+      },
+    ];
+    if (useGlow) {
+      datasets.push({
+        data: values,
+        borderColor: "rgba(0,0,0,0)",
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 2.3,
+      });
+    }
+    const sparkShadowPlugin = {
+      id: "sparkShadow",
+      beforeDatasetDraw(chart, args) {
+        if (args.index !== 1) return;
+        chart.ctx.save();
+        chart.ctx.shadowColor = baseColor;
+        chart.ctx.shadowBlur = 7;
+      },
+      afterDatasetDraw(chart, args) {
+        if (args.index !== 1) return;
+        chart.ctx.restore();
+      },
+    };
     const ch = new Chart(canvas, {
       type: "line",
+      plugins: useGlow ? [sparkShadowPlugin] : [],
       data: {
         labels: values.map((_, i) => i),
-        datasets: [
-          {
-            data: values,
-            borderColor: color || "#9db4c8",
-            tension: 0.3,
-            pointRadius: 0,
-            borderWidth: 1.4,
-          },
-        ],
+        datasets,
       },
       options: {
         responsive: false,
@@ -1133,8 +1178,51 @@ function Spark({ values, color }) {
         scales: { x: { display: false }, y: { display: false } },
       },
     });
-    return () => ch.destroy();
-  }, [values, color]);
+    if (!useGlow) return () => ch.destroy();
+    let alive = true;
+    let rafId = null;
+    let lastDraw = 0;
+    const t0 = performance.now();
+    const PERIOD = 6600;
+    const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+    function tick(now) {
+      if (!alive) return;
+      rafId = requestAnimationFrame(tick);
+      if (document.hidden || !canvas.isConnected) return;
+      if (now - lastDraw < 33) return;
+      lastDraw = now;
+      const area = ch.chartArea;
+      if (!area || area.right <= area.left) return;
+      const u = ((now - t0) % PERIOD) / PERIOD;
+      let p = null;
+      if (u <= 0.32) p = ease(u / 0.32);
+      else if (u >= 0.36 && u <= 0.68) p = ease(1 - (u - 0.36) / 0.32);
+      if (p == null) {
+        ch.data.datasets[1].borderColor = "rgba(0,0,0,0)";
+        ch.update("none");
+        return;
+      }
+      const center = -0.20 + p * 1.40;
+      const half = 0.18;
+      const s0 = Math.max(0, Math.min(1, center - half));
+      const s1 = Math.max(0, Math.min(1, center));
+      const s2 = Math.max(0, Math.min(1, center + half));
+      const grad = ch.ctx.createLinearGradient(area.left, 0, area.right, 0);
+      grad.addColorStop(0, "rgba(232,242,255,0)");
+      grad.addColorStop(s0, "rgba(232,242,255,0)");
+      grad.addColorStop(s1, "rgba(232,242,255,0.92)");
+      grad.addColorStop(s2, "rgba(232,242,255,0)");
+      grad.addColorStop(1, "rgba(232,242,255,0)");
+      ch.data.datasets[1].borderColor = grad;
+      ch.update("none");
+    }
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      alive = false;
+      if (rafId != null) cancelAnimationFrame(rafId);
+      ch.destroy();
+    };
+  }, [valuesKey, color, glow]);
   return html`<div class="spark-box"><canvas ref=${ref}></canvas></div>`;
 }
 
@@ -1376,6 +1464,7 @@ function Wizard({ onDone, profiles, activeSlug, onSwitchProfile, onCreateProfile
     setErr("");
     try {
       const body = Object.assign({}, form, {
+        port: Number(form.port) || 22,
         hostkey_mode: mode,
         fingerprint_sha256: hostkey.fingerprint_sha256,
         key_type: hostkey.key_type,
@@ -1444,7 +1533,8 @@ function Wizard({ onDone, profiles, activeSlug, onSwitchProfile, onCreateProfile
           </div>
           <div class="grow-port">
             <label>Порт</label>
-            <input type="number" value=${form.port} onInput=${(e) => setField("port", Number(e.target.value))} />
+            <input type="number" min="1" max="65535" value=${form.port}
+                   onInput=${(e) => setField("port", e.target.value === "" ? "" : Number(e.target.value))} />
           </div>
         </div>
         <label>User</label><input value=${form.user} onInput=${(e) => setField("user", e.target.value)} />
@@ -2020,7 +2110,7 @@ function Dashboard({ onOpen, llmEnabled, onOpenAlerts, internetOffline }) {
                   <div class="kpi">${fmtNum(s.ram)}<small>RAM %</small></div>
                   <div class="kpi">${fmtNum(s.disk)}<small>Disk %</small></div>
                 </div>
-                <${Spark} values=${(s.sparkline_cpu || []).map((v) => v ?? 0)} />
+                <${Spark} values=${(s.sparkline_cpu || []).map((v) => v ?? 0)} glow=${!isFrozen} />
               </div>
               ${!s.hostkey
                 ? html`<div class="banner warn">Host key не подтверждён — метрики не собираются</div>
@@ -2034,7 +2124,7 @@ function Dashboard({ onOpen, llmEnabled, onOpenAlerts, internetOffline }) {
     ${explain
       ? html`<${Modal} title="Интерпретация аномалии" onClose=${() => setExplain(null)}>
           <div class="muted">${explain.llm_alias} · ${explain.metric} · ${explain.provider}</div>
-          <p>${explain.explanation}</p>
+          <${LlmMarkdown} text=${explain.explanation} />
           <div class="row">${(explain.recommendations || []).map((id) => html`<span class="badge">${id}</span>`)}</div>
         </${Modal}>`
       : null}
@@ -2245,6 +2335,10 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
   const [authBusy, setAuthBusy] = useState(false);
   const [metricsCfg, setMetricsCfg] = useState({ interval: "", raw_days: "", agg_days: "" });
   const [metricsCfgBusy, setMetricsCfgBusy] = useState(false);
+  const [connDraft, setConnDraft] = useState({ host: "", port: 22, os_family: "ubuntu" });
+  const [connBusy, setConnBusy] = useState(false);
+  const [planningOp, setPlanningOp] = useState(null);
+  const [runningOps, setRunningOps] = useState(() => new Set());
 
   async function load() {
     const s = await api("/api/v1/servers/" + id);
@@ -2303,6 +2397,11 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
       interval: srv.metrics_interval_sec != null ? String(srv.metrics_interval_sec) : "",
       raw_days: srv.retention_raw_days != null ? String(srv.retention_raw_days) : "",
       agg_days: srv.retention_agg_days != null ? String(srv.retention_agg_days) : "",
+    });
+    setConnDraft({
+      host: srv.host || "",
+      port: srv.port || 22,
+      os_family: srv.os_family || "ubuntu",
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, srv && srv.id]);
@@ -2371,6 +2470,7 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
 
   async function doPlan(oid, params, escalatable) {
     setErr("");
+    setPlanningOp(oid);
     try {
       const body = { server_id: Number(id), params };
       if (escalatable) body.use_sudo = useSudo;
@@ -2379,40 +2479,62 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
       setPlanOk(false);
     } catch (ex) {
       setErr(ex.message);
+    } finally {
+      setPlanningOp((cur) => (cur === oid ? null : cur));
     }
   }
 
   async function doExec() {
-    const opObj = ops.find((o) => o.id === plan.oid);
+    const curPlan = plan;
+    if (!curPlan) return;
+    const opObj = ops.find((o) => o.id === curPlan.oid);
     const isStream = !!(opObj && opObj.flags && opObj.flags.streaming);
-    try {
-      const body = {
-        server_id: Number(id),
-        params: plan.params,
-        confirm: true,
-      };
-      if (plan.escalatable || plan.use_sudo) body.use_sudo = plan.use_sudo;
-      if (isStream) {
-        const job = await api("/api/v1/operations/" + plan.oid + "/stream/start", {
+    if (!isStream && runningOps.has(curPlan.oid)) return;
+    const body = {
+      server_id: Number(id),
+      params: curPlan.params,
+      confirm: true,
+    };
+    if (curPlan.escalatable || curPlan.use_sudo) body.use_sudo = curPlan.use_sudo;
+    if (isStream) {
+      try {
+        const job = await api("/api/v1/operations/" + curPlan.oid + "/stream/start", {
           method: "POST",
           body: JSON.stringify(body),
         });
-        setStreamExec({ ...job, oid: plan.oid, op: opObj });
+        setStreamExec({ ...job, oid: curPlan.oid, op: opObj });
         setPlan(null);
-      } else {
-        const r = await api("/api/v1/operations/" + plan.oid + "/execute", {
-          method: "POST",
-          body: JSON.stringify(body),
-        });
-        setExec(Object.assign({}, r, { _oid: plan.oid }));
-        setPlan(null);
+      } catch (ex) {
+        if (ex.code === "E_SUDO_REQUIRED") {
+          setSudo({ alias: srv.llm_alias, pending: true });
+          return;
+        }
+        setErr(ex.message);
       }
+      return;
+    }
+    setErr("");
+    setRunningOps((prev) => new Set([...prev, curPlan.oid]));
+    try {
+      const r = await api("/api/v1/operations/" + curPlan.oid + "/execute", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setExec(Object.assign({}, r, { _oid: curPlan.oid }));
+      setPlan((p) => (p && p.oid === curPlan.oid ? null : p));
     } catch (ex) {
       if (ex.code === "E_SUDO_REQUIRED") {
         setSudo({ alias: srv.llm_alias, pending: true });
         return;
       }
       setErr(ex.message);
+      showToast("Ошибка операции: " + ex.message, "error");
+    } finally {
+      setRunningOps((prev) => {
+        const next = new Set(prev);
+        next.delete(curPlan.oid);
+        return next;
+      });
     }
   }
 
@@ -2645,6 +2767,48 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
       showToast("Ошибка: " + ex.message, "error");
     } finally {
       setLocalBusy(false);
+    }
+  }
+
+  async function doSaveConn() {
+    if (!srv) return;
+    const h = (connDraft.host || "").trim();
+    const p = Number(connDraft.port);
+    if (!h) { setErr("host не может быть пустым"); return; }
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      setErr("port должен быть целым числом 1..65535");
+      return;
+    }
+    const addrChanged = h !== srv.host || p !== srv.port;
+    setErr("");
+    setConnBusy(true);
+    try {
+      const updated = await api("/api/v1/servers/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({
+          host: h,
+          port: p,
+          os_family: connDraft.os_family,
+        }),
+      });
+      setSrv(updated);
+      setConnDraft({
+        host: updated.host || "",
+        port: updated.port || 22,
+        os_family: updated.os_family || "ubuntu",
+      });
+      setIncomplete([]);
+      showToast(
+        addrChanged
+          ? "Подключение сохранено — подтвердите host key для нового адреса/порта"
+          : "Параметры подключения сохранены",
+        addrChanged ? "warn" : "ok",
+      );
+    } catch (ex) {
+      setErr(ex.message);
+      showToast("Ошибка: " + ex.message, "error");
+    } finally {
+      setConnBusy(false);
     }
   }
 
@@ -2988,10 +3152,13 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
                 }
                 return out;
               };
-              return html`<article class="card" key=${o.id}>
+              const isPlanning = planningOp === o.id;
+              const isRunning = runningOps.has(o.id);
+              return html`<article class=${"card" + (isRunning ? " svetyashka-card" : "")} key=${o.id}>
                 <h3>${o.name}</h3>
                 <div class="muted mono">${o.id}</div>
                 <div class="row">
+                  ${isRunning ? html`<span class="badge ok">выполняется…</span>` : null}
                   ${o.source === "user" ? html`<span class="badge">user</span>` : null}
                   ${o.applicable === false ? html`<span class="badge danger">не привязана</span>` : null}
                   ${o.flags?.state_changing ? html`<span class="badge warn">state</span>` : html`<span class="badge">read</span>`}
@@ -3025,9 +3192,11 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
                   ? html`<label class="check"><input type="checkbox" checked=${useSudo} onChange=${(e) => setUseSudo(e.target.checked)} /> Использовать sudo (явно)</label>`
                   : null}
                 <button class="btn btn-primary"
-                        disabled=${o.applicable === false}
+                        disabled=${o.applicable === false || isPlanning || isRunning}
                         title=${o.applicable === false ? "Операция не привязана к этому серверу" : ""}
-                        onClick=${() => doPlan(o.id, buildOpParams(), o.flags?.escalatable)}>План</button>
+                        onClick=${() => doPlan(o.id, buildOpParams(), o.flags?.escalatable)}>
+                  ${isRunning ? "Выполняется…" : (isPlanning ? "Готовлю план…" : "План")}
+                </button>
               </article>`;
             })}
             ${ops.filter((o) => !o.valid).map((o) => html`<article class="card" key=${o.id}><span class="badge danger">невалидна</span><div>${o.name}</div><div class="err">${o.error}</div></article>`)}
@@ -3047,7 +3216,7 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
           <label>Строк</label>
           <input type="number" min="1" max="1000" value=${lines} onInput=${(e) => setLines(e.target.value)} />
           <label class="check"><input type="checkbox" checked=${useSudo} onChange=${(e) => setUseSudo(e.target.checked)} /> Использовать sudo (явно)</label>
-          <button class="btn" onClick=${() => doPlan("journalctl_view", { lines: Number(lines) }, true)}>План journalctl</button>
+          <button class="btn" disabled=${planningOp === "journalctl_view" || runningOps.has("journalctl_view")} onClick=${() => doPlan("journalctl_view", { lines: Number(lines) }, true)}>${runningOps.has("journalctl_view") ? "Выполняется…" : (planningOp === "journalctl_view" ? "Готовлю план…" : "План journalctl")}</button>
           ${exec ? html`<pre class="pre">${(exec.steps || []).map((s) => s.stdout).join("\n")}</pre>` : null}
         </div>`
       : null}
@@ -3201,6 +3370,48 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
             </div>
           </div>
           <div class="card stack">
+            <h3>Подключение (SSH)</h3>
+            <p class="muted small">
+              При смене Host или порта текущая SSH-сессия закрывается, а сохранённый
+              отпечаток host key сбрасывается — потребуется подтвердить отпечаток заново.
+            </p>
+            <div class="server-form-row-two">
+              <div class="grow-host">
+                <label>Host / IP</label>
+                <input class="mono" value=${connDraft.host}
+                       disabled=${connBusy}
+                       onInput=${(e) => setConnDraft({ ...connDraft, host: e.target.value })} />
+              </div>
+              <div class="grow-port">
+                <label>Порт</label>
+                <input type="number" min="1" max="65535" value=${connDraft.port}
+                       disabled=${connBusy}
+                       onInput=${(e) => setConnDraft({
+                         ...connDraft,
+                         port: e.target.value === "" ? "" : Number(e.target.value),
+                       })} />
+              </div>
+            </div>
+            <label>OS</label>
+            <select value=${connDraft.os_family}
+                    disabled=${connBusy}
+                    onChange=${(e) => setConnDraft({ ...connDraft, os_family: e.target.value })}>
+              <option value="ubuntu">ubuntu</option>
+              <option value="debian">debian</option>
+            </select>
+            <div class="row">
+              <button type="button" class="btn btn-primary"
+                      disabled=${connBusy
+                        || !connDraft.host.trim()
+                        || (connDraft.host.trim() === (srv.host || "")
+                            && Number(connDraft.port) === Number(srv.port)
+                            && connDraft.os_family === (srv.os_family || "ubuntu"))}
+                      onClick=${doSaveConn}>
+                ${connBusy ? "Сохранение…" : "Сохранить подключение"}
+              </button>
+            </div>
+          </div>
+          <div class="card stack">
             <h3>Аутентификация</h3>
             <p class="muted">
               Параметры SSH-подключения. Применяются при следующем коннекте.
@@ -3334,7 +3545,13 @@ function ServerView({ id, onBack, internetOffline, llmEnabled }) {
       : null}
     ${plan
       ? html`<${Modal} title=${"План: " + plan.operation_id} onClose=${() => setPlan(null)}
-          footer=${html`<button class="btn btn-primary" disabled=${plan.state_changing && !planOk} onClick=${doExec}>Выполнить</button>`}>
+          footer=${html`<button class="btn btn-primary"
+              disabled=${runningOps.has(plan.oid) || (plan.state_changing && !planOk)}
+              onClick=${doExec}>
+            ${runningOps.has(plan.oid)
+              ? html`<span class="spin" aria-hidden="true">⟳</span> Выполняется…`
+              : "Выполнить"}
+          </button>`}>
           ${(plan.warnings || []).map((w) => html`<div class="badge warn">${w}</div>`)}
           <p class="muted">${plan.state_changing ? "Меняет состояние" : "Только чтение"}</p>
           ${(plan.steps || []).map(
@@ -3421,6 +3638,7 @@ function NewServer({ onClose, onCreated }) {
     setErr("");
     try {
       const body = Object.assign({}, form, {
+        port: Number(form.port) || 22,
         hostkey_mode: mode,
         fingerprint_sha256: hostkey.fingerprint_sha256,
         key_type: hostkey.key_type,
@@ -3458,7 +3676,8 @@ function NewServer({ onClose, onCreated }) {
       </div>
       <div class="grow-port">
         <label>Порт</label>
-        <input type="number" value=${form.port} onInput=${(e) => set("port", Number(e.target.value))} />
+        <input type="number" min="1" max="65535" value=${form.port}
+               onInput=${(e) => set("port", e.target.value === "" ? "" : Number(e.target.value))} />
       </div>
     </div>
     <label>User</label><input value=${form.user} onInput=${(e) => set("user", e.target.value)} />
@@ -3608,6 +3827,9 @@ function loadLLMChatHistory() {
       if (m.suggested_rule_patch && typeof m.suggested_rule_patch === "object") {
         o.suggested_rule_patch = m.suggested_rule_patch;
       }
+      if (m.suggested_report && typeof m.suggested_report === "object") {
+        o.suggested_report = m.suggested_report;
+      }
       return o;
     }).slice(-LLM_CHAT_MAX);
   } catch {
@@ -3632,6 +3854,7 @@ function saveLLMChatHistory(messages) {
         if (typeof m.suggested_alert_id === "number") o.suggested_alert_id = m.suggested_alert_id;
         if (typeof m.suggested_rule_id === "number") o.suggested_rule_id = m.suggested_rule_id;
         if (m.suggested_rule_patch) o.suggested_rule_patch = m.suggested_rule_patch;
+        if (m.suggested_report) o.suggested_report = m.suggested_report;
         return o;
       });
     localStorage.setItem(LLM_CHAT_LS_KEY, JSON.stringify(clean));
@@ -3655,30 +3878,55 @@ function saveLLMWindowState(s) {
 // Режимы чата. Ключ — то, что пишет пользователь, значение — 
 // что рендерится в pill и какое описание в tooltip.
 // Список расширяемый: /alert, /reaction — когда появятся.
+let _scrollToLlmProfilesPending = false;
+
+function calcDropdownPos(btnEl, minW = 180) {
+  if (!btnEl) return "";
+  const r = btnEl.getBoundingClientRect();
+  const maxW = Math.min(280, window.innerWidth - 16);
+  const estW = Math.max(minW, Math.min(r.width + 40, maxW));
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - estW - 8));
+  const spaceBelow = window.innerHeight - r.bottom - 8;
+  const spaceAbove = r.top - 8;
+  if (spaceBelow >= 170 || spaceBelow >= spaceAbove) {
+    return `left: ${Math.round(left)}px; top: ${Math.round(r.bottom + 4)}px; min-width: ${minW}px;`;
+  }
+  return `left: ${Math.round(left)}px; bottom: ${Math.round(window.innerHeight - r.top + 4)}px; min-width: ${minW}px;`;
+}
+
+function LlmPlaceholder({ show }) {
+  if (!show) return null;
+  return html`<div class="llm-ph-overlay" aria-hidden="true">
+    <span class="llm-ph-word">написать</span>
+    <span class="llm-ph-dots"><span class="d1">.</span><span class="d2">.</span><span class="d3">.</span></span>
+  </div>`;
+}
+
 const LLM_CHAT_MODES = [
   {
     value: "chat",
     label: "chat",
     description: "Обычный чат: вопросы, объяснения, консультации.",
-    placeholder: "написать…",
   },
   {
     value: "operation",
     label: "operation",
     description: "Режим создания операции: каждое сообщение — описание YAML.",
-    placeholder: "описание операции…",
   },
   {
     value: "alert",
     label: "alert",
     description: "Режим правил алертов: опишите условия, LLM вернёт JSON-правила.",
-    placeholder: "например: cpu > 1 — warning, cpu > 5 — critical",
   },
   {
     value: "reaction",
     label: "reaction",
     description: "Режим правил реакций: «если алерт X — запусти операцию Y».",
-    placeholder: "например: при critical алерте перезапусти nginx",
+  },
+  {
+    value: "report",
+    label: "report",
+    description: "Режим отчётов: опишите операции по серверам, LLM создаст шаблон отчёта.",
   },
 ];
 
@@ -3696,18 +3944,18 @@ const SMOOTH_DRAIN_FRAMES = 90;
 // Локальная справка по командам. Отвечаем без LLM — экономим токены
 // и гарантируем неизменность текста.
 const LLM_HELP_TEXT = [
-  "Доступные команды:",
+  "**Доступные команды:**",
   "",
-  "/operation <описание>         — создать YAML-операцию",
-  "/alert <описание>             — создать правила алертов",
-  "/reaction <описание>          — создать правило реакции",
-  "/explain <id> [вопрос]        — объяснить конкретный алерт",
-  "/explain-rule <id> [вопрос]   — объяснить правило алерта",
-  "/edit-rule <id> <описание>    — предложить правку правила",
-  "/help                         — эта справка",
+  "- `/operation <описание>` — создать YAML-операцию",
+  "- `/alert <описание>` — создать правила алертов",
+  "- `/reaction <описание>` — создать правило реакции",
+  "- `/report <описание>` — сгенерировать отчёт (YAML)",
+  "- `/explain <id> [вопрос]` — объяснить конкретный алерт",
+  "- `/explain-rule <id> [вопрос]` — объяснить правило алерта",
+  "- `/edit-rule <id> <описание>` — предложить правку правила",
+  "- `/help` — эта справка",
   "",
-  "Режим чата выбирается в шапке окна (pill рядом с профилем).",
-  "Обычные сообщения без команд идут в LLM как вопросы.",
+  "Режим чата выбирается в шапке окна (кнопка рядом с профилем). Обычные сообщения без команд идут в LLM как вопросы.",
 ].join("\n");
 
 const LLM_CHAT_MODE_LS_KEY = "melecho.llmChatMode";
@@ -3809,10 +4057,11 @@ function chatModeSpec(value) {
 // Универсальный хук delayed-tooltip: показывается через 1 сек hover,
 // исчезает мгновенно. Тултип рендерится в document.body — иначе его
 // обрезает .modal overflow: hidden или containing block от transform.
-function ModePill({ value, onChange, open, setOpen, onButtonClick }) {
+function ModePill({ value, onChange, onHelp, open, setOpen, onButtonClick, disabled }) {
   const spec = chatModeSpec(value);
   const tip = useDelayedTooltip(spec.description);
   const isActive = value !== "chat";
+  const ddStyle = open ? calcDropdownPos(tip.ref.current, 170) : "";
   return html`<div class="llm-mode-pill-wrap">
     <button ref=${tip.ref} type="button"
             onPointerEnter=${tip.onPointerEnter}
@@ -3823,14 +4072,47 @@ function ModePill({ value, onChange, open, setOpen, onButtonClick }) {
       <span class="llm-mode-pill-arrow" aria-hidden="true">▾</span>
     </button>
     ${open
-      ? html`<div class="llm-window-dropdown">
+      ? html`<div class="llm-window-dropdown" style=${ddStyle}>
           ${LLM_CHAT_MODES.map((m) => html`<button type="button" key=${m.value}
               class=${m.value === value ? "active" : ""}
               onClick=${() => { setOpen(false); onChange(m.value); }}>
-            ${m.label} <span class="muted small">· ${m.description}</span>
+            ${m.label}
           </button>`)}
+          <div class="llm-dropdown-sep"></div>
+          <button type="button" class="llm-dropdown-action"
+                  disabled=${!!disabled}
+                  title="Вывести справку по командам в чат"
+                  onClick=${() => { setOpen(false); onHelp && onHelp(); }}>
+            <span>? Справка</span>
+            <span class="llm-dropdown-action-hint">/help</span>
+          </button>
         </div>`
       : null}
+  </div>`;
+}
+
+function LLMProfilesDropdown({ profiles, activeId, onProfileChange, onCloseMenu, onGoSettings, styleStr }) {
+  return html`<div class="llm-window-dropdown" style=${styleStr || ""}>
+    ${profiles.map((p) => html`<button type="button" key=${p.id}
+        class=${p.id === activeId ? "active" : ""}
+        onClick=${() => {
+          onCloseMenu();
+          if (p.id !== activeId) onProfileChange(p.id);
+        }}>
+      ${p.name} <span class="muted small">· ${p.provider}</span>
+    </button>`)}
+    ${profiles.length > 0 ? html`<div class="llm-dropdown-sep"></div>` : null}
+    <button type="button" class="llm-dropdown-action"
+            title="Перейти в Настройки → Профили LLM"
+            onClick=${() => {
+              onCloseMenu();
+              onGoSettings && onGoSettings();
+              _scrollToLlmProfilesPending = true;
+              window.dispatchEvent(new Event("melecho:open-llm-profiles"));
+            }}>
+      <span>⚙ Профили LLM</span>
+      <span class="llm-dropdown-action-hint">↗</span>
+    </button>
   </div>`;
 }
 
@@ -3872,12 +4154,319 @@ function useDelayedTooltip(text, delayMs = 1000) {
 }
 
 
+function renderInlineMarkdown(str, depth = 0) {
+  if (!str) return null;
+  if (depth > 4) return str;
+  const rules = [
+    { type: "code", re: /`([^`\n]+)`/ },
+    { type: "link", re: /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/ },
+    { type: "bolditalic", re: /\*\*\*(?!\s|\*)([^\n]+?)(?<!\s|\*)\*\*\*/ },
+    { type: "bold", re: /\*\*(?!\s)([^\n]+?)(?<!\s)\*\*/ },
+    { type: "strike", re: /~~(?!\s)([^\n]+?)(?<!\s)~~/ },
+    { type: "italic", re: /\*(?!\s|\*)([^\n]+?)(?<!\s|\*)\*/ },
+    { type: "italic_u", re: /(^|[\s(\["'«])_(?!\s|_)([^_\n]+?)(?<!\s|_)_(?=$|[\s.,;:!?)\]"'»])/ },
+  ];
+  const out = [];
+  let rest = String(str);
+  let keyIdx = 0;
+
+  while (rest) {
+    let best = null;
+    let bestRule = null;
+    for (const r of rules) {
+      const m = r.re.exec(rest);
+      if (!m) continue;
+      const idx = r.type === "italic_u" ? m.index + m[1].length : m.index;
+      if (!best || idx < best.effIndex) {
+        best = m;
+        best.effIndex = idx;
+        bestRule = r;
+      }
+    }
+    if (!best) {
+      out.push(rest);
+      break;
+    }
+    if (best.effIndex > 0) {
+      out.push(rest.slice(0, best.effIndex));
+    }
+    const k = "inl_" + depth + "_" + (keyIdx++);
+    if (bestRule.type === "code") {
+      out.push(html`<code class="llm-md-code" key=${k}>${best[1]}</code>`);
+      rest = rest.slice(best.effIndex + best[0].length);
+    } else if (bestRule.type === "link") {
+      out.push(html`<a class="llm-md-link" key=${k} href=${best[2]} target="_blank" rel="noopener noreferrer">
+        ${renderInlineMarkdown(best[1], depth + 1)}
+      </a>`);
+      rest = rest.slice(best.effIndex + best[0].length);
+    } else if (bestRule.type === "bolditalic") {
+      out.push(html`<strong key=${k}><em>${renderInlineMarkdown(best[1], depth + 1)}</em></strong>`);
+      rest = rest.slice(best.effIndex + best[0].length);
+    } else if (bestRule.type === "bold") {
+      out.push(html`<strong key=${k}>${renderInlineMarkdown(best[1], depth + 1)}</strong>`);
+      rest = rest.slice(best.effIndex + best[0].length);
+    } else if (bestRule.type === "strike") {
+      out.push(html`<del key=${k}>${renderInlineMarkdown(best[1], depth + 1)}</del>`);
+      rest = rest.slice(best.effIndex + best[0].length);
+    } else if (bestRule.type === "italic") {
+      out.push(html`<em key=${k}>${renderInlineMarkdown(best[1], depth + 1)}</em>`);
+      rest = rest.slice(best.effIndex + best[0].length);
+    } else if (bestRule.type === "italic_u") {
+      out.push(html`<em key=${k}>${renderInlineMarkdown(best[2], depth + 1)}</em>`);
+      rest = rest.slice(best.index + best[0].length);
+    }
+  }
+  return out;
+}
+
+function splitTableCells(line) {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+function parseTableAligns(sepLine) {
+  return splitTableCells(sepLine).map((c) => {
+    const left = c.startsWith(":");
+    const right = c.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    return "left";
+  });
+}
+
+function parseMarkdownBlocks(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const blocks = [];
+  const fenceOpenRe = /^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)\s*$/;
+  const hrRe = /^\s*(?:[-*_]\s*){3,}$/;
+  const headRe = /^\s*(#{1,6})\s+(.+?)\s*#*$/;
+  const quoteRe = /^\s*>\s?(.*)$/;
+  const ulRe = /^(\s*)[-*+]\s+(.*)$/;
+  const olRe = /^(\s*)\d+[.)]\s+(.*)$/;
+  const tableSepRe = /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+
+  let i = 0;
+  while (i < lines.length) {
+    const ln = lines[i];
+
+    // 1. Fenced code block (вкл. незакрытый во время стрима)
+    const fm = fenceOpenRe.exec(ln);
+    if (fm) {
+      const fChar = fm[1][0];
+      const fLen = fm[1].length;
+      const lang = fm[2] || "";
+      const closeRe = new RegExp(`^\\s*${fChar === "`" ? "`" : "~"}{${fLen},}\\s*$`);
+      const body = [];
+      i++;
+      while (i < lines.length && !closeRe.test(lines[i])) {
+        body.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      blocks.push({ type: "code", lang, code: body.join("\n") });
+      continue;
+    }
+
+    // 2. Пустая строка
+    if (!ln.trim()) {
+      i++;
+      continue;
+    }
+
+    // 3. Горизонтальный разделитель
+    if (hrRe.test(ln)) {
+      blocks.push({ type: "hr" });
+      i++;
+      continue;
+    }
+
+    // 4. Заголовок
+    const hm = headRe.exec(ln);
+    if (hm) {
+      blocks.push({ type: "heading", level: hm[1].length, text: hm[2] });
+      i++;
+      continue;
+    }
+
+    // 5. Таблица (строка с | + строка-разделитель)
+    if (ln.includes("|") && i + 1 < lines.length && tableSepRe.test(lines[i + 1])) {
+      const headers = splitTableCells(ln);
+      const aligns = parseTableAligns(lines[i + 1]);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|") && !fenceOpenRe.test(lines[i])) {
+        rows.push(splitTableCells(lines[i]));
+        i++;
+      }
+      blocks.push({ type: "table", headers, aligns, rows });
+      continue;
+    }
+
+    // 6. Цитата
+    if (quoteRe.test(ln)) {
+      const qLines = [];
+      while (i < lines.length) {
+        const qm = quoteRe.exec(lines[i]);
+        if (!qm) break;
+        qLines.push(qm[1]);
+        i++;
+      }
+      blocks.push({ type: "quote", text: qLines.join("\n") });
+      continue;
+    }
+
+    // 7. Списки (с поддержкой вложенности)
+    const u0 = ulRe.exec(ln);
+    const o0 = olRe.exec(ln);
+    if (u0 || o0) {
+      const items = [];
+      const rootOrdered = !!o0;
+      const baseIndent = (u0 || o0)[1].length;
+      while (i < lines.length) {
+        const um = ulRe.exec(lines[i]);
+        const om = olRe.exec(lines[i]);
+        if (!um && !om) break;
+        const m = um || om;
+        const ind = m[1].length;
+        if (ind <= baseIndent && !!om !== rootOrdered) break;
+        items.push({ ordered: !!om, indent: ind, text: m[2] });
+        i++;
+      }
+      blocks.push({ type: "list", items });
+      continue;
+    }
+
+    // 8. Абзац
+    const pLines = [];
+    while (i < lines.length) {
+      const cur = lines[i];
+      if (!cur.trim() || fenceOpenRe.test(cur) || hrRe.test(cur) || headRe.test(cur)
+          || quoteRe.test(cur) || ulRe.test(cur) || olRe.test(cur)
+          || (cur.includes("|") && i + 1 < lines.length && tableSepRe.test(lines[i + 1]))) {
+        break;
+      }
+      pLines.push(cur);
+      i++;
+    }
+    if (pLines.length) blocks.push({ type: "p", lines: pLines });
+    else i++;
+  }
+  return blocks;
+}
+
+function buildNestedList(items) {
+  const root = { ordered: items[0].ordered, children: [] };
+  const stack = [{ indent: items[0].indent, list: root }];
+  for (const it of items) {
+    while (stack.length > 1 && it.indent < stack[stack.length - 1].indent) {
+      stack.pop();
+    }
+    const top = stack[stack.length - 1];
+    if (it.indent > top.indent && top.children && top.children.length > 0) {
+      const prevLi = top.children[top.children.length - 1];
+      const sub = { ordered: it.ordered, children: [] };
+      prevLi.sub.push(sub);
+      stack.push({ indent: it.indent, list: sub, children: sub.children });
+    } else if (it.ordered !== top.list.ordered && stack.length === 1) {
+      // Переключение ul <-> ol на верхнем уровне: продолжаем или создаём подсписок
+      top.list.children.push({ text: it.text, sub: [] });
+    } else {
+      top.list.children.push({ text: it.text, sub: [] });
+    }
+    if (!top.children) top.children = top.list.children;
+  }
+  return root;
+}
+
+function renderListTree(node, keyPfx) {
+  const Tag = node.ordered ? "ol" : "ul";
+  return html`<${Tag} class="llm-md-list" key=${keyPfx}>
+    ${node.children.map((li, idx) => html`<li key=${keyPfx + "_" + idx}>
+      ${renderInlineMarkdown(li.text)}
+      ${li.sub.map((s, sIdx) => renderListTree(s, keyPfx + "_" + idx + "_" + sIdx))}
+    </li>`)}
+  </${Tag}>`;
+}
+
+function LlmCodeBlock({ lang, code }) {
+  const [copied, setCopied] = useState(false);
+  function doCopy() {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }).catch(() => {});
+    }
+  }
+  return html`<div class="llm-md-codeblock">
+    <div class="llm-md-codehead">
+      <span class="mono">${lang || "code"}</span>
+      <button type="button" class="llm-md-copy" onClick=${doCopy}>
+        ${copied ? "Скопировано ✓" : "Копировать"}
+      </button>
+    </div>
+    <pre class="llm-md-pre"><code>${code}</code></pre>
+  </div>`;
+}
+
+function LlmMarkdown({ text }) {
+  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
+  return html`<div class="llm-md-root">
+    ${blocks.map((b, idx) => {
+      if (b.type === "code") return html`<${LlmCodeBlock} key=${idx} lang=${b.lang} code=${b.code} />`;
+      if (b.type === "hr") return html`<hr class="llm-md-hr" key=${idx} />`;
+      if (b.type === "heading") {
+        const cls = "llm-md-h llm-md-h" + Math.min(4, b.level);
+        return html`<div class=${cls} key=${idx}>${renderInlineMarkdown(b.text)}</div>`;
+      }
+      if (b.type === "quote") {
+        return html`<blockquote class="llm-md-quote" key=${idx}>
+          <${LlmMarkdown} text=${b.text} />
+        </blockquote>`;
+      }
+      if (b.type === "list") {
+        const tree = buildNestedList(b.items);
+        return renderListTree(tree, "lst_" + idx);
+      }
+      if (b.type === "table") {
+        return html`<div class="llm-md-table-wrap" key=${idx}>
+          <table class="llm-md-table">
+            <thead>
+              <tr>
+                ${b.headers.map((h, hi) => {
+                  const al = b.aligns[hi];
+                  const cls = al === "center" ? "llm-md-align-center" : (al === "right" ? "llm-md-align-right" : "");
+                  return html`<th key=${hi} class=${cls}>${renderInlineMarkdown(h)}</th>`;
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              ${b.rows.map((row, ri) => html`<tr key=${ri}>
+                ${b.headers.map((_, ci) => {
+                  const al = b.aligns[ci];
+                  const cls = al === "center" ? "llm-md-align-center" : (al === "right" ? "llm-md-align-right" : "");
+                  return html`<td key=${ci} class=${cls}>${renderInlineMarkdown(row[ci] ?? "")}</td>`;
+                })}
+              </tr>`)}
+            </tbody>
+          </table>
+        </div>`;
+      }
+      return html`<p class="llm-md-p" key=${idx}>
+        ${b.lines.map((ln, li) => html`${li > 0 ? html`<br />` : null}${renderInlineMarkdown(ln)}`)}
+      </p>`;
+    })}
+  </div>`;
+}
+
 function LLMChatModal({
   messages, input, setInput, streaming,
   attachment, setAttachment, attachNotice,
   sendMessage, cancelStream,
   profileName, profiles, activeId, onProfileChange,
-  chatMode, onChangeMode,
+  chatMode, onChangeMode, onHelp,
   onRequestClear,
   onClose,
   errorNotification, setErrorNotification,
@@ -3889,6 +4478,7 @@ function LLMChatModal({
   const [modePillOpen, setModePillOpen] = useState(false);
   const chatBoxRef = useRef(null);
   const inputRef = useRef(null);
+  const modalProfileBtnRef = useRef(null);
 
   useEffect(() => {
     try { inputRef.current && inputRef.current.focus(); } catch {}
@@ -3940,38 +4530,34 @@ function LLMChatModal({
          role="dialog" aria-modal="true">
 
       <div class="llm-chat-modal-head">
-        ${profiles.length > 0
-          ? html`<div class="llm-modal-pill-wrap">
-              <button type="button"
-                      class=${"llm-window-pill " + (pillOpen ? "open" : "")}
-                      onClick=${() => setPillOpen((v) => !v)}>
-                <span class="llm-window-pill-label">LLM</span>
-                <span class="llm-window-pill-sep">·</span>
-                <span class="llm-window-pill-text">${profileName || "профиль не задан"}</span>
-                <span class="llm-window-pill-arrow" aria-hidden="true">▾</span>
-              </button>
-              ${pillOpen
-                ? html`<div class="llm-window-dropdown">
-                    ${profiles.map((p) => html`<button type="button" key=${p.id}
-                        class=${p.id === activeId ? "active" : ""}
-                        onClick=${() => {
-                          setPillOpen(false);
-                          if (p.id !== activeId) onProfileChange(p.id);
-                        }}>
-                      ${p.name} <span class="muted small">· ${p.provider}</span>
-                    </button>`)}
-                  </div>`
-                : null}
-            </div>`
-          : html`<span class="llm-modal-profile-fallback muted small">
-              ${profileName || "профиль не задан"}
-            </span>`}
+        <div class="llm-modal-pill-wrap">
+          <button ref=${modalProfileBtnRef}
+                  type="button"
+                  class=${"llm-window-pill " + (pillOpen ? "open" : "")}
+                  onClick=${() => { setModePillOpen(false); setPillOpen((v) => !v); }}>
+            <span class="llm-window-pill-label">LLM</span>
+            <span class="llm-window-pill-sep">·</span>
+            <span class="llm-window-pill-text">${profileName || "профиль не задан"}</span>
+            <span class="llm-window-pill-arrow" aria-hidden="true">▾</span>
+          </button>
+          ${pillOpen
+            ? html`<${LLMProfilesDropdown}
+                  profiles=${profiles}
+                  activeId=${activeId}
+                  onProfileChange=${onProfileChange}
+                  onCloseMenu=${() => setPillOpen(false)}
+                  onGoSettings=${onClose}
+                  styleStr=${calcDropdownPos(modalProfileBtnRef.current, 190)} />`
+            : null}
+        </div>
         <${ModePill}
             value=${chatMode}
             onChange=${onChangeMode}
+            onHelp=${onHelp}
+            disabled=${streaming}
             open=${modePillOpen}
             setOpen=${setModePillOpen}
-            onButtonClick=${() => setModePillOpen((v) => !v)} />
+            onButtonClick=${() => { setPillOpen(false); setModePillOpen((v) => !v); }} />
         <button type="button" class="llm-window-btn" title="Закрыть"
                 onClick=${onClose}>×</button>
       </div>
@@ -4056,9 +4642,18 @@ function LLMChatModal({
                         Применить
                       </button>`);
                     }
+                    if (m.suggested_report) {
+                      actions.push(html`<button type="button" key="rep" class="llm-open-editor-btn"
+                          onClick=${() => window.dispatchEvent(new CustomEvent(
+                            "melecho:llm-open-report-editor",
+                            { detail: { yaml: m.suggested_report.yaml, spec: m.suggested_report.spec } }))}>
+                        В редактор
+                      </button>`);
+                    }
                     return html`<div key=${i} class=${"llm-msg-block " + m.role}
                         onContextMenu=${(e) => onMsgContextMenu && onMsgContextMenu(e, m, i, lastUserIdx, lastAssistantIdx)}>
                       <div class=${"llm-msg " + m.role
+                          + (m.role === "assistant" ? " llm-md" : "")
                           + (m.streaming ? " streaming" : "")
                           + (m.blocked ? " blocked" : "")}>
                         <div class=${"llm-reveal" + (m.attachment ? " shown" : "")}>
@@ -4071,7 +4666,22 @@ function LLMChatModal({
                               : null}
                           </div>
                         </div>
-                        ${m.blocked ? "🚫 " : ""}${(m.content || "").replace(/\n+$/, "") || (m.streaming ? (m.retryNotice ? html`<span class="llm-retry-indicator">${m.retryNotice}</span>` : (m.waitingText || "")) : (m.attachment ? "" : "…"))}
+                        ${(() => {
+                          const cleanText = (m.content || "").replace(/\n+$/, "");
+                          if (!cleanText) {
+                            return m.streaming
+                              ? (m.retryNotice
+                                  ? html`<span class="llm-retry-indicator">${m.retryNotice}</span>`
+                                  : (m.thinking
+                                      ? html`<span class="llm-thinking-indicator">Модель размышляет…</span>`
+                                      : (m.waitingText || "")))
+                              : (m.attachment ? "" : "…");
+                          }
+                          if (m.role === "assistant" && !m.blocked) {
+                            return html`<${LlmMarkdown} text=${cleanText} />`;
+                          }
+                          return (m.blocked ? "🚫 " : "") + cleanText;
+                        })()}
                       </div>
                       <div class=${"llm-reveal" + (actions.length ? " shown" : "")}>
                         <div class="llm-reveal-inner">
@@ -4096,10 +4706,9 @@ function LLMChatModal({
               </div>`
             : null}
           <div class="llm-chat-modal-input-area">
+            <${LlmPlaceholder} show=${!input} />
             <textarea ref=${inputRef}
-                      placeholder=${expanded
-                        ? "Большой запрос — Enter отправит, Shift+Enter новая строка"
-                        : chatModeSpec(chatMode).placeholder}
+                      placeholder=""
                       value=${input}
                       disabled=${streaming}
                       onInput=${(e) => setInput(e.target.value)}
@@ -4116,7 +4725,8 @@ function LLMChatModal({
                 ? (streaming
                     ? html`<button type="button" class="btn btn-danger llm-send-text"
                                   onClick=${cancelStream}>стоп</button>`
-                    : html`<button type="button" class="btn btn-primary llm-send-text"
+                    : html`<button type="button"
+                                  class=${"btn btn-primary llm-send-text" + (canSend ? " svetyashka-btn" : "")}
                                   disabled=${!canSend}
                                   onClick=${sendMessage}>отправить</button>`)
                 : (streaming
@@ -4124,6 +4734,7 @@ function LLMChatModal({
                         onClick=${cancelStream} />`
                     : html`<${SymBtn} symbol="➤" tooltip="Отправить"
                         send=${true}
+                        svetyashka=${true}
                         disabled=${!canSend}
                         onClick=${sendMessage} />`)}
             </div>
@@ -4168,6 +4779,7 @@ function LLMWindow() {
   const abortRef = useRef(null);
   const chatBoxRef = useRef(null);
   const inputRef = useRef(null);
+  const profileBtnRef = useRef(null);
   const dragRef = useRef(null);
   const resizeRef = useRef(null);
   const rafRef = useRef(null);
@@ -4517,8 +5129,13 @@ function LLMWindow() {
     try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
     if (!d.moved) {
       // Клик без движения — открываем/закрываем соответствующий dropdown.
-      if (d.wasPill) setPillOpen((v) => !v);
-      else if (d.wasModePill) setModePillOpen((v) => !v);
+      if (d.wasPill) {
+        setModePillOpen(false);
+        setPillOpen((v) => !v);
+      } else if (d.wasModePill) {
+        setPillOpen(false);
+        setModePillOpen((v) => !v);
+      }
       return;
     }
     // Snap-to-edge: если окно близко к краю — прилипаем.
@@ -4736,6 +5353,7 @@ function LLMWindow() {
               if (typeof built.suggested_alert_id === "number") next.suggested_alert_id = built.suggested_alert_id;
               if (typeof built.suggested_rule_id === "number") next.suggested_rule_id = built.suggested_rule_id;
               if (built.suggested_rule_patch) next.suggested_rule_patch = built.suggested_rule_patch;
+              if (built.suggested_report) next.suggested_report = built.suggested_report;
               return next;
             });
           } catch (e) {
@@ -4824,16 +5442,22 @@ function LLMWindow() {
   // читает SSE, дёргает handleSuggestEvent. applyFinal(fields) вызывается
   // ровно один раз при final-событии — он превращает структурный ответ
   // в { content, attachment, suggested_* } финального сообщения.
-  async function suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride, skipUserMsg = false) {
+  async function suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride, skipUserMsg = false, userAttach = null) {
     if (streaming) return;
     setErrorNotification(null);
     resetSuggestQueue();
     resetStreamQueue();     // на всякий случай: не должно быть активного чата
-    const userContent = userContentOverride || ("/" + modeLabel + " " + (body.description || ""));
+    const userContent = userContentOverride !== undefined
+      ? userContentOverride
+      : ("/" + modeLabel + " " + (body.description || ""));
     const userMsg = { role: "user", content: userContent, _mode: modeLabel };
+    if (userAttach) userMsg.attachment = userAttach;
     const placeholder = { role: "assistant", content: "", waitingText: placeholderText, streaming: true, _mode: modeLabel };
     setMessages((prev) => skipUserMsg ? [...prev, placeholder] : [...prev, userMsg, placeholder]);
-    if (!skipUserMsg) setInput("");
+    if (!skipUserMsg) {
+      setInput("");
+      setAttachment(null);
+    }
     setStreaming(true);
 
     suggestApplyFinalRef.current = applyFinal;
@@ -4880,13 +5504,21 @@ function LLMWindow() {
               const attemptStr = `${obj.attempt}/${obj.max_attempts}`;
               replaceLastAssistant((last) => ({
                 ...last,
+                thinking: false,
                 retryNotice: `Повтор запроса (${attemptStr})…`,
               }));
+            } else if (obj.type === "thinking") {
+              replaceLastAssistant((last) => (
+                last.thinking && !last.retryNotice
+                  ? last
+                  : { ...last, thinking: true, retryNotice: null }
+              ));
             } else if (obj.type === "chunk") {
-              replaceLastAssistant((last) => ({
-                ...last,
-                retryNotice: null,
-              }));
+              replaceLastAssistant((last) => (
+                !last.thinking && !last.retryNotice
+                  ? last
+                  : { ...last, thinking: false, retryNotice: null }
+              ));
             }
             if (obj.type === "error") {
               streamErr = { code: obj.code, message: obj.message };
@@ -4939,7 +5571,7 @@ function LLMWindow() {
             message: msg,
             onRetry: () => {
               setErrorNotification(null);
-              suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride, true);
+              suggestStream(modeLabel, endpoint, placeholderText, body, applyFinal, userContentOverride, true, userAttach);
             },
           });
         }
@@ -4963,10 +5595,13 @@ function LLMWindow() {
     }
   }
 
-  async function sendAlertCommand(description, skipUserMsg = false, historyMsgs = null) {
-    if (!description) return;
-    const history = buildContextHistory(historyMsgs || messages, "alert", contextCfg, description.length);
-    const body = { description };
+  async function sendAlertCommand(description, skipUserMsg = false, historyMsgs = null, attach = null) {
+    const cleanDesc = (description || "").trim();
+    if (!cleanDesc && !attach) return;
+    const effText = cleanDesc || "Доработай правила с учётом вложения.";
+    const fullDesc = attach ? expandMsgContent({ content: effText, attachment: attach }) : effText;
+    const history = buildContextHistory(historyMsgs || messages, "alert", contextCfg, fullDesc.length);
+    const body = { description: fullDesc };
     if (history.length) body.history = history;
     return suggestStream(
       "alert",
@@ -4994,21 +5629,25 @@ function LLMWindow() {
           const lines = invalid.map((x) => "  #" + x.index + ": " + x.error);
           content += (content ? "\n\n" : "") + "Отклонены:\n" + lines.join("\n");
         }
-        const attachment = valid.length
+        const attOut = valid.length
           ? { name: "alert-rules: " + valid.length, content: JSON.stringify(valid, null, 2) }
           : null;
         const suggested = (valid.length && !needsClarification && !impossible) ? valid : null;
-        return { content, attachment, suggested_alert_rules: suggested };
+        return { content, attachment: attOut, suggested_alert_rules: suggested };
       },
-      undefined,
+      attach ? cleanDesc : undefined,
       skipUserMsg,
+      attach,
     );
   }
 
-  async function sendReactionCommand(description, skipUserMsg = false, historyMsgs = null) {
-    if (!description) return;
-    const history = buildContextHistory(historyMsgs || messages, "reaction", contextCfg, description.length);
-    const body = { description };
+  async function sendReactionCommand(description, skipUserMsg = false, historyMsgs = null, attach = null) {
+    const cleanDesc = (description || "").trim();
+    if (!cleanDesc && !attach) return;
+    const effText = cleanDesc || "Доработай реакцию с учётом вложения.";
+    const fullDesc = attach ? expandMsgContent({ content: effText, attachment: attach }) : effText;
+    const history = buildContextHistory(historyMsgs || messages, "reaction", contextCfg, fullDesc.length);
+    const body = { description: fullDesc };
     if (history.length) body.history = history;
     return suggestStream(
       "reaction",
@@ -5031,14 +5670,15 @@ function LLMWindow() {
         if (!content && !valid) {
           content = "Модель не вернула правила реакции.";
         }
-        const attachment = valid
+        const attOut = valid
           ? { name: "reaction: " + (valid.name || "rule"), content: JSON.stringify(valid, null, 2) }
           : null;
         const suggested = (valid && !needsClarification && !impossible) ? valid : null;
-        return { content, attachment, suggested_reaction: suggested };
+        return { content, attachment: attOut, suggested_reaction: suggested };
       },
-      undefined,
+      attach ? cleanDesc : undefined,
       skipUserMsg,
+      attach,
     );
   }
 
@@ -5192,10 +5832,52 @@ function LLMWindow() {
     );
   }
 
-  async function sendOperationCommand(description, skipUserMsg = false, historyMsgs = null) {
-    if (!description) return;
-    const history = buildContextHistory(historyMsgs || messages, "operation", contextCfg, description.length);
-    const body = { description };
+  async function sendReportCommand(description, skipUserMsg = false, historyMsgs = null, attach = null) {
+    const cleanDesc = (description || "").trim();
+    if (!cleanDesc && !attach) return;
+    const effText = cleanDesc || "Проверь и доработай вложенный отчёт.";
+    const fullDesc = attach ? expandMsgContent({ content: effText, attachment: attach }) : effText;
+    const history = buildContextHistory(historyMsgs || messages, "report", contextCfg, fullDesc.length);
+    const body = { description: fullDesc };
+    if (history.length) body.history = history;
+    return suggestStream(
+      "report",
+      "/api/v1/llm/suggest-report",
+      "Готовлю отчёт…",
+      body,
+      (r) => {
+        const attOut = r.yaml
+          ? { name: "report: " + (r.id || "draft"), content: r.yaml }
+          : null;
+        let content = (r.explanation || "").trim();
+        const lower = content.toLowerCase();
+        const needsClarification = lower.startsWith("уточните:");
+        const impossible = lower.startsWith("невозможно:");
+        if (!content && !r.yaml) {
+          content = "Модель не вернула ни объяснения, ни YAML. "
+            + (r.error ? ("Причина: " + r.error) : "Попробуйте переформулировать запрос.");
+        }
+        if (!content && r.yaml && !r.valid) {
+          content = "YAML отчёта не прошёл валидацию: " + (r.error || "—");
+        }
+        const suggestedReport = (r.yaml && !needsClarification && !impossible)
+          ? { yaml: r.yaml, id: r.id, spec: r.spec || null, valid: !!r.valid }
+          : null;
+        return { content, attachment: attOut, suggested_report: suggestedReport };
+      },
+      attach ? cleanDesc : undefined,
+      skipUserMsg,
+      attach,
+    );
+  }
+
+  async function sendOperationCommand(description, skipUserMsg = false, historyMsgs = null, attach = null) {
+    const cleanDesc = (description || "").trim();
+    if (!cleanDesc && !attach) return;
+    const effText = cleanDesc || "Проверь и доработай вложенную операцию.";
+    const fullDesc = attach ? expandMsgContent({ content: effText, attachment: attach }) : effText;
+    const history = buildContextHistory(historyMsgs || messages, "operation", contextCfg, fullDesc.length);
+    const body = { description: fullDesc };
     if (history.length) body.history = history;
     return suggestStream(
       "operation",
@@ -5203,16 +5885,9 @@ function LLMWindow() {
       "Готовлю YAML…",
       body,
       (r) => {
-        const attachment = r.yaml
+        const attOut = r.yaml
           ? { name: "yaml: " + (r.id || "operation"), content: r.yaml }
           : null;
-        // Разбор ответа по особым случаям:
-        //   - explanation начинается с "УТОЧНИТЕ:" → модель задаёт вопрос
-        //   - explanation начинается с "НЕВОЗМОЖНО:" → модели нужна
-        //     команда вне списка
-        //   - explanation это маркер "[модель израсходовала...]" → модель
-        //     ушла в reasoning и не вернулась
-        //   - всё пусто → реальная ошибка, показываем сырой ответ
         let content = (r.explanation || "").trim();
         const lower = content.toLowerCase();
         const needsClarification = lower.startsWith("уточните:");
@@ -5226,17 +5901,16 @@ function LLMWindow() {
           content += "\n\nЧто вернула модель (для диагностики):\n"
             + r.raw_response.slice(0, 1200);
         }
-        // Кнопка «В редактор» только когда YAML валиден. В случаях
-        // УТОЧНИТЕ/НЕВОЗМОЖНО YAML и не должно быть.
         const suggestedOp = (r.yaml && r.valid && !needsClarification && !impossible)
           ? { yaml: r.yaml, id: r.id } : null;
         if (!content && r.yaml && !r.valid) {
           content = "YAML не прошёл валидацию: " + (r.error || "—");
         }
-        return { content, attachment, suggested_op: suggestedOp };
+        return { content, attachment: attOut, suggested_op: suggestedOp };
       },
-      undefined,
+      attach ? cleanDesc : undefined,
       skipUserMsg,
+      attach,
     );
   }
 
@@ -5381,30 +6055,29 @@ function LLMWindow() {
       return sendExplainCommand(attach.alert_id, text, attach, skipUserMsg);
     }
 
-    // Явные префиксы режимов: /operation, /alert, /reaction.
-    const MODE_PREFIXES = ["operation", "alert", "reaction"];
+    // Явные префиксы режимов: /operation, /alert, /reaction, /report.
+    const MODE_PREFIXES = ["operation", "alert", "reaction", "report"];
     for (const m of MODE_PREFIXES) {
       const pfx = "/" + m;
       if (text === pfx || text.startsWith(pfx + " ")) {
         const desc = text.slice(pfx.length).trim();
         if (!skipUserMsg) setChatMode(m);
-        if (!desc) {
+        if (!desc && !attach) {
           if (!skipUserMsg) setInput("");
           return;
         }
-        if (m === "operation") return sendOperationCommand(desc, skipUserMsg, historyMsgs);
-        if (m === "alert")     return sendAlertCommand(desc, skipUserMsg, historyMsgs);
-        if (m === "reaction")  return sendReactionCommand(desc, skipUserMsg, historyMsgs);
+        if (m === "operation") return sendOperationCommand(desc, skipUserMsg, historyMsgs, attach);
+        if (m === "alert")     return sendAlertCommand(desc, skipUserMsg, historyMsgs, attach);
+        if (m === "reaction")  return sendReactionCommand(desc, skipUserMsg, historyMsgs, attach);
+        if (m === "report")    return sendReportCommand(desc, skipUserMsg, historyMsgs, attach);
       }
     }
-    // sticky-режим: каждое сообщение в operation идёт в suggest.
-    // Пустое поле — не отправляем. Вложение игнорируется: suggest
-    // принимает только текст-описание.
     if (mode !== "chat") {
-      if (!text) return;
-      if (mode === "operation") return sendOperationCommand(text, skipUserMsg, historyMsgs);
-      if (mode === "alert")     return sendAlertCommand(text, skipUserMsg, historyMsgs);
-      if (mode === "reaction")  return sendReactionCommand(text, skipUserMsg, historyMsgs);
+      if (!text && !attach) return;
+      if (mode === "operation") return sendOperationCommand(text, skipUserMsg, historyMsgs, attach);
+      if (mode === "alert")     return sendAlertCommand(text, skipUserMsg, historyMsgs, attach);
+      if (mode === "reaction")  return sendReactionCommand(text, skipUserMsg, historyMsgs, attach);
+      if (mode === "report")    return sendReportCommand(text, skipUserMsg, historyMsgs, attach);
     }
     // Отправляем, если есть хоть что-то: текст или вложение.
     if ((!text && !attach) || streaming) return;
@@ -5482,13 +6155,21 @@ function LLMWindow() {
             const attemptStr = `${obj.attempt}/${obj.max_attempts}`;
             replaceLastAssistant((last) => ({
               ...last,
+              thinking: false,
               retryNotice: `Повтор запроса (${attemptStr})…`,
             }));
+          } else if (obj.type === "thinking") {
+            replaceLastAssistant((last) => (
+              last.thinking && !last.retryNotice
+                ? last
+                : { ...last, thinking: true, retryNotice: null }
+            ));
           } else if (obj.type === "chunk" && typeof obj.text === "string") {
-            replaceLastAssistant((last) => ({
-              ...last,
-              retryNotice: null,
-            }));
+            replaceLastAssistant((last) => (
+              !last.thinking && !last.retryNotice
+                ? last
+                : { ...last, thinking: false, retryNotice: null }
+            ));
             streamBufRef.current += obj.text;
             kickStreamPump();
           } else if (obj.type === "error") {
@@ -5625,19 +6306,20 @@ function LLMWindow() {
                  onPointerMove=${onPointerMove}
                  onPointerUp=${onPointerUp}
                  onPointerCancel=${onPointerUp}>
-              <button type="button"
+              <button ref=${profileBtnRef}
+                      type="button"
                       class=${"llm-window-pill " + (pillOpen ? "open" : "")}
                       title="Профиль LLM — клик для выбора, drag для перемещения окна">
                 <span class="llm-window-pill-label">LLM</span>
                 <span class="llm-window-pill-sep">·</span>
                 <span class="llm-window-pill-text">${profileName || "профиль не задан"}</span>
-                ${profiles.length > 0
-                  ? html`<span class="llm-window-pill-arrow" aria-hidden="true">▾</span>`
-                  : null}
+                <span class="llm-window-pill-arrow" aria-hidden="true">▾</span>
               </button>
               <${ModePill}
                   value=${chatMode}
                   onChange=${setChatMode}
+                  onHelp=${() => { if (!streaming) dispatchPrompt("/help", null, chatMode, false); }}
+                  disabled=${streaming}
                   open=${modePillOpen}
                   setOpen=${setModePillOpen} />
               <div class="grow"></div>
@@ -5647,14 +6329,13 @@ function LLMWindow() {
                 ${state === "open" ? "—" : "+"}
               </button>
               <button class="llm-window-btn" title="Закрыть" onClick=${closeWindow}>×</button>
-              ${pillOpen && profiles.length > 0
-                ? html`<div class="llm-window-dropdown">
-                    ${profiles.map((p) => html`<button type="button"
-                        class=${p.id === activeId ? "active" : ""}
-                        onClick=${() => { setPillOpen(false); if (p.id !== activeId) onProfileChange(p.id); }}>
-                      ${p.name} <span class="muted small">· ${p.provider}</span>
-                    </button>`)}
-                  </div>`
+              ${pillOpen
+                ? html`<${LLMProfilesDropdown}
+                      profiles=${profiles}
+                      activeId=${activeId}
+                      onProfileChange=${onProfileChange}
+                      onCloseMenu=${() => setPillOpen(false)}
+                      styleStr=${calcDropdownPos(profileBtnRef.current, 190)} />`
                 : null}
             </div>
             ${state === "open"
@@ -5716,9 +6397,18 @@ function LLMWindow() {
                               Применить
                             </button>`);
                           }
+                          if (m.suggested_report) {
+                            actions.push(html`<button type="button" key="rep" class="llm-open-editor-btn"
+                                onClick=${() => window.dispatchEvent(new CustomEvent(
+                                  "melecho:llm-open-report-editor",
+                                  { detail: { yaml: m.suggested_report.yaml, spec: m.suggested_report.spec } }))}>
+                              В редактор
+                            </button>`);
+                          }
                           return html`<div key=${i} class=${"llm-msg-block " + m.role}
                               onContextMenu=${(e) => handleMsgContextMenu(e, m, i, lastUserIdx, lastAssistantIdx)}>
                             <div class=${"llm-msg " + m.role
+                                + (m.role === "assistant" ? " llm-md" : "")
                                 + (m.streaming ? " streaming" : "")
                                 + (m.blocked ? " blocked" : "")}
                                 title=${m.blocked ? "Сообщение не отправлено: сработала защита от утечки секретов" : ""}>
@@ -5732,7 +6422,22 @@ function LLMWindow() {
                                     : null}
                                 </div>
                               </div>
-                              ${m.blocked ? "🚫 " : ""}${(m.content || "").replace(/\n+$/, "") || (m.streaming ? (m.retryNotice ? html`<span class="llm-retry-indicator">${m.retryNotice}</span>` : (m.waitingText || "")) : (m.attachment ? "" : "…"))}
+                              ${(() => {
+                                const cleanText = (m.content || "").replace(/\n+$/, "");
+                                if (!cleanText) {
+                                  return m.streaming
+                                    ? (m.retryNotice
+                                        ? html`<span class="llm-retry-indicator">${m.retryNotice}</span>`
+                                        : (m.thinking
+                                            ? html`<span class="llm-thinking-indicator">Модель размышляет…</span>`
+                                            : (m.waitingText || "")))
+                                    : (m.attachment ? "" : "…");
+                                }
+                                if (m.role === "assistant" && !m.blocked) {
+                                  return html`<${LlmMarkdown} text=${cleanText} />`;
+                                }
+                                return (m.blocked ? "🚫 " : "") + cleanText;
+                              })()}
                             </div>
                             <div class=${"llm-reveal" + (actions.length ? " shown" : "")}>
                               <div class="llm-reveal-inner">
@@ -5761,13 +6466,16 @@ function LLMWindow() {
                       ? html`<${SymBtn} symbol="↺" tooltip="Очистить историю"
                             onClick=${requestClearChat} />`
                       : null}
-                    <textarea ref=${inputRef}
-                              placeholder=${chatModeSpec(chatMode).placeholder}
-                              rows="1"
-                              value=${input}
-                              disabled=${streaming}
-                              onInput=${(e) => setInput(e.target.value)}
-                              onKeyDown=${onInputKey}></textarea>
+                    <div class="llm-input-wrap">
+                      <${LlmPlaceholder} show=${!input} />
+                      <textarea ref=${inputRef}
+                                placeholder=""
+                                rows="1"
+                                value=${input}
+                                disabled=${streaming}
+                                onInput=${(e) => setInput(e.target.value)}
+                                onKeyDown=${onInputKey}></textarea>
+                    </div>
                     <button type="button" class="llm-chat-expand"
                             title="Открыть большой формат"
                             onClick=${() => setChatOpen(true)}>⤢</button>
@@ -5776,7 +6484,7 @@ function LLMWindow() {
                             onClick=${cancelStream} />`
                       : html`<${SymBtn} symbol="➤" tooltip="Отправить"
                             disabled=${!input.trim() && !attachment}
-                            send=${true} onClick=${sendMessage} />`}
+                            send=${true} svetyashka=${true} onClick=${sendMessage} />`}
                   </div>
                 </div>
                 <div class="llm-window-resize"
@@ -5797,6 +6505,7 @@ function LLMWindow() {
             profileName=${profileName} profiles=${profiles}
             activeId=${activeId} onProfileChange=${onProfileChange}
             chatMode=${chatMode} onChangeMode=${setChatMode}
+            onHelp=${() => { if (!streaming) dispatchPrompt("/help", null, chatMode, false); }}
             onRequestClear=${requestClearChat}
             onClose=${() => setChatOpen(false)}
             errorNotification=${errorNotification}
@@ -6975,7 +7684,7 @@ function LLMProfilesSection() {
     } catch (ex) { setErr(ex.message); }
   }
 
-  return html`<div class="card stack">
+  return html`<div class="card stack" id="settings-llm-profiles-section">
     <h3>Профили LLM</h3>
     <p class="muted">
       Профиль — сохранённые провайдер, base URL, модель и ключ. Локальные провайдеры ключ не требуют.
@@ -9235,7 +9944,7 @@ function MetricsView({ serverId }) {
   </div>`;
 }
 
-function SymBtn({ symbol, tooltip, onClick, onContextMenu, disabled, send }) {
+function SymBtn({ symbol, tooltip, onClick, onContextMenu, disabled, send, svetyashka }) {
   const [tipVisible, setTipVisible] = useState(false);
   const btnRef = useRef(null);
   const timerRef = useRef(null);
@@ -9267,7 +9976,7 @@ function SymBtn({ symbol, tooltip, onClick, onContextMenu, disabled, send }) {
     return () => { el.remove(); };
   }, [tipVisible, tooltip]);
 
-  const cls = "sym-btn" + (send ? " sym-btn-send" : "");
+  const cls = "sym-btn" + (send ? " sym-btn-send" : "") + (svetyashka && !disabled ? " svetyashka-btn" : "");
   return html`<button ref=${btnRef} type="button" class=${cls}
       disabled=${disabled}
       onPointerEnter=${show} onPointerLeave=${hide}
@@ -11346,7 +12055,7 @@ function AutomationGraphView({ initialServerId = null, isServerTab = false, onRe
               <div class="row" style="gap:6px"><span class="legend-shape srv"></span><span>Сервер (цвет = статус)</span></div>
               <div class="row" style="gap:6px"><span class="legend-shape op"></span><span>Операция (sys / user)</span></div>
               <div class="row" style="gap:6px"><span class="legend-shape rule"></span><span>Правило алерта (пунктир = off)</span></div>
-              <div class="row" style="gap:6px"><span class="legend-shape rx"></span><span>Реакция (внешняя орбита)</span></div>
+              <div class="row" style="gap:6px"><span class="legend-shape rx"></span><span>Реакция</span></div>
               <div class="row" style="gap:6px"><span class="legend-line solid"></span><span>Прямая привязка</span></div>
               <div class="row" style="gap:6px"><span class="legend-line dashed"></span><span>Общая / глобальная связь</span></div>
             </div>
@@ -11508,6 +12217,996 @@ function AutomationGraphView({ initialServerId = null, isServerTab = false, onRe
   </div>`;
 }
 
+const _RU_TRANSLIT = {
+  "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z",
+  "и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r",
+  "с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"ts","ч":"ch","ш":"sh","щ":"sch",
+  "ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya"
+};
+function reportFileSlug(name) {
+  let out = "";
+  for (const ch of String(name || "").toLowerCase()) {
+    if (_RU_TRANSLIT[ch] !== undefined) out += _RU_TRANSLIT[ch];
+    else if (/[a-z0-9._-]/.test(ch)) out += ch;
+    else if (/[\s,:;()[\]{}/\\]/.test(ch)) out += "-";
+  }
+  out = out.replace(/-+/g, "-").replace(/^[-_.]+|[-_.]+$/g, "").slice(0, 48);
+  return out || "report";
+}
+
+const _stepUidMap = new WeakMap();
+let _nextStepUid = 1;
+function getStepUid(st) {
+  let id = _stepUidMap.get(st);
+  if (!id) {
+    id = "st_" + (_nextStepUid++);
+    _stepUidMap.set(st, id);
+  }
+  return id;
+}
+
+function specToReportYaml(spec) {
+  const lines = [
+    `id: ${yamlScalar(spec.id || "custom_report")}`,
+    `name: ${yamlScalar(spec.name || "Новый отчёт")}`,
+  ];
+  if (spec.description) lines.push(`description: ${yamlScalar(spec.description)}`);
+  lines.push(`parallel_servers: ${spec.parallel_servers !== false ? "true" : "false"}`);
+  lines.push(`display_mode: ${spec.display_mode || "display_and_raw"}`);
+  lines.push("targets:");
+  for (const t of (spec.targets || [])) {
+    const srvVal = typeof t.server === "number" ? String(t.server) : yamlScalar(t.server || "all");
+    lines.push(`  - server: ${srvVal}`);
+    lines.push("    steps:");
+    for (const st of (t.steps || [])) {
+      lines.push(`      - operation_id: ${yamlScalar(st.operation_id || "")}`);
+      const pObj = st.params || {};
+      if (Object.keys(pObj).length === 0) {
+        lines.push("        params: {}");
+      } else {
+        lines.push("        params:");
+        for (const [pk, pv] of Object.entries(pObj)) {
+          lines.push(`          ${pk}: ${yamlScalar(pv)}`);
+        }
+      }
+      if (st.use_sudo != null) {
+        lines.push(`        use_sudo: ${st.use_sudo ? "true" : "false"}`);
+      }
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+function downloadBlobAuth(url, filename) {
+  return fetch(url, { headers: sessionToken ? { "X-Session-Token": sessionToken } : {} })
+    .then(async (res) => {
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || ("HTTP " + res.status));
+      }
+      return res.blob();
+    })
+    .then((blob) => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+    });
+}
+
+function ReportStepOutputView({ step, viewMode }) {
+  if (!step) return null;
+  if (step.error_message) {
+    return html`<div class="err small">${step.error_code || "ERR"}: ${step.error_message}</div>`;
+  }
+  const hasDisplay = !!(step.display || step.display_data);
+  const rawSteps = step.steps || [];
+  if (viewMode === "display_only" && step.display) {
+    return html`<${OperationDisplayView} display=${step.display} steps=${rawSteps} />`;
+  }
+  if (viewMode === "raw_only" || !hasDisplay) {
+    if (!rawSteps.length) return html`<div class="muted small">(вывод отсутствует)</div>`;
+    return html`<div class="stack" style="gap:6px">
+      ${rawSteps.map((s, idx) => html`<pre class="pre" key=${idx}>${s.phase} exit ${s.exit}
+${s.stdout}${s.stderr}</pre>`)}
+    </div>`;
+  }
+  return html`<${OperationResultView} op=${{ display: step.display }} steps=${rawSteps} />`;
+}
+
+function ReportRunModal({ jobId, onClose }) {
+  const [job, setJob] = useState(null);
+  const [viewMode, setViewMode] = useState(null);
+  const [err, setErr] = useState("");
+  const [busyCancel, setBusyCancel] = useState(false);
+
+  async function loadJob() {
+    try {
+      const r = await api("/api/v1/reports/runs/" + encodeURIComponent(jobId));
+      setJob(r);
+      setViewMode((prev) => prev || r.display_mode || "display_and_raw");
+    } catch (ex) {
+      setErr(ex.message);
+    }
+  }
+
+  useEffect(() => { loadJob(); }, [jobId]);
+
+  useEffect(() => {
+    let timer = null;
+    const onEv = (e) => {
+      const p = e && e.detail && e.detail.payload;
+      if (p && p.job_id !== jobId) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => { loadJob(); }, 120);
+    };
+    window.addEventListener("melecho:report-event", onEv);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("melecho:report-event", onEv);
+    };
+  }, [jobId]);
+
+  useEffect(() => {
+    if (!job || job.status !== "running") return undefined;
+    const iv = setInterval(loadJob, 2000);
+    return () => clearInterval(iv);
+  }, [jobId, job && job.status]);
+
+  async function cancelRun() {
+    setBusyCancel(true);
+    try {
+      await api("/api/v1/reports/runs/" + encodeURIComponent(jobId) + "/cancel", {
+        method: "POST", body: "{}",
+      });
+      await loadJob();
+    } catch (ex) {
+      setErr(ex.message);
+    } finally {
+      setBusyCancel(false);
+    }
+  }
+
+  async function exportFile(fmt) {
+    if (!job) return;
+    const safe = reportFileSlug(job.name || "report");
+    const mode = viewMode || job.display_mode || "display_and_raw";
+    try {
+      await downloadBlobAuth(
+        `/api/v1/reports/runs/${encodeURIComponent(jobId)}/export?format=${fmt}&display_mode=${encodeURIComponent(mode)}`,
+        `${safe}.${fmt}`,
+      );
+    } catch (ex) {
+      showToast("Ошибка экспорта: " + ex.message, "error");
+    }
+  }
+
+  function exportPdf() {
+    if (!job) return;
+    window.dispatchEvent(new CustomEvent("melecho:print-report", {
+      detail: { job, viewMode: viewMode || job.display_mode || "display_and_raw" },
+    }));
+  }
+
+  const pct = job && job.total_steps > 0
+    ? Math.round((job.completed_steps / job.total_steps) * 100)
+    : 0;
+  const effMode = viewMode || (job && job.display_mode) || "display_and_raw";
+
+  return html`<${Modal}
+      title=${job ? `Отчёт: ${job.name}` : "Отчёт"}
+      onClose=${onClose}
+      footer=${job ? html`<div class="row grow">
+        ${job.status === "running"
+          ? html`<button class="btn btn-sm btn-danger" disabled=${busyCancel} onClick=${cancelRun}>
+              ${busyCancel ? "Отмена…" : "Отменить оставшиеся"}
+            </button>`
+          : null}
+        <div class="grow"></div>
+        <button class="btn btn-sm" onClick=${() => exportFile("csv")}>CSV</button>
+        <button class="btn btn-sm" onClick=${() => exportFile("json")}>JSON</button>
+        <button class="btn btn-sm" onClick=${() => exportFile("md")}>Markdown</button>
+        <button class="btn btn-sm btn-primary" onClick=${exportPdf}>PDF</button>
+        <button class="btn btn-sm btn-ghost" onClick=${onClose}>Закрыть</button>
+      </div>` : null}>
+    ${err ? html`<div class="err">${err}</div>` : null}
+    ${!job
+      ? html`<p class="muted">Загрузка…</p>`
+      : html`<div class="stack">
+          <div class="row">
+            <span class=${"badge " + (job.status === "done" ? (job.fail_count > 0 ? "warn" : "ok") : (job.status === "cancelled" ? "off" : ""))}>
+              ${job.status === "running" ? "выполняется…" : job.status}
+            </span>
+            <span class="muted small">
+              Шаги: <b>${job.completed_steps} / ${job.total_steps}</b>
+              · ✅ ${job.ok_count} · ❌ ${job.fail_count}
+            </span>
+          </div>
+          <div class="report-progress-track">
+            <div class="report-progress-fill" style=${`width: ${pct}%`}></div>
+          </div>
+          <div class="row">
+            <span class="muted small">Вид и экспорт:</span>
+            <${Segmented}
+              value=${effMode}
+              onChange=${setViewMode}
+              options=${[
+                { value: "display_and_raw", label: "Display + сырой" },
+                { value: "display_only", label: "Только display" },
+                { value: "raw_only", label: "Только сырой" },
+              ]} />
+          </div>
+
+          ${(job.servers || []).map((srv) => html`<div class="report-target-card" key=${srv.server_id}>
+            <div class="row">
+              <b>${srv.server_name}</b>
+              <span class="muted small mono">${srv.llm_alias}</span>
+            </div>
+            <div class="stack" style="gap:8px">
+              ${(srv.steps || []).map((st, idx) => {
+                const isRun = st.status === "running";
+                const stBadge = st.status === "ok" ? "ok"
+                  : (st.status === "failed" || st.status === "error") ? "danger"
+                  : isRun ? "warn" : "";
+                return html`<div class=${"report-step-row" + (isRun ? " svetyashka-card" : "")} key=${idx}>
+                  <div class="row">
+                    <span class=${"badge " + stBadge}>${st.status}</span>
+                    <b class="grow">${st.operation_name || st.operation_id}</b>
+                    <span class="muted small mono">${st.operation_id}</span>
+                    ${st.duration_ms != null ? html`<span class="muted small">${st.duration_ms} мс</span>` : null}
+                  </div>
+                  ${st.status !== "pending" && st.status !== "running" && st.status !== "cancelled"
+                    ? html`<${ReportStepOutputView} step=${st} viewMode=${effMode} />`
+                    : null}
+                </div>`;
+              })}
+            </div>
+          </div>`)}
+        </div>`}
+  </${Modal}>`;
+}
+
+function ReportPlanModal({ payload, onClose, onStarted }) {
+  const [plan, setPlan] = useState(null);
+  const [confirm, setConfirm] = useState(false);
+  const [sudoPw, setSudoPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api("/api/v1/reports/plan", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
+      .then(setPlan)
+      .catch((ex) => setErr(ex.message));
+  }, []);
+
+  async function start() {
+    if (!plan) return;
+    setBusy(true);
+    setErr("");
+    try {
+      const body = { ...payload, confirm: true };
+      if (sudoPw) body.sudo_password = sudoPw;
+      const r = await api("/api/v1/reports/run", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      onStarted && onStarted(r.id);
+    } catch (ex) {
+      setErr(ex.message);
+      setBusy(false);
+    }
+  }
+
+  return html`<${Modal} title=${plan ? `Запуск отчёта: ${plan.name}` : "План отчёта"}
+      onClose=${onClose}
+      footer=${plan ? html`<div class="row grow">
+        <button class="btn btn-sm btn-ghost" onClick=${onClose}>Отмена</button>
+        <div class="grow"></div>
+        <button class="btn btn-sm btn-primary"
+                disabled=${busy || plan.total_steps === 0 || (plan.requires_confirmation && !confirm)}
+                onClick=${start}>
+          ${busy ? "Запуск…" : `Запустить (${plan.total_steps} шагов)`}
+        </button>
+      </div>` : null}>
+    ${err ? html`<div class="err">${err}</div>` : null}
+    ${!plan
+      ? (!err ? html`<p class="muted">Формирую сводный план…</p>` : null)
+      : html`<div class="stack">
+          <div class="muted small">
+            Серверов: <b>${plan.servers.length}</b> · Всего шагов: <b>${plan.total_steps}</b> ·
+            ${plan.parallel_servers ? "серверы параллельно, внутри сервера очередью" : "строго по очереди"}
+          </div>
+          ${plan.servers.map((s) => html`<div class="report-target-card" key=${s.server_id}>
+            <div class="row">
+              <b>${s.server_name}</b>
+              <span class="muted small mono">${s.llm_alias}</span>
+            </div>
+            <div class="stack" style="gap:4px">
+              ${s.steps.map((st, idx) => html`<div class="row small" key=${idx}>
+                <span class="mono">${idx + 1}. ${st.operation_id}</span>
+                ${st.state_changing ? html`<span class="badge warn">state</span>` : null}
+                ${st.use_sudo ? html`<span class="badge">sudo</span>` : null}
+                ${st.has_display ? html`<span class="badge ok">display</span>` : null}
+              </div>`)}
+            </div>
+          </div>`)}
+          ${plan.needs_sudo
+            ? html`<div class="form-section">
+                <div class="form-section-title">Sudo для шагов отчёта</div>
+                ${plan.sudo_unlocked
+                  ? html`<div class="okt small">✓ Автосудо разблокировано — будет использовано при необходимости.</div>`
+                  : html`<div class="stack" style="gap:6px">
+                      <div class="muted small">Автосудо не активно. Введите одноразовый пароль sudo для этого отчёта (не сохраняется на диск) или оставьте пустым, если на сервере настроено беспарольное sudo.</div>
+                      <input type="password" autocomplete="off" placeholder="Пароль sudo (опционально)"
+                             value=${sudoPw} onInput=${(e) => setSudoPw(e.target.value)} />
+                    </div>`}
+              </div>`
+            : null}
+          ${plan.requires_confirmation
+            ? html`<label class="check">
+                <input type="checkbox" checked=${confirm} onChange=${(e) => setConfirm(e.target.checked)} />
+                Подтверждаю выполнение операций, меняющих состояние серверов
+              </label>`
+            : null}
+        </div>`}
+  </${Modal}>`;
+}
+
+function ReportEditorModal({ mode, rid, initialYaml, initialSpec, onClose, onSaved, onRunJob }) {
+  const isEdit = mode === "edit";
+  const [tab, setTab] = useState("builder");
+  const [loading, setLoading] = useState(isEdit);
+  const [servers, setServers] = useState([]);
+  const [ops, setOps] = useState([]);
+  const [spec, setSpec] = useState(() => initialSpec || {
+    id: "custom_report",
+    name: "Новый отчёт",
+    description: "",
+    parallel_servers: true,
+    display_mode: "display_and_raw",
+    targets: [],
+  });
+  const [yamlText, setYamlText] = useState(initialYaml || "");
+  const [validation, setValidation] = useState(null);
+  const [validating, setValidating] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [planPayload, setPlanPayload] = useState(null);
+  const [stepDrag, setStepDrag] = useState(null);
+  const stepDragRef = useRef(null);
+  stepDragRef.current = stepDrag;
+  const stepDragRafRef = useRef(null);
+  const specRef = useRef(spec);
+  specRef.current = spec;
+  const stepElMapRef = useRef(new Map());
+  const prevStepTopsRef = useRef(new Map());
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const tasks = [api("/api/v1/servers"), api("/api/v1/operations")];
+        if (isEdit && rid) tasks.push(api("/api/v1/reports/templates/" + encodeURIComponent(rid)));
+        const [srvR, opsR, tplR] = await Promise.all(tasks);
+        const srvItems = srvR.items || [];
+        const opItems = (opsR.items || []).filter((o) => o.valid && !(o.flags && o.flags.streaming));
+        setServers(srvItems);
+        setOps(opItems);
+
+        if (tplR) {
+          setYamlText(tplR.yaml || "");
+          if (tplR.spec) setSpec(tplR.spec);
+        } else if (initialYaml && !initialSpec) {
+          setTab("yaml");
+          setYamlText(initialYaml);
+        } else if (initialSpec) {
+          setYamlText(specToReportYaml(initialSpec));
+        } else {
+          const defSrv = srvItems.length ? srvItems[0].llm_alias : "all";
+          const defOp = opItems.length ? opItems[0].id : "disk_check";
+          const initS = {
+            id: "custom_report",
+            name: "Сводка серверов",
+            description: "",
+            parallel_servers: true,
+            display_mode: "display_and_raw",
+            targets: srvItems.length ? [{ server: defSrv, steps: [{ operation_id: defOp, params: {}, use_sudo: false }] }] : [],
+          };
+          setSpec(initS);
+          setYamlText(specToReportYaml(initS));
+        }
+      } catch (ex) {
+        setErr(ex.message);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [mode, rid]);
+
+  useEffect(() => {
+    if (loading || !yamlText.trim()) {
+      setValidation(null);
+      return undefined;
+    }
+    const t = setTimeout(async () => {
+      setValidating(true);
+      try {
+        const curId = isEdit ? rid : "";
+        const r = await api("/api/v1/reports/validate", {
+          method: "POST",
+          body: JSON.stringify({ id: curId, yaml: yamlText }),
+        });
+        setValidation(r);
+      } catch (ex) {
+        setValidation({ valid: false, error: ex.message });
+      } finally {
+        setValidating(false);
+      }
+    }, 450);
+    return () => clearTimeout(t);
+  }, [yamlText, loading]);
+
+  function updateSpec(next) {
+    setSpec(next);
+    setYamlText(specToReportYaml(next));
+    setValidation(null);
+    setErr("");
+  }
+
+  const stepOrderKey = (spec.targets || []).map((t) => (t.steps || []).map(getStepUid).join(",")).join("|");
+  useLayoutEffect(() => {
+    const nextTops = new Map();
+    for (const [uid, el] of stepElMapRef.current.entries()) {
+      if (el && typeof el.offsetTop === "number") nextTops.set(uid, el.offsetTop);
+    }
+    const draggingUid = stepDragRef.current ? stepDragRef.current.uid : null;
+    for (const [uid, newTop] of nextTops.entries()) {
+      if (uid === draggingUid) continue;
+      const oldTop = prevStepTopsRef.current.get(uid);
+      if (oldTop == null) continue;
+      const dy = oldTop - newTop;
+      if (Math.abs(dy) < 1) continue;
+      const el = stepElMapRef.current.get(uid);
+      if (!el) continue;
+      el.style.transition = "none";
+      el.style.transform = `translateY(${dy}px)`;
+      requestAnimationFrame(() => {
+        el.style.transition = "transform 180ms cubic-bezier(0.22, 1, 0.36, 1)";
+        el.style.transform = "";
+      });
+    }
+    prevStepTopsRef.current = nextTops;
+  }, [stepOrderKey, tab]);
+
+  function onStepPointerDown(e, tIdx, sIdx) {
+    if (e.button !== 0) return;
+    const rowEl = e.currentTarget.closest(".report-step-row");
+    if (!rowEl) return;
+    const st = ((spec.targets || [])[tIdx]?.steps || [])[sIdx];
+    if (!st) return;
+    const rect = rowEl.getBoundingClientRect();
+    setStepDrag({
+      tIdx,
+      sIdx,
+      uid: getStepUid(st),
+      opId: st.operation_id,
+      pointerId: e.pointerId,
+      offsetX: e.clientX - rect.left,
+      offsetY: e.clientY - rect.top,
+      width: rect.width,
+      height: rect.height,
+      cursorX: e.clientX,
+      cursorY: e.clientY,
+    });
+    e.preventDefault();
+  }
+
+  useEffect(() => {
+    if (!stepDrag) return undefined;
+    document.body.classList.add("dragging-report-step");
+    function onMove(e) {
+      const cur = stepDragRef.current;
+      if (!cur || e.pointerId !== cur.pointerId) return;
+      const cx = e.clientX;
+      const cy = e.clientY;
+      setStepDrag((prev) => (prev ? { ...prev, cursorX: cx, cursorY: cy } : null));
+      if (stepDragRafRef.current) return;
+      stepDragRafRef.current = requestAnimationFrame(() => {
+        stepDragRafRef.current = null;
+        const d = stepDragRef.current;
+        if (!d) return;
+        const curSpec = specRef.current;
+        const t = (curSpec.targets || [])[d.tIdx];
+        if (!t || !Array.isArray(t.steps)) return;
+        const curIdx = t.steps.findIndex((x) => getStepUid(x) === d.uid);
+        if (curIdx < 0) return;
+
+        const without = t.steps.filter((_, idx) => idx !== curIdx);
+        let targetIdx = without.length;
+        for (let i = 0; i < without.length; i++) {
+          const el = stepElMapRef.current.get(getStepUid(without[i]));
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (cy < r.top + r.height / 2) {
+            targetIdx = i;
+            break;
+          }
+        }
+        if (targetIdx === curIdx) return;
+        const nextSteps = t.steps.slice();
+        const [moved] = nextSteps.splice(curIdx, 1);
+        nextSteps.splice(targetIdx, 0, moved);
+        const nextTargets = curSpec.targets.slice();
+        nextTargets[d.tIdx] = { ...t, steps: nextSteps };
+        setStepDrag((prev) => (prev ? { ...prev, sIdx: targetIdx } : null));
+        updateSpec({ ...curSpec, targets: nextTargets });
+      });
+    }
+    function onUp(e) {
+      const cur = stepDragRef.current;
+      if (cur && e.pointerId !== cur.pointerId) return;
+      if (stepDragRafRef.current) {
+        cancelAnimationFrame(stepDragRafRef.current);
+        stepDragRafRef.current = null;
+      }
+      setStepDrag(null);
+    }
+    function onKey(e) {
+      if (e.key === "Escape") onUp(e);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.body.classList.remove("dragging-report-step");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [stepDrag && stepDrag.pointerId]);
+
+  function switchTab(nextTab) {
+    if (nextTab === "builder" && tab === "yaml") {
+      if (validation && validation.valid && validation.parsed) {
+        setSpec(validation.parsed);
+      }
+    } else if (nextTab === "yaml" && tab === "builder") {
+      setYamlText(specToReportYaml(spec));
+    }
+    setTab(nextTab);
+  }
+
+  function addServerTarget(srvVal) {
+    if (!srvVal) return;
+    if ((spec.targets || []).some((t) => String(t.server) === String(srvVal))) return;
+    const defOp = ops.length ? ops[0].id : "disk_check";
+    updateSpec({
+      ...spec,
+      targets: [...(spec.targets || []), {
+        server: srvVal,
+        steps: [{ operation_id: defOp, params: {}, use_sudo: false }],
+      }],
+    });
+  }
+
+  function copyStepsToAll(srcIdx) {
+    const src = (spec.targets || [])[srcIdx];
+    if (!src) return;
+    const nextTargets = (spec.targets || []).map((t, i) => {
+      if (i === srcIdx) return t;
+      return { ...t, steps: (src.steps || []).map((st) => ({ ...st, params: { ...(st.params || {}) } })) };
+    });
+    updateSpec({ ...spec, targets: nextTargets });
+    showToast("Шаги скопированы на все серверы в отчёте", "ok");
+  }
+
+  async function saveTemplate() {
+    const curYaml = tab === "builder" ? specToReportYaml(spec) : yamlText;
+    const saveId = isEdit ? rid : (validation && validation.parsed ? validation.parsed.id : spec.id);
+    setBusy(true);
+    setErr("");
+    try {
+      if (isEdit) {
+        await api("/api/v1/reports/templates/" + encodeURIComponent(rid), {
+          method: "PATCH",
+          body: JSON.stringify({ yaml: curYaml }),
+        });
+      } else {
+        await api("/api/v1/reports/templates", {
+          method: "POST",
+          body: JSON.stringify({ id: saveId, yaml: curYaml }),
+        });
+      }
+      showToast(isEdit ? "Шаблон обновлён" : "Шаблон отчёта сохранён", "ok");
+      onSaved && onSaved();
+    } catch (ex) {
+      setErr(ex.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function openRunPlan() {
+    const curYaml = tab === "builder" ? specToReportYaml(spec) : yamlText;
+    setPlanPayload({ yaml: curYaml });
+  }
+
+  function exportToLLM() {
+    const curYaml = tab === "builder" ? specToReportYaml(spec) : yamlText;
+    window.dispatchEvent(new CustomEvent("melecho:llm-attach", {
+      detail: {
+        name: "report: " + (spec.id || "draft"),
+        content: curYaml.trim(),
+        force_mode: "report",
+      },
+    }));
+  }
+
+  const canAction = !busy && validation && validation.valid;
+
+  return html`<${Modal}
+      title=${isEdit ? `Шаблон отчёта: ${rid}` : "Конструктор отчёта"}
+      onClose=${onClose}
+      footer=${html`<div class="row grow">
+        <button class="btn btn-sm btn-ghost" onClick=${onClose}>Закрыть</button>
+        <div class="grow"></div>
+        <button class="btn btn-sm" disabled=${!canAction} onClick=${saveTemplate}>
+          ${busy ? "Сохранение…" : "Сохранить шаблон"}
+        </button>
+        <button class="btn btn-sm btn-primary" disabled=${!canAction} onClick=${openRunPlan}>
+          Запустить отчёт
+        </button>
+      </div>`}>
+    ${err ? html`<div class="err">${err}</div>` : null}
+    ${loading
+      ? html`<p class="muted">Загрузка…</p>`
+      : html`<div class="stack">
+          <div class="row">
+            <${Segmented}
+              value=${tab}
+              onChange=${switchTab}
+              options=${[
+                { value: "builder", label: "Конструктор" },
+                { value: "yaml", label: "YAML" },
+              ]} />
+            <div class="grow"></div>
+            <${SymBtn} symbol="↗" tooltip="Передать в LLM-чат" onClick=${exportToLLM} />
+          </div>
+
+          ${tab === "builder"
+            ? html`<div class="stack">
+                <div class="row">
+                  <div class="grow">
+                    <label>Название</label>
+                    <input value=${spec.name}
+                           onInput=${(e) => updateSpec({ ...spec, name: e.target.value })} />
+                  </div>
+                  <div style="flex:0 0 180px">
+                    <label>ID (для шаблона)</label>
+                    <input class="mono" value=${spec.id} disabled=${isEdit}
+                           onInput=${(e) => updateSpec({ ...spec, id: e.target.value })} />
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="grow">
+                    <label>Режим вывода (display / сырой)</label>
+                    <select value=${spec.display_mode || "display_and_raw"}
+                            onChange=${(e) => updateSpec({ ...spec, display_mode: e.target.value })}>
+                      <option value="display_and_raw">Display + сырой вывод</option>
+                      <option value="display_only">Только display (если есть у операции)</option>
+                      <option value="raw_only">Только сырой вывод</option>
+                    </select>
+                  </div>
+                  <label class="check" style="padding-top:18px">
+                    <input type="checkbox" checked=${spec.parallel_servers !== false}
+                           onChange=${(e) => updateSpec({ ...spec, parallel_servers: e.target.checked })} />
+                    <span>Серверы параллельно</span>
+                  </label>
+                </div>
+
+                <div class="form-section">
+                  <div class="row">
+                    <div class="form-section-title grow">Серверы и очередь операций</div>
+                    <select style="width:auto; height:32px; font-size:0.8125rem"
+                            value=""
+                            onChange=${(e) => { addServerTarget(e.target.value); e.target.value = ""; }}>
+                      <option value="">+ Добавить сервер…</option>
+                      <option value="all">Все серверы (all)</option>
+                      ${servers.map((s) => html`<option value=${s.llm_alias} key=${s.id}>
+                        ${s.name} (${s.llm_alias})
+                      </option>`)}
+                    </select>
+                  </div>
+
+                  ${(spec.targets || []).length === 0
+                    ? html`<p class="muted small">Добавьте серверы выше, чтобы задать очередь операций.</p>`
+                    : (spec.targets || []).map((t, tIdx) => {
+                        const srvObj = servers.find((s) => s.llm_alias === String(t.server) || String(s.id) === String(t.server));
+                        const srvLabel = t.server === "all"
+                          ? "Все серверы (all)"
+                          : (srvObj ? `${srvObj.name} (${srvObj.llm_alias})` : String(t.server));
+                        return html`<div class="report-target-card" key=${tIdx}>
+                          <div class="row">
+                            <b class="grow">${srvLabel}</b>
+                            ${(spec.targets || []).length > 1
+                              ? html`<button type="button" class="btn btn-sm btn-ghost"
+                                      title="Скопировать эти шаги на все остальные серверы"
+                                      onClick=${() => copyStepsToAll(tIdx)}>Копировать всем</button>`
+                              : null}
+                            <button type="button" class="btn btn-sm btn-danger"
+                                    onClick=${() => updateSpec({
+                                      ...spec,
+                                      targets: spec.targets.filter((_, idx) => idx !== tIdx),
+                                    })}>×</button>
+                          </div>
+
+                          ${(t.steps || []).map((st, sIdx) => {
+                            const uid = getStepUid(st);
+                            const opObj = ops.find((o) => o.id === st.operation_id) || null;
+                            const updateStep = (patch) => {
+                              const nextTargets = spec.targets.slice();
+                              const nextSteps = t.steps.slice();
+                              const nextSt = { ...st, ...patch };
+                              _stepUidMap.set(nextSt, uid);
+                              nextSteps[sIdx] = nextSt;
+                              nextTargets[tIdx] = { ...t, steps: nextSteps };
+                              updateSpec({ ...spec, targets: nextTargets });
+                            };
+                            const moveStep = (dir) => {
+                              const j = sIdx + dir;
+                              if (j < 0 || j >= t.steps.length) return;
+                              const nextTargets = spec.targets.slice();
+                              const nextSteps = t.steps.slice();
+                              const [moved] = nextSteps.splice(sIdx, 1);
+                              nextSteps.splice(j, 0, moved);
+                              nextTargets[tIdx] = { ...t, steps: nextSteps };
+                              updateSpec({ ...spec, targets: nextTargets });
+                            };
+                            const isDragged = stepDrag && stepDrag.uid === uid;
+                            return html`<div
+                                class=${"report-step-row" + (isDragged ? " dragging" : "")}
+                                key=${uid}
+                                ref=${(el) => {
+                                  if (el) stepElMapRef.current.set(uid, el);
+                                  else stepElMapRef.current.delete(uid);
+                                }}>
+                              <div class="row">
+                                <span class="report-step-handle mono muted small"
+                                      title="Перетащите для изменения порядка"
+                                      onPointerDown=${(e) => onStepPointerDown(e, tIdx, sIdx)}>⠿ ${sIdx + 1}.</span>
+                                <select class="grow" style="height:32px; font-size:0.8125rem"
+                                        value=${st.operation_id}
+                                        onChange=${(e) => updateStep({ operation_id: e.target.value, params: {} })}>
+                                  ${ops.map((o) => html`<option value=${o.id} key=${o.id}>
+                                    ${o.name} (${o.id})${o.display ? " · display" : ""}
+                                  </option>`)}
+                                  ${!opObj && st.operation_id
+                                    ? html`<option value=${st.operation_id}>${st.operation_id} (не найдена)</option>`
+                                    : null}
+                                </select>
+                                ${opObj && opObj.flags && opObj.flags.escalatable
+                                  ? html`<label class="check small">
+                                      <input type="checkbox" checked=${!!st.use_sudo}
+                                             onChange=${(e) => updateStep({ use_sudo: e.target.checked })} />
+                                      <span>sudo</span>
+                                    </label>`
+                                  : null}
+                                <button type="button" class="btn btn-sm btn-ghost"
+                                        disabled=${sIdx === 0}
+                                        onClick=${() => moveStep(-1)}>↑</button>
+                                <button type="button" class="btn btn-sm btn-ghost"
+                                        disabled=${sIdx === t.steps.length - 1}
+                                        onClick=${() => moveStep(1)}>↓</button>
+                                <button type="button" class="btn btn-sm btn-ghost"
+                                        disabled=${t.steps.length <= 1}
+                                        onClick=${() => {
+                                          const nextTargets = spec.targets.slice();
+                                          nextTargets[tIdx] = { ...t, steps: t.steps.filter((_, k) => k !== sIdx) };
+                                          updateSpec({ ...spec, targets: nextTargets });
+                                        }}>×</button>
+                              </div>
+                              ${opObj && opObj.params && opObj.params.length > 0
+                                ? html`<${OperationParamsFields}
+                                    op=${opObj}
+                                    paramsStr=${JSON.stringify(st.params || {}, null, 2)}
+                                    onChangeStr=${(pStr) => {
+                                      try { updateStep({ params: JSON.parse(pStr || "{}") }); } catch {}
+                                    }}
+                                    servers=${servers} />`
+                                : null}
+                            </div>`;
+                          })}
+
+                          <div>
+                            <button type="button" class="btn btn-sm"
+                                    onClick=${() => {
+                                      const defOp = ops.length ? ops[0].id : "disk_check";
+                                      const nextTargets = spec.targets.slice();
+                                      nextTargets[tIdx] = {
+                                        ...t,
+                                        steps: [...t.steps, { operation_id: defOp, params: {}, use_sudo: false }],
+                                      };
+                                      updateSpec({ ...spec, targets: nextTargets });
+                                    }}>+ Добавить операцию</button>
+                          </div>
+                        </div>`;
+                      })}
+                </div>
+              </div>`
+            : html`<div class="user-op-yaml-wrap">
+                <textarea class="mono user-op-yaml" spellCheck=${false}
+                          value=${yamlText}
+                          onInput=${(e) => { setYamlText(e.target.value); setValidation(null); setErr(""); }}></textarea>
+              </div>`}
+
+          <div class="row user-op-status">
+            ${validating
+              ? html`<span class="muted small">Проверка…</span>`
+              : validation == null
+              ? html`<span class="muted small">Проверка…</span>`
+              : validation.valid
+              ? html`<span class="okt small">✓ Валидно</span>`
+              : html`<span class="err small">✗ ${validation.error || "невалидно"}</span>`}
+          </div>
+        </div>`}
+
+    ${stepDrag
+      ? html`<div class="report-step-ghost"
+            style=${`left: ${Math.round(stepDrag.cursorX - stepDrag.offsetX)}px; top: ${Math.round(stepDrag.cursorY - stepDrag.offsetY)}px; width: ${Math.round(stepDrag.width)}px;`}>
+          <div class="row">
+            <span class="mono muted small">⠿ ${stepDrag.sIdx + 1}.</span>
+            <b class="small mono">${stepDrag.opId}</b>
+          </div>
+        </div>`
+      : null}
+
+    ${planPayload
+      ? html`<${ReportPlanModal}
+          payload=${planPayload}
+          onClose=${() => setPlanPayload(null)}
+          onStarted=${(jid) => {
+            setPlanPayload(null);
+            onRunJob && onRunJob(jid);
+          }} />`
+      : null}
+  </${Modal}>`;
+}
+
+function ReportsView() {
+  const [templates, setTemplates] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [err, setErr] = useState("");
+  const [editor, setEditor] = useState(null);
+  const [planPayload, setPlanPayload] = useState(null);
+  const [activeJobId, setActiveJobId] = useState(null);
+
+  async function load() {
+    setErr("");
+    try {
+      const [t, r] = await Promise.all([
+        api("/api/v1/reports/templates"),
+        api("/api/v1/reports/runs"),
+      ]);
+      setTemplates(t.items || []);
+      setRuns(r.items || []);
+    } catch (ex) {
+      setErr(ex.message);
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  useEffect(() => {
+    let timer = null;
+    const onEv = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { load(); }, 250);
+    };
+    window.addEventListener("melecho:report-event", onEv);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("melecho:report-event", onEv);
+    };
+  }, []);
+
+  async function removeTemplate(t) {
+    if (!confirm("Удалить шаблон отчёта «" + t.name + "»?")) return;
+    try {
+      await api("/api/v1/reports/templates/" + encodeURIComponent(t.id), { method: "DELETE" });
+      await load();
+    } catch (ex) {
+      setErr(ex.message);
+    }
+  }
+
+  return html`<div class="stack">
+    ${err ? html`<div class="err">${err}</div>` : null}
+    <div class="row">
+      <button class="btn" onClick=${() => setEditor({ mode: "create" })}>+ Конструктор отчёта</button>
+      <span class="muted small grow">
+        Выполнение очереди операций по выбранным серверам с экспортом в CSV, JSON, Markdown и PDF.
+      </span>
+    </div>
+
+    ${runs.length > 0
+      ? html`<div class="card stack">
+          <h3>Запуски в текущей сессии</h3>
+          <div class="stack" style="gap:8px">
+            ${runs.map((r) => html`<div class=${"report-step-row" + (r.status === "running" ? " svetyashka-card" : "")} key=${r.id}>
+              <div class="row">
+                <span class=${"badge " + (r.status === "done" ? (r.fail_count > 0 ? "warn" : "ok") : (r.status === "cancelled" ? "off" : ""))}>
+                  ${r.status === "running" ? "выполняется…" : r.status}
+                </span>
+                <b class="grow">${r.name}</b>
+                <span class="muted small">${r.completed_steps}/${r.total_steps} · ${fmtAgo(r.started_at)}</span>
+                <button class="btn btn-sm btn-primary" onClick=${() => setActiveJobId(r.id)}>Открыть</button>
+              </div>
+            </div>`)}
+          </div>
+        </div>`
+      : null}
+
+    ${templates.length === 0
+      ? html`<div class="card empty">
+          <h3>Сохранённых шаблонов отчётов нет</h3>
+          <p class="muted">
+            Вы можете собрать и сразу запустить отчёт через «Конструктор отчёта» без сохранения,
+            либо попросить LLM создать отчёт командой <span class="mono">/report</span>.
+          </p>
+        </div>`
+      : html`<div class="stack">
+          ${templates.map((t) => html`<article class="check-card" key=${t.id}>
+            <div class="check-head">
+              <span class=${"badge " + (t.valid !== false ? "ok" : "fail")}>
+                ${t.valid !== false ? "ok" : "invalid"}
+              </span>
+              <div class="check-title">${t.name}</div>
+              <span class="muted small mono">${t.id}</span>
+            </div>
+            ${t.description ? html`<div class="muted small">${t.description}</div>` : null}
+            <div class="check-meta">
+              <span>целей: ${(t.targets || []).length}</span>
+              <span>режим: ${t.display_mode || "display_and_raw"}</span>
+              <span>${t.parallel_servers !== false ? "параллельно" : "последовательно"}</span>
+            </div>
+            ${t.valid === false && t.error ? html`<div class="err">${t.error}</div>` : null}
+            <div class="check-actions">
+              <button class="btn btn-sm btn-primary" disabled=${t.valid === false}
+                      onClick=${() => setPlanPayload({ template_id: t.id })}>Запустить</button>
+              <button class="btn btn-sm" onClick=${() => setEditor({ mode: "edit", rid: t.id })}>Правка</button>
+              <button class="btn btn-sm btn-danger" onClick=${() => removeTemplate(t)}>Удалить</button>
+            </div>
+          </article>`)}
+        </div>`}
+
+    ${editor
+      ? html`<${ReportEditorModal}
+          mode=${editor.mode}
+          rid=${editor.rid || null}
+          onClose=${() => setEditor(null)}
+          onSaved=${async () => { setEditor(null); await load(); }}
+          onRunJob=${(jid) => { setEditor(null); setActiveJobId(jid); load(); }} />`
+      : null}
+    ${planPayload
+      ? html`<${ReportPlanModal}
+          payload=${planPayload}
+          onClose=${() => setPlanPayload(null)}
+          onStarted=${(jid) => { setPlanPayload(null); setActiveJobId(jid); load(); }} />`
+      : null}
+    ${activeJobId
+      ? html`<${ReportRunModal}
+          jobId=${activeJobId}
+          onClose=${() => { setActiveJobId(null); load(); }} />`
+      : null}
+  </div>`;
+}
+
 function AutomationView({ autoState, pendingCount, onOpenPending, onRefreshStatus, initialRuleRid, onRuleDetailClosed }) {
   const [sub, setSub] = useState("reactions");
   const [busy, setBusy] = useState(false);
@@ -11584,6 +13283,7 @@ function AutomationView({ autoState, pendingCount, onOpenPending, onRefreshStatu
       <button class=${sub === "operations" ? "on" : ""} onClick=${() => setSub("operations")}>Операции</button>
       <button class=${sub === "alert_rules" ? "on" : ""} onClick=${() => setSub("alert_rules")}>Правила</button>
       <button class=${sub === "graph" ? "on" : ""} onClick=${() => setSub("graph")}>Граф</button>
+      <button class=${sub === "reports" ? "on" : ""} onClick=${() => setSub("reports")}>Отчёты</button>
     </div>
     ${sub === "reactions" ? html`<${ReactionsView} />` : null}
     ${sub === "operations" ? html`<${UserOpsView} />` : null}
@@ -11593,6 +13293,7 @@ function AutomationView({ autoState, pendingCount, onOpenPending, onRefreshStatu
     ${sub === "graph" ? html`<div class="stack" style="height: calc(100vh - 210px); min-height: 480px;">
         <${AutomationGraphView} onRefreshStatus=${onRefreshStatus} />
       </div>` : null}
+    ${sub === "reports" ? html`<${ReportsView} />` : null}
   </div>`;
 }
 function SettingsView() {
@@ -11652,9 +13353,28 @@ function SettingsView() {
       const el = document.getElementById("settings-updates-section");
       if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
     }
+    function onScrollToLlm() {
+      const el = document.getElementById("settings-llm-profiles-section");
+      if (el) {
+        _scrollToLlmProfilesPending = false;
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
     window.addEventListener("melecho:scroll-to-updates", onScrollTo);
-    return () => window.removeEventListener("melecho:scroll-to-updates", onScrollTo);
+    window.addEventListener("melecho:scroll-to-llm-profiles", onScrollToLlm);
+    return () => {
+      window.removeEventListener("melecho:scroll-to-updates", onScrollTo);
+      window.removeEventListener("melecho:scroll-to-llm-profiles", onScrollToLlm);
+    };
   }, []);
+  useEffect(() => {
+    if (!s || !_scrollToLlmProfilesPending) return;
+    const el = document.getElementById("settings-llm-profiles-section");
+    if (el) {
+      _scrollToLlmProfilesPending = false;
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [!!s]);
   if (!s) return html`<div class="page">…</div>`;
   async function toggleLlm(v) {
     setS(await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ llm_master_enabled: v }) }));
@@ -14127,6 +15847,9 @@ function AppShell() {
   const [pendingOpen, setPendingOpen] = useState(false);
   // Редактор операции, открытый из чата LLM («В редактор»).
   const [inlineEditor, setInlineEditor] = useState(null);
+  const [inlineReportEditor, setInlineReportEditor] = useState(null);
+  const [inlineReportJobId, setInlineReportJobId] = useState(null);
+  const [printingReport, setPrintingReport] = useState(null);
   // Кандидаты правил/реакций из LLM — показываются в модалке перед созданием.
   const [pendingAlertRules, setPendingAlertRules] = useState(null);
   const [pendingReaction, setPendingReaction] = useState(null);
@@ -14381,6 +16104,11 @@ function AppShell() {
         detail: ev,
       }));
     }
+    if (typeof ev.topic === "string" && ev.topic.startsWith("report.")) {
+      window.dispatchEvent(new CustomEvent("melecho:report-event", {
+        detail: ev,
+      }));
+    }
   };
   useEventStream(onEventRef);
 
@@ -14405,6 +16133,20 @@ function AppShell() {
       const y = ev && ev.detail && ev.detail.yaml;
       if (typeof y === "string" && y.trim()) setInlineEditor({ yaml: y });
     };
+    const onOpenReportEditor = (ev) => {
+      const d = (ev && ev.detail) || {};
+      if ((typeof d.yaml === "string" && d.yaml.trim()) || d.spec) {
+        setInlineReportEditor({ yaml: d.yaml || "", spec: d.spec || null });
+      }
+    };
+    const onPrintReport = (ev) => {
+      const d = (ev && ev.detail) || {};
+      if (!d.job) return;
+      setPrintingReport({ job: d.job, viewMode: d.viewMode || "display_and_raw" });
+      setTimeout(() => { window.print(); }, 80);
+    };
+    const onAfterPrint = () => { setPrintingReport(null); };
+    window.addEventListener("afterprint", onAfterPrint);
     const onCreateAlertRules = (ev) => {
       const rules = ev && ev.detail && ev.detail.rules;
       if (Array.isArray(rules) && rules.length) setPendingAlertRules(rules);
@@ -14494,19 +16236,33 @@ function AppShell() {
         });
     };
     window.addEventListener("melecho:llm-open-editor", onOpenEditor);
+    window.addEventListener("melecho:llm-open-report-editor", onOpenReportEditor);
+    window.addEventListener("melecho:print-report", onPrintReport);
     window.addEventListener("melecho:llm-create-alert-rules", onCreateAlertRules);
     window.addEventListener("melecho:llm-create-reaction", onCreateReaction);
     window.addEventListener("melecho:toast", onToast);
     window.addEventListener("melecho:llm-open-alert", onOpenAlert);
     window.addEventListener("melecho:llm-open-rule", onOpenRule);
     window.addEventListener("melecho:open-server", onOpenServerFromEv);
+    const onOpenLlmProfiles = () => {
+      _scrollToLlmProfilesPending = true;
+      setView("set");
+      setSid(null);
+      setTimeout(() => {
+        window.dispatchEvent(new Event("melecho:scroll-to-llm-profiles"));
+      }, 40);
+    };
     window.addEventListener("melecho:llm-apply-rule-patch", onApplyRulePatch);
+    window.addEventListener("melecho:open-llm-profiles", onOpenLlmProfiles);
     return () => {
       clearInterval(light);
       clearInterval(heavy);
       if (countsDebounceRef.current) clearTimeout(countsDebounceRef.current);
       window.removeEventListener("melecho:refresh-status", onRefresh);
       window.removeEventListener("melecho:llm-open-editor", onOpenEditor);
+      window.removeEventListener("melecho:llm-open-report-editor", onOpenReportEditor);
+      window.removeEventListener("melecho:print-report", onPrintReport);
+      window.removeEventListener("afterprint", onAfterPrint);
       window.removeEventListener("melecho:llm-create-alert-rules", onCreateAlertRules);
       window.removeEventListener("melecho:llm-create-reaction", onCreateReaction);
       window.removeEventListener("melecho:toast", onToast);
@@ -14514,6 +16270,7 @@ function AppShell() {
       window.removeEventListener("melecho:llm-open-rule", onOpenRule);
     window.removeEventListener("melecho:open-server", onOpenServerFromEv);
       window.removeEventListener("melecho:llm-apply-rule-patch", onApplyRulePatch);
+      window.removeEventListener("melecho:open-llm-profiles", onOpenLlmProfiles);
     };
   }, []);
 
@@ -14845,6 +16602,43 @@ function AppShell() {
             initialYaml=${inlineEditor.yaml}
             onClose=${() => setInlineEditor(null)}
             onSaved=${() => { setInlineEditor(null); refreshStatus(); }} />`
+      : null}
+    ${inlineReportEditor
+      ? html`<${ReportEditorModal}
+            mode="create"
+            initialYaml=${inlineReportEditor.yaml}
+            initialSpec=${inlineReportEditor.spec}
+            onClose=${() => setInlineReportEditor(null)}
+            onSaved=${() => { setInlineReportEditor(null); refreshStatus(); }}
+            onRunJob=${(jid) => { setInlineReportEditor(null); setInlineReportJobId(jid); }} />`
+      : null}
+    ${inlineReportJobId
+      ? html`<${ReportRunModal}
+            jobId=${inlineReportJobId}
+            onClose=${() => setInlineReportJobId(null)} />`
+      : null}
+    ${printingReport
+      ? html`<div class="report-print-sheet stack">
+          <h1>Отчёт: ${printingReport.job.name}</h1>
+          ${printingReport.job.description ? html`<p>${printingReport.job.description}</p>` : null}
+          <div class="muted small">
+            Статус: ${printingReport.job.status} · Начат: ${printingReport.job.started_at || "—"} ·
+            Завершён: ${printingReport.job.finished_at || "—"} ·
+            Шаги: ${printingReport.job.completed_steps}/${printingReport.job.total_steps}
+          </div>
+          ${(printingReport.job.servers || []).map((srv) => html`<div class="card stack" key=${srv.server_id}>
+            <h3>${srv.server_name} (${srv.llm_alias})</h3>
+            ${(srv.steps || []).map((st, idx) => html`<div class="form-section" key=${idx}>
+              <div class="row">
+                <b>${st.operation_name || st.operation_id}</b>
+                <span class="mono small">(${st.operation_id})</span>
+                <span class="badge">${st.status}</span>
+                ${st.duration_ms != null ? html`<span class="small">${st.duration_ms} мс</span>` : null}
+              </div>
+              <${ReportStepOutputView} step=${st} viewMode=${printingReport.viewMode} />
+            </div>`)}
+          </div>`)}
+        </div>`
       : null}
     ${pendingAlertRules
       ? html`<${AlertRulesFromLLMModal}

@@ -104,7 +104,7 @@ def build_chat_system_prompt(allowed_commands: list[str]) -> str:
         "- Команду вне списка нужно сначала добавить в белый список (Автоматизация → Операции → Белый список команд).\n"
         "- Не предлагай выполнять shell-команды напрямую и не генерируй shell-скрипты.\n"
         "- Если не хватает данных — скажи одной фразой.\n"
-        "- Для генерации артефактов есть команды /operation, /alert, /reaction. Даже если в истории выше\n"
+        "- Для генерации артефактов есть команды /operation, /alert, /reaction, /report. Даже если в истории выше\n"
         "  были YAML/JSON из этих режимов, учитывай их как контекст, но в обычном чате отвечай текстом."
     )
 
@@ -706,6 +706,102 @@ def build_suggest_operation_prompt(description: str, allowed_commands: list[str]
     )
 
 
+def build_suggest_report_prompt(
+    description: str,
+    servers: list[dict],
+    operations: list[dict],
+    existing_templates: list[dict] | None = None,
+) -> str:
+    """Промпт для генерации YAML-шаблона пакетного отчёта."""
+    sv_lines = [
+        "  {!r} ({})".format(s["llm_alias"], s.get("name") or "?")
+        for s in servers[:50]
+    ]
+    sv_str = "\n".join(sv_lines) if sv_lines else "  (нет серверов)"
+
+    op_lines = []
+    for o in operations[:60]:
+        flags = o.get("flags") or {}
+        if flags.get("streaming"):
+            continue
+        tags = []
+        if flags.get("escalatable"):
+            tags.append("sudo_opt_in")
+        if flags.get("state_changing"):
+            tags.append("state_changing")
+        if o.get("has_display"):
+            tags.append("has_display")
+        if o.get("params"):
+            p_desc = ", ".join(
+                f"{p.get('name')}:{p.get('type', 'str')}"
+                for p in (o.get("params") or [])
+            )
+            tags.append(f"params=[{p_desc}]")
+        if o.get("applicable_aliases") is not None:
+            tags.append("servers=" + (",".join(o["applicable_aliases"]) or "none"))
+        tag_str = (" [" + "; ".join(tags) + "]") if tags else ""
+        op_lines.append(f"  {o['id']} — {o.get('name') or ''}{tag_str}")
+    op_str = "\n".join(op_lines) if op_lines else "  (нет операций)"
+
+    ex_lines = [
+        "  {} — {!r}".format(t.get("id"), t.get("name"))
+        for t in (existing_templates or [])[:30]
+    ]
+    ex_str = "\n".join(ex_lines) if ex_lines else "  (нет шаблонов)"
+
+    return "\n".join([
+        "Ты — генератор шаблонов пакетных отчётов панели Melecho.",
+        "Отчёт = очередь операций из каталога, выполняемая по серверам для экспорта.",
+        "Отвечай СТРОГО в формате ниже. Думать вслух запрещено.",
+        "Теги <thought>, <reasoning>, <thinking>, <analysis> запрещены.",
+        "",
+        "ДОСТУПНЫЕ СЕРВЕРЫ (указывай в targets[].server как server-N или 'all'):",
+        sv_str,
+        "",
+        "ДОСТУПНЫЕ ОПЕРАЦИИ (streaming-операции запрещены в отчётах):",
+        op_str,
+        "",
+        "СУЩЕСТВУЮЩИЕ ШАБЛОНЫ (используй уникальный id):",
+        ex_str,
+        "",
+        "ПРАВИЛА СХЕМЫ:",
+        "- id: только [a-z][a-z0-9_]*, начинается с буквы",
+        "- ОБЯЗАТЕЛЬНО заключай значения name и description в двойные кавычки \"...\" (особенно если внутри есть двоеточие ':')",
+        "- ОБЯЗАТЕЛЬНО заключай значения name и description в двойные кавычки \"...\" (особенно если внутри есть двоеточие ':')",
+        "- parallel_servers: true (разные серверы параллельно, шаги на одном сервере всегда очередью)",
+        "- display_mode: display_only | display_and_raw | raw_only",
+        "- targets[].server: 'all' или 'server-N' из списка выше",
+        "- targets[].steps[].operation_id: только из списка операций выше",
+        "- targets[].steps[].params: объект параметров (или {})",
+        "- targets[].steps[].use_sudo: true|false (только если нужно sudo)",
+        "",
+        "ФОРМАТ ОТВЕТА (ровно так, ничего лишнего):",
+        "",
+        "<1-2 строки, что собирает отчёт>",
+        "",
+        "```yaml",
+        "id: <snake_case>",
+        'name: "<человекочитаемое название>"',
+        'description: "<краткое описание>"',
+        "parallel_servers: true",
+        "display_mode: display_and_raw",
+        "targets:",
+        "  - server: server-1",
+        "    steps:",
+        "      - operation_id: disk_check",
+        "        params: {}",
+        "        use_sudo: false",
+        "```",
+        "",
+        "ОСОБЫЕ СЛУЧАИ (без YAML-блока):",
+        "  НЕВОЗМОЖНО: <причина>",
+        "  УТОЧНИТЕ: <вопрос>",
+        "",
+        "ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:",
+        description.strip(),
+    ])
+
+
 def extract_yaml_block(text: str) -> tuple[str | None, str]:
     """Ищет fenced-блок ```yaml\\n...\\n``` и вырезает его из текста.
 
@@ -1132,7 +1228,7 @@ class OpenAICompatLLM:
                         if finish_reason == "length":
                             log.warning("LLM stream truncated: finish_reason=length (model=%s)", self.model)
                         delta = choices[0].get("delta") or {}
-                        r_chunk = delta.get("reasoning_content") or delta.get("reasoning")
+                        r_chunk = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thought") or delta.get("reasoning_details")
                         chunk = delta.get("content")
                         if r_chunk and not chunk:
                             yield ("thinking", None)
