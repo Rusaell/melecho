@@ -136,7 +136,7 @@ class Detector:
 
     def update_metric(self, server_id: int, metric: str, x: float, ts: str, skip: bool = False) -> dict:
         if skip:
-            st = self._bucket(server_id).get(metric) or MetricState()
+            self._bucket(server_id)
             return {"metric": metric, "status": "skipped_reset", "anomaly": False, "z": None, "x": x}
         b = self._bucket(server_id)
         st = b.get(metric)

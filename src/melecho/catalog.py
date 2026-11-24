@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import logging
 import re
 from pathlib import Path
@@ -48,7 +49,7 @@ INTERPRETER_CMDS = frozenset({
 STDIN_CMDS = {"cat", "read", "tee", "head", "tail", "sort", "grep"}
 
 
-def _flags(raw: dict) -> dict:
+def _flags(raw: dict | None) -> dict:
     raw = raw or {}
     return {
         "dangerous": bool(raw.get("dangerous", False)),
@@ -63,7 +64,7 @@ def _flags(raw: dict) -> dict:
     }
 
 
-def _compile_display_regex(pat: str, ctx: str) -> None:
+def _compile_display_regex(pat: object, ctx: str) -> None:
     if not isinstance(pat, str) or not pat:
         raise ValueError(f"{ctx}: regex должен быть непустой строкой")
     if len(pat) > 500:
@@ -461,7 +462,7 @@ class Catalog:
             "error": None,
         }
 
-    def list(self) -> list[dict]:
+    def list(self) -> builtins.list[dict]:
         return [self.public(op) for op in self.ops.values()]
 
     def get(self, oid: str) -> dict:
@@ -486,5 +487,5 @@ class Catalog:
             "source": op.get("source", "system"),
         }
 
-    def catalog_ids(self) -> list[str]:
+    def catalog_ids(self) -> builtins.list[str]:
         return [k for k, v in self.ops.items() if v.get("valid")]

@@ -6,6 +6,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -888,7 +889,7 @@ class Database:
 
     # Соответствие "старый source" → "новый condition_kind".
     # Используется в _migrate_v10 и в миграции reaction_rules.match_json.
-    _SOURCE_TO_KIND = {
+    _SOURCE_TO_KIND: ClassVar[dict[str, str]] = {
         "detector": "metric_zscore",
         "threshold": "metric_threshold",
         "stale": "metric_stale",

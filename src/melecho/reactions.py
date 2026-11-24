@@ -219,17 +219,18 @@ class ReactionEngine:
             policy = "confirm"
 
         try:
-            cooldown = int(
-                body.get("cooldown_sec") if body.get("cooldown_sec") is not None else 300
-            )
+            raw_cd = body.get("cooldown_sec")
+            cooldown = int(300 if raw_cd is None else raw_cd)
         except (TypeError, ValueError):
             raise AppError("E_PARAM", "cooldown_sec: целое", status=400)
         if cooldown < 0 or cooldown > 86400:
             raise AppError("E_PARAM", "cooldown_sec: 0..86400", status=400)
 
         try:
-            max_attempts = int(body.get("max_attempts_per_alert") or 3)
-            max_depth = int(body.get("max_depth") or 3)
+            raw_ma = body.get("max_attempts_per_alert")
+            raw_md = body.get("max_depth")
+            max_attempts = int(raw_ma) if (raw_ma is not None and raw_ma) else 3
+            max_depth = int(raw_md) if (raw_md is not None and raw_md) else 3
         except (TypeError, ValueError):
             raise AppError(
                 "E_PARAM", "max_attempts_per_alert/max_depth: целые", status=400,

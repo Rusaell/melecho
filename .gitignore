@@ -5,6 +5,7 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-qa/
 .venv-*/
 
 # Test / lint / type-check caches

@@ -1,6 +1,11 @@
 .git
 .venv
+.venv-qa
 .pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+scripts
 __pycache__
 *.pyc
 *.pyo

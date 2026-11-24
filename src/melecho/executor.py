@@ -68,10 +68,11 @@ def wrap_locale(argv: list[str], env_abs: str, sudo_abs: str | None, sudo_mode: 
     core = [env_abs, "LC_ALL=C", "LANG=C", *argv]
     if sudo_mode is None:
         return core
+    sudo_bin = sudo_abs or "/usr/bin/sudo"
     if sudo_mode == "n":
-        return [sudo_abs, "-n", *core]
+        return [sudo_bin, "-n", *core]
     if sudo_mode == "S":
-        return [sudo_abs, "-S", "-p", "", *core]
+        return [sudo_bin, "-S", "-p", "", *core]
     raise ValueError(sudo_mode)
 
 

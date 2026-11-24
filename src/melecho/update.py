@@ -125,7 +125,7 @@ def fetch_latest_version(repo: str, timeout_sec: float = 2.0) -> str | None:
         import httpx2 as httpx
     except ImportError:
         try:
-            import httpx
+            import httpx  # type: ignore[no-redef]
         except ImportError:
             return None
     url = f"https://api.github.com/repos/{repo}/releases/latest"

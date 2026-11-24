@@ -16,6 +16,10 @@ import stat as _stat
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar
+
+if TYPE_CHECKING:
+    from melecho.llm import OpenAICompatLLM
 
 from melecho.alerts import AlertEngine, fingerprint
 from melecho.audit import append_audit, empty_head, sign_head, verify_integrity
@@ -227,7 +231,7 @@ NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,100}$")
 USER_RE = re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
 
 
-def _validate_host(host: str) -> str:
+def _validate_host(host: str | None) -> str:
     host = (host or "").strip()
     if not host:
         raise AppError("E_PARAM", "host не может быть пустым", status=400)
@@ -236,7 +240,7 @@ def _validate_host(host: str) -> str:
     return host
 
 
-def _validate_name(name: str) -> str:
+def _validate_name(name: str | None) -> str:
     name = (name or "").strip()
     if not name:
         raise AppError("E_PARAM", "name не может быть пустым", status=400)
@@ -245,7 +249,7 @@ def _validate_name(name: str) -> str:
     return name
 
 
-def _validate_user(user: str) -> str:
+def _validate_user(user: str | None) -> str:
     user = (user or "").strip()
     if not user:
         raise AppError("E_PARAM", "user не может быть пустым", status=400)
@@ -451,7 +455,7 @@ class Runtime:
         self.paths = PathCache()
         self.prev_cpu: dict[int, tuple[int, int]] = {}
         self.prev_net: dict[int, tuple[int, int]] = {}
-        self.llm = None
+        self.llm: OpenAICompatLLM | None = None
         self.collect_errors: dict[int, str] = {}
         # Серверы, для которых collect_server уже сработал (успешно или нет)
         # в этой сессии. Stale-детектор смотрит только на них — иначе на
@@ -714,13 +718,13 @@ class Runtime:
     async def export_profile_bytes(self, password: str) -> bytes:
         """Создаёт зашифрованный архив текущего профиля."""
         from melecho.profiles import export_profile_bytes as _export
-        self.require_dek()
+        dek = self.require_dek()
         if not isinstance(password, str) or len(password) < 12:
             raise AppError("E_PASSWORD", "пароль архива не короче 12 символов", status=400)
         src_dir = self.cfg.data_dir or self.cfg.db_path.parent
         try:
             return await asyncio.to_thread(
-                _export, src_dir, self.dek, password,
+                _export, src_dir, dek, password,
             )
         except ValueError as e:
             raise AppError("E_PARAM", str(e), status=400) from e
@@ -1551,12 +1555,12 @@ class Runtime:
         failed = int(self.db.get_setting("unlock_failed_count") or "0")
         delays = [1, 2, 4, 8, 16]
         salt_hex = self.db.get_setting("kdf_salt")
-        blob = self.db.get_setting("encrypted_dek")
-        if not salt_hex or not blob:
+        enc_blob = self.db.get_setting("encrypted_dek")
+        if not salt_hex or not enc_blob:
             raise AppError("E_STATE", "повреждены параметры KDF", status=500)
         try:
             kek = kdf_kek(password, bytes.fromhex(salt_hex))
-            dek = unwrap_dek(kek, blob)
+            dek = unwrap_dek(kek, enc_blob)
         except Exception:
             failed += 1
             delay = delays[min(failed - 1, len(delays) - 1)]
@@ -1873,7 +1877,7 @@ class Runtime:
                 )
             return sid, alias
 
-        sid, alias = await self.db.mutate(fn)
+        sid, _alias = await self.db.mutate(fn)
         return self.public_server(self.db.conn.execute("SELECT * FROM servers WHERE id=?", (sid,)).fetchone())
 
     def _apply_detector_settings(self) -> None:
@@ -2931,7 +2935,7 @@ class Runtime:
     # пароль из RAM или из settings (если mode=disk).
 
     SUDO_MODES = ("none", "session", "30m", "2h", "8h", "disk")
-    SUDO_MODE_MINUTES = {"30m": 30, "2h": 120, "8h": 480}
+    SUDO_MODE_MINUTES: ClassVar[dict[str, int]] = {"30m": 30, "2h": 120, "8h": 480}
 
     def sudo_unlock_status(self) -> dict:
         """Возвращает текущее состояние автосудо."""
@@ -3455,7 +3459,7 @@ class Runtime:
     # Человекочитаемые названия метрик — используются при формировании
     # title/description алертов. Держим единый словарь, чтобы detector и
     # threshold говорили на одном языке.
-    _METRIC_LABELS: dict[str, str] = {
+    _METRIC_LABELS: ClassVar[dict[str, str]] = {
         "cpu": "CPU",
         "ram": "RAM",
         "disk": "Диск",
@@ -3545,7 +3549,7 @@ class Runtime:
         "manual_op_failed",   # провал операции из UI
         "reaction_failed",    # реакция не смогла восстановить
     })
-    _SOURCE_TO_KIND_LEGACY = {
+    _SOURCE_TO_KIND_LEGACY: ClassVar[dict[str, str]] = {
         "threshold": "metric_threshold",
         "detector":  "metric_zscore",
         "stale":     "metric_stale",
@@ -3698,6 +3702,7 @@ class Runtime:
             if sj_raw is not None:
                 if not isinstance(sj_raw, dict):
                     raise AppError("E_PARAM", "servers_json: объект", status=400)
+                norm: dict[str, Any]
                 if sj_raw.get("all") is True:
                     norm = {"all": True}
                 else:
@@ -6781,7 +6786,7 @@ class Runtime:
 
     CHAT_MAX_MESSAGES = 32
     CHAT_MAX_CHARS = 16000
-    CHAT_ROLES = {"system", "user", "assistant"}
+    CHAT_ROLES = frozenset({"system", "user", "assistant"})
 
     def validate_chat_request(self, body: dict) -> tuple[list[dict], int]:
         """Параметрическая валидация тела POST /llm/chat с учётом настроек контекста."""
@@ -7780,6 +7785,8 @@ class Runtime:
                 messages_to_send.extend(history)
             messages_to_send.append({"role": "user", "content": prompt})
 
+        if self.llm is None:
+            raise AppError("E_LLM_DISABLED", "LLM не настроен", status=409)
         ph = prompt_hash(json.dumps(messages_to_send, ensure_ascii=False))
         provider = self.llm.provider
         model = self.llm.model
@@ -8039,6 +8046,9 @@ class Runtime:
         def _parse(text: str):
             yaml_text, explanation = extract_yaml_block(text)
             used_yaml = yaml_text
+            raw_id: str | None
+            spec: dict | None
+            error: str | None
             if not yaml_text:
                 raw_id, spec, error = None, None, "модель не вернула YAML-блок"
                 valid = False
@@ -8094,6 +8104,9 @@ class Runtime:
 
         def _parse(text: str):
             yaml_text, explanation = extract_yaml_block(text)
+            raw_id: str | None
+            parsed_op: dict | None
+            error: str | None
             if not yaml_text:
                 raw_id, parsed_op, error = None, None, "модель не вернула YAML-блок"
                 valid = False
@@ -8750,13 +8763,13 @@ class Runtime:
                 except AppError as e:
                     log.warning("не удалось применить LLM-профиль %s: %s", pid, e.code)
         # 2. Legacy fallback: старый ключ в settings (пока UI не переехал на профили).
-        key = self._llm_api_key()
-        if not key:
+        legacy_key = self._llm_api_key()
+        if not legacy_key:
             return
         from melecho.llm import OpenAICompatLLM
 
         self.llm = OpenAICompatLLM(
-            self.cfg.llm_base_url, self.cfg.llm_model, key, self.cfg.llm_timeout_sec
+            self.cfg.llm_base_url, self.cfg.llm_model, legacy_key, self.cfg.llm_timeout_sec
         )
 
     async def explain_anomaly(self, server_id: int, metric: str, include_logs: bool | None = None) -> dict:
@@ -9316,7 +9329,7 @@ class Runtime:
         lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
         allowed = json.loads(row["allowed_units"] or "[]")
         allowed_set = set(allowed)
-        all_units = []
+        all_units: list[dict[str, Any]] = []
         active_cnt = 0
         failed_cnt = 0
         for ln in lines[:5000]:

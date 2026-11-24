@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "melecho"
-version = "1.3.0"
+version = "1.3.1"
 description = "Local-first Linux SSH control panel with HMAC audit and LLM-assisted anomaly interpretation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -73,6 +73,10 @@ pythonpath = ["src", "."]
 line-length = 120
 target-version = "py311"
 src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "PIE", "RUF012", "RUF059", "PLR0124", "TRY203", "SIM114", "SIM115"]
+ignore = ["E501", "E701", "E702", "E741", "B008", "B904", "PIE790", "PIE810"]
 
 [tool.mypy]
 python_version = "3.11"

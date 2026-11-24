@@ -61,9 +61,7 @@ def _slug_base(name: str) -> str:
     for ch in name.lower():
         if ch in _TRANSLIT:
             out.append(_TRANSLIT[ch])
-        elif ch.isascii() and ch.isalnum():
-            out.append(ch)
-        elif ch in "_-":
+        elif (ch.isascii() and ch.isalnum()) or ch in "_-":
             out.append(ch)
         elif ch.isspace() or ch in ".,!?;:()[]{}«»\"'*&^%$#@+=|\\/<>~`":
             out.append("-")

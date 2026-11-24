@@ -153,7 +153,7 @@ def _launch_detached(args: argparse.Namespace) -> int:
     Возвращает exit-code.
     """
     pid = rf.read_pid()
-    if rf.is_alive(pid):
+    if pid is not None and rf.is_alive(pid):
         # Демон жив: SIGUSR1 → новый bootstrap → открыть браузер.
         prev = rf.read_bootstrap()
         try:
@@ -179,18 +179,15 @@ def _launch_detached(args: argparse.Namespace) -> int:
     # Спавним child в фоне.
     log_path = user_data_dir() / "melecho.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_fd = open(log_path, "a", buffering=1)
     child_argv = [
         sys.executable, "-m", "melecho", "--foreground",
     ] + sys.argv[1:]
-    try:
+    with open(log_path, "a", buffering=1) as log_fd:
         proc = subprocess.Popen(
             child_argv,
             stdout=log_fd, stderr=log_fd, stdin=subprocess.DEVNULL,
             start_new_session=True, close_fds=True,
         )
-    finally:
-        log_fd.close()
 
     # Ждём появления bootstrap.url.
     new_url = rf.wait_for_bootstrap(None, timeout=15.0)
@@ -338,7 +335,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
             log.exception("_signal_shutdown failed")
         _orig_handle_exit(sig, frame)
 
-    server.handle_exit = _handle_exit_wrapper
+    server.handle_exit = _handle_exit_wrapper  # type: ignore[method-assign]
 
     async def _serve():
         loop_holder["loop"] = asyncio.get_running_loop()

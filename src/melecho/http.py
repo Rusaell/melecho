@@ -574,8 +574,6 @@ def create_app(rt: Runtime) -> FastAPI:
                         continue
                     # Таймаут 25 сек — heartbeat.
                     yield b": ping\n\n"
-            except asyncio.CancelledError:
-                raise
             finally:
                 rt.events.unsubscribe(q)
 
@@ -1296,6 +1294,7 @@ def create_app(rt: Runtime) -> FastAPI:
         offset: int = 0,
     ):
         rt.require_dek()
+        statuses: tuple[str, ...] | None
         if status == "active":
             statuses = ("open", "reacting", "pending_confirmation", "acknowledged")
         elif status == "all":

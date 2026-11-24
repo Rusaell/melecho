@@ -14,7 +14,7 @@ from melecho.errors import AppError
 try:
     import httpx2 as httpx
 except ImportError:
-    import httpx
+    import httpx  # type: ignore[no-redef]
 
 log = logging.getLogger("melecho")
 
@@ -1101,6 +1101,8 @@ class OpenAICompatLLM:
                     continue
                 raise AppError("E_LLM_NETWORK", "не удалось связаться с LLM-провайдером", status=502) from e
 
+        if r is None:
+            raise AppError("E_LLM_NETWORK", "не удалось связаться с LLM-провайдером", status=502)
         try:
             data = r.json()
         except Exception as e:
@@ -1179,7 +1181,7 @@ class OpenAICompatLLM:
                         if i != -1 and (best_idx == -1 or i < best_idx):
                             best_idx = i
                             best_tag = tag
-                    if best_idx == -1:
+                    if best_idx == -1 or best_tag is None:
                         keep = max_open_len - 1
                         if keep > 0 and len(buf) > keep:
                             out.append(buf[: len(buf) - keep])

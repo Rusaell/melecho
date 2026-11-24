@@ -4,7 +4,9 @@ import ast
 import csv
 import io
 import json
+from collections.abc import Callable
 import logging
+import math
 import operator as _op
 import re
 from pathlib import Path
@@ -18,13 +20,13 @@ log = logging.getLogger("melecho")
 
 DISPLAY_MODES = ("display_only", "display_and_raw", "raw_only")
 
-_AST_BIN_OPS = {
+_AST_BIN_OPS: dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: _op.add,
     ast.Sub: _op.sub,
     ast.Mult: _op.mul,
     ast.Div: _op.truediv,
 }
-_AST_UNARY_OPS = {
+_AST_UNARY_OPS: dict[type[ast.unaryop], Callable[[float], float]] = {
     ast.UAdd: _op.pos,
     ast.USub: _op.neg,
 }
@@ -68,7 +70,7 @@ def eval_display_expr(expr: str, row: dict) -> float | None:
     res = _eval(tree)
     if res is None:
         return None
-    if res != res or res in (float("inf"), float("-inf")):
+    if not math.isfinite(res):
         return None
     return res
 
@@ -101,7 +103,7 @@ def _fmt_bytes(n) -> str:
         v = float(n)
     except (TypeError, ValueError):
         return "—"
-    if v != v:
+    if not math.isfinite(v):
         return "—"
     units = ("B", "KiB", "MiB", "GiB", "TiB")
     i = 0
@@ -520,7 +522,8 @@ def _display_to_markdown(disp: dict | None) -> list[str]:
             if not rows:
                 out.append(f"_{disp.get('empty_text') or 'Записей не найдено.'}_")
             else:
-                esc = lambda x: str(x).replace("|", "\\|").replace("\n", " ")
+                def esc(x):
+                    return str(x).replace("|", "\\|").replace("\n", " ")
                 out.append("| " + " | ".join(esc(c["label"]) for c in cols) + " |")
                 out.append("| " + " | ".join("---" for _ in cols) + " |")
                 for r in rows:
